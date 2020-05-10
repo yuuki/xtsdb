@@ -1,3 +1,6 @@
+export GO111MODULE=on
+export GOFLAGS=-mod=vendor
+
 .PHONY: build
 build: ingester flusher
 
