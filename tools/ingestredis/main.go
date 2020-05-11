@@ -4,9 +4,15 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	goredis "github.com/go-redis/redis/v7"
+)
+
+const (
+	expiredStream = "expired-stream"
+	prefixEx      = "ex:"
 )
 
 func main() {
@@ -24,6 +30,7 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// ingester
 	go func() {
 		metrics := map[string][]struct {
 			Timestamp int64
@@ -55,13 +62,48 @@ func main() {
 			}
 
 			// TODO: check expired and set
-			_, err := client.Set(fmt.Sprintf("ex:%s", stream), true, 10*time.Second).Result()
+			key := prefixEx + stream
+			_, err := client.Set(key, true, 5*time.Second).Result()
 			if err != nil {
 				log.Printf("Could not set stream: %s", err)
 				continue
 			}
-			fmt.Printf("Set expire to stream '%s'\n", stream)
+			fmt.Printf("Set expire to key '%s'\n", key)
 		}
+	}()
+
+	// flusher
+	go func() {
+		// TODO: consumer group
+		// reading from expired-stream
+		// https://github.com/antirez/redis/issues/5543
+		startID := "$"
+		expiredMetricID := []string{}
+
+	again:
+		xstreams, err := client.XRead(&goredis.XReadArgs{
+			Streams: []string{expiredStream, startID},
+			Block:   0,
+		}).Result()
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		for _, xstream := range xstreams {
+			for _, xmsg := range xstream.Messages {
+				for metricID := range xmsg.Values {
+					expiredMetricID = append(expiredMetricID, metricID)
+				}
+				startID = xmsg.ID
+			}
+		}
+		log.Printf("%s\n", expiredMetricID)
+
+		// zero clear
+		expiredMetricID = expiredMetricID[:0]
+
+		goto again
+		// flush to cassandra
 	}()
 
 	pubsub := client.Subscribe("__keyevent@0__:expired")
@@ -76,5 +118,16 @@ func main() {
 	ch := pubsub.Channel()
 	for msg := range ch {
 		fmt.Println(msg.Channel, msg.Payload)
+
+		metricID := strings.TrimPrefix(msg.Payload, prefixEx)
+		err := client.XAdd(&goredis.XAddArgs{
+			Stream: expiredStream,
+			ID:     "*",
+			Values: map[string]interface{}{metricID: ""},
+		}).Err()
+		if err != nil {
+			log.Printf("Could not add stream: %s", err)
+			continue
+		}
 	}
 }
