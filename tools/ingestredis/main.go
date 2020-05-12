@@ -15,6 +15,10 @@ const (
 	prefixEx      = "ex:"
 )
 
+func init() {
+	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+}
+
 func main() {
 	var addr = flag.String("addr", "localhost:6379", "addr:port to redis server")
 	var db = flag.Int("db", 0, "redis database")
@@ -78,7 +82,7 @@ func main() {
 		// reading from expired-stream
 		// https://github.com/antirez/redis/issues/5543
 		startID := "$"
-		expiredMetricID := []string{}
+		expiredMetricIDs := []string{}
 
 	again:
 		xstreams, err := client.XRead(&goredis.XReadArgs{
@@ -92,18 +96,43 @@ func main() {
 		for _, xstream := range xstreams {
 			for _, xmsg := range xstream.Messages {
 				for metricID := range xmsg.Values {
-					expiredMetricID = append(expiredMetricID, metricID)
+					expiredMetricIDs = append(expiredMetricIDs, metricID)
 				}
 				startID = xmsg.ID
 			}
 		}
-		log.Printf("%s\n", expiredMetricID)
+		log.Println(expiredMetricIDs)
+
+		if len(expiredMetricIDs) < 1 {
+			goto again
+		}
+
+		// begin transaction flush to cassandra
+		metricIDs := expiredMetricIDs
+		go func(metricIDs []string) {
+			fn := func(tx *goredis.Tx) error {
+				for _, metricID := range metricIDs {
+					xmsgs, err := tx.XRange(metricID, "-", "+").Result()
+					if err != nil {
+						return err
+					}
+					log.Printf("Flush datapoints to cassandra: %s %v\n", metricID, xmsgs)
+				}
+				if err := tx.Del(metricIDs...).Err(); err != nil {
+					return err
+				}
+				return nil
+			}
+			// TODO: retry
+			if err := client.Watch(fn, metricIDs...); err != nil {
+				log.Println(err)
+			}
+		}(metricIDs)
 
 		// zero clear
-		expiredMetricID = expiredMetricID[:0]
+		expiredMetricIDs = expiredMetricIDs[:0]
 
 		goto again
-		// flush to cassandra
 	}()
 
 	pubsub := client.Subscribe("__keyevent@0__:expired")
