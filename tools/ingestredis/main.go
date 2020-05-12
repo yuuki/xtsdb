@@ -82,9 +82,10 @@ func main() {
 		// reading from expired-stream
 		// https://github.com/antirez/redis/issues/5543
 		startID := "$"
-		expiredMetricIDs := []string{}
 
 	again:
+		expiredMetricIDs := []string{}
+
 		xstreams, err := client.XRead(&goredis.XReadArgs{
 			Streams: []string{expiredStream, startID},
 			Block:   0,
@@ -108,7 +109,8 @@ func main() {
 		}
 
 		// begin transaction flush to cassandra
-		metricIDs := expiredMetricIDs
+		metricIDs := make([]string, len(expiredMetricIDs))
+		copy(metricIDs, expiredMetricIDs)
 		go func(metricIDs []string) {
 			fn := func(tx *goredis.Tx) error {
 				for _, metricID := range metricIDs {
@@ -128,9 +130,6 @@ func main() {
 				log.Println(err)
 			}
 		}(metricIDs)
-
-		// zero clear
-		expiredMetricIDs = expiredMetricIDs[:0]
 
 		goto again
 	}()
