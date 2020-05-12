@@ -13,6 +13,7 @@ import (
 const (
 	expiredStream = "expired-stream"
 	prefixEx      = "ex:"
+	flusherXGroup = "flushers"
 )
 
 func init() {
@@ -81,58 +82,82 @@ func main() {
 		// TODO: consumer group
 		// reading from expired-stream
 		// https://github.com/antirez/redis/issues/5543
-		startID := "$"
 
-	again:
-		expiredMetricIDs := []string{}
+		for {
+			expiredMetricIDs := []string{}
+			expiredStreamIDs := []string{}
 
-		xstreams, err := client.XRead(&goredis.XReadArgs{
-			Streams: []string{expiredStream, startID},
-			Block:   0,
-		}).Result()
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		for _, xstream := range xstreams {
-			for _, xmsg := range xstream.Messages {
-				for metricID := range xmsg.Values {
-					expiredMetricIDs = append(expiredMetricIDs, metricID)
+			// TODO: launch multiple goroutines
+			xstreams, err := client.XReadGroup(&goredis.XReadGroupArgs{
+				Group:    flusherXGroup,
+				Consumer: "flusher-1",
+				Streams:  []string{expiredStream, ">"},
+				Count:    100,
+				Block:    30 * time.Second,
+			}).Result()
+			if err != nil {
+				if err.Error() != "redis: nil" {
+					log.Println(err)
 				}
-				startID = xmsg.ID
+				continue
 			}
-		}
-		log.Println(expiredMetricIDs)
 
-		if len(expiredMetricIDs) < 1 {
-			goto again
-		}
+			for _, xstream := range xstreams {
+				for _, xmsg := range xstream.Messages {
+					for metricID := range xmsg.Values {
+						expiredMetricIDs = append(expiredMetricIDs, metricID)
+					}
+					expiredStreamIDs = append(expiredStreamIDs, xmsg.ID)
+				}
+			}
+			log.Println(expiredMetricIDs)
 
-		// begin transaction flush to cassandra
-		metricIDs := make([]string, len(expiredMetricIDs))
-		copy(metricIDs, expiredMetricIDs)
-		go func(metricIDs []string) {
-			fn := func(tx *goredis.Tx) error {
-				for _, metricID := range metricIDs {
-					xmsgs, err := tx.XRange(metricID, "-", "+").Result()
-					if err != nil {
+			if len(expiredMetricIDs) < 1 {
+				continue
+			}
+
+			// begin transaction flush to cassandra
+			metricIDs := make([]string, len(expiredMetricIDs))
+			copy(metricIDs, expiredMetricIDs)
+			streamIDs := make([]string, len(expiredStreamIDs))
+			copy(streamIDs, expiredStreamIDs)
+
+			go func(metricIDs []string, streamIDs []string) {
+				fn := func(tx *goredis.Tx) error {
+					for _, metricID := range metricIDs {
+						xmsgs, err := tx.XRange(metricID, "-", "+").Result()
+						if err != nil {
+							log.Println(err)
+							return err
+						}
+						// TODO: Flush to cassandra
+						log.Printf("Flush datapoints to cassandra: %s %v\n", metricID, xmsgs)
+					}
+
+					if err := tx.XAck(expiredStream, flusherXGroup, streamIDs...).Err(); err != nil {
+						log.Println(err)
 						return err
 					}
-					log.Printf("Flush datapoints to cassandra: %s %v\n", metricID, xmsgs)
-				}
-				if err := tx.Del(metricIDs...).Err(); err != nil {
-					return err
-				}
-				return nil
-			}
-			// TODO: retry
-			if err := client.Watch(fn, metricIDs...); err != nil {
-				log.Println(err)
-			}
-		}(metricIDs)
 
-		goto again
+					if err := tx.Del(metricIDs...).Err(); err != nil {
+						log.Println(err)
+						return err
+					}
+					return nil
+				}
+				// TODO: retry
+				if err := client.Watch(fn, metricIDs...); err != nil {
+					log.Println(err)
+				}
+			}(metricIDs, streamIDs)
+		}
 	}()
+
+	// Create consumer group for expired-stream.
+	err = client.XGroupCreateMkStream(expiredStream, flusherXGroup, "$").Err()
+	if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
+		log.Fatalln(err)
+	}
 
 	pubsub := client.Subscribe("__keyevent@0__:expired")
 
