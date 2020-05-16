@@ -1,13 +1,20 @@
+/* Before you execute the program, Launch `cqlsh` and execute:
+cqlsh --execute="create keyspace xtsdb with replication = { 'class' : 'SimpleStrategy', 'replication_factor' : 1 };"
+cqlsh --keyspace xtsdb --file assets/scheme/series_cassandra.sql
+*/
+
 package main
 
 import (
 	"flag"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
 	goredis "github.com/go-redis/redis/v7"
+	"github.com/gocql/gocql"
 )
 
 const (
@@ -21,19 +28,32 @@ func init() {
 }
 
 func main() {
-	var addr = flag.String("addr", "localhost:6379", "addr:port to redis server")
-	var db = flag.Int("db", 0, "redis database")
+	var redisAddr = flag.String("redis-addr", "127.0.0.1:6379", "addr:port to redis server")
+	var redisDB = flag.Int("redis-db", 0, "redis database")
+	var cassandraAddr = flag.String("cassandra-addr", "127.0.0.1:9042", "addr:port to cassandra server")
+	var cassandraKeyspace = flag.String("cassandra-keyspace", "xtsdb", "cassandra keyspace")
 
+	// Setup redis client
 	client := goredis.NewClient(&goredis.Options{
-		Addr:     *addr,
+		Addr:     *redisAddr,
 		Password: "",
-		DB:       *db,
+		DB:       *redisDB,
 	})
 
 	_, err := client.Ping().Result()
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	// Setup cassandra client
+	cluster := gocql.NewCluster(*cassandraAddr)
+	cluster.Keyspace = *cassandraKeyspace
+	cluster.Consistency = gocql.Any
+	session, err := cluster.CreateSession()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer session.Close()
 
 	// ingester
 	go func() {
@@ -55,6 +75,7 @@ func main() {
 
 		for stream, datapoints := range metrics {
 			for _, datapoint := range datapoints {
+				// TODO: redis lua scripting
 				_, err := client.XAdd(&goredis.XAddArgs{
 					Stream: stream,
 					ID:     fmt.Sprintf("%d", datapoint.Timestamp),
@@ -132,7 +153,29 @@ func main() {
 						}
 						// TODO: Flush to cassandra
 						log.Printf("Flush datapoints to cassandra: %s %v\n", metricID, xmsgs)
+						for _, xmsg := range xmsgs {
+							ts, err := strconv.ParseInt(strings.TrimSuffix(xmsg.ID, "-0"), 10, 64)
+							if err != nil {
+								log.Println(err)
+								return err
+							}
+							for _, v := range xmsg.Values {
+								val, err := strconv.ParseFloat(v.(string), 64)
+								if err != nil {
+									log.Println(err)
+									return err
+								}
+								err = session.Query(`INSERT INTO datapoint (metric_id, timestamp, value) VALUES (?, ?, ?)`,
+									metricID, ts, val).Exec()
+								if err != nil {
+									log.Println(err)
+									return err
+								}
+							}
+						}
 					}
+
+					// TODO: lua script for xack and del
 
 					if err := tx.XAck(expiredStream, flusherXGroup, streamIDs...).Err(); err != nil {
 						log.Println(err)
