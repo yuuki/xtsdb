@@ -154,19 +154,24 @@ func main() {
 						// TODO: Flush to cassandra
 						log.Printf("Flush datapoints to cassandra: %s %v\n", metricID, xmsgs)
 						for _, xmsg := range xmsgs {
-							ts, err := strconv.ParseInt(strings.TrimSuffix(xmsg.ID, "-0"), 10, 64)
+							t, err := strconv.ParseInt(strings.TrimSuffix(xmsg.ID, "-0"), 10, 64)
 							if err != nil {
 								log.Println(err)
 								return err
 							}
+
+							timestamp := time.Unix(t, 0)
+
 							for _, v := range xmsg.Values {
 								val, err := strconv.ParseFloat(v.(string), 64)
 								if err != nil {
 									log.Println(err)
 									return err
 								}
-								err = session.Query(`INSERT INTO datapoint (metric_id, timestamp, value) VALUES (?, ?, ?)`,
-									metricID, ts, val).Exec()
+								err = session.Query(`
+									INSERT INTO datapoint (metric_id, timestamp, value)
+									VALUES (?, ?, ?) `, metricID, timestamp, val,
+								).Exec()
 								if err != nil {
 									log.Println(err)
 									return err
