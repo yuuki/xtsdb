@@ -11,7 +11,7 @@ Xtsdb is a scalable time series database on two tiers of Redis and Cassandra.
 - Memory-based KVS
   - Redis 5.0+
 - Disk-based KVS
-  - Apache Cassandra 4.0+
+  - Apache Cassandra 3.0+
   - Apache HBase (To be added)
   - Amazon DynamoDB (To be added)
   - Amazon S3 (To be added)
