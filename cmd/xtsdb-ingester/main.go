@@ -4,9 +4,15 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
 
-	"github.com/labstack/gommon/log"
+	"github.com/yuuki/xtsdb/ingester"
+)
+
+const (
+	exitCodeOK  = 0
+	exitCodeErr = 10 + iota
 )
 
 // CLI is the command line object.
@@ -35,12 +41,22 @@ func (cli *CLI) Run(args []string) int {
 		fmt.Fprint(cli.errStream, helpText)
 	}
 	flags.StringVar(&listenAddr, "graphiteListenAddr", "", "")
-
-	if listenAddr == "" {
-		log.Printf("any of ListenAddr option is required")
+	if err := flags.Parse(args[1:]); err != nil {
+		return exitCodeErr
 	}
 
-	return 0
+	if listenAddr == "" {
+		log.Println("any of ListenAddr option is required")
+		return exitCodeErr
+	}
+
+	log.Println("Starting xtsdb-ingester...")
+	if err := ingester.Serve(listenAddr); err != nil {
+		log.Printf("%+v\n", err)
+		return exitCodeErr
+	}
+
+	return exitCodeOK
 }
 
 var helpText = `
