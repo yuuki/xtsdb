@@ -3,6 +3,7 @@ package redis
 import (
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	vmstorage "github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
@@ -15,6 +16,8 @@ const (
 	// prefixEx is a prefix of expired keys.
 	prefixKeyForExpire = "ex:"
 	durationForExpire  = 5 * time.Second
+	expiredStreamName  = "expired-stream"
+	flusherXGroup      = "flushers"
 )
 
 // Redis provides a redis client.
@@ -58,6 +61,40 @@ func (r *Redis) AddRows(mrs []vmstorage.MetricRow) error {
 			continue
 		}
 		fmt.Printf("Set expire to key '%s'\n", key)
+	}
+
+	return nil
+}
+
+func (r *Redis) SubscribeExpiredDataPoints() error {
+	// Create consumer group for expired-stream.
+	err := r.client.XGroupCreateMkStream(expiredStreamName, flusherXGroup, "$").Err()
+	if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
+		return xerrors.Errorf("Could not create consumer group for the stream on redis: %w", err)
+	}
+
+	pubsub := r.client.Subscribe("__keyevent@0__:expired")
+
+	// Wait for confirmation that subscription is created before publishing anything.
+	if _, err = pubsub.Receive(); err != nil {
+		return xerrors.Errorf("Could not receive pub/sub on redis: %w", err)
+	}
+
+	log.Println("Waiting expired events")
+
+	ch := pubsub.Channel()
+	for msg := range ch {
+		metricID := strings.TrimPrefix(msg.Payload, prefixKeyForExpire)
+		err := r.client.XAdd(&goredis.XAddArgs{
+			Stream: expiredStreamName,
+			ID:     "*",
+			Values: map[string]interface{}{metricID: ""},
+		}).Err()
+		if err != nil {
+			log.Printf("Could not add message('%s') to stream('%s'): %s\n",
+				msg, expiredStreamName, err)
+			continue
+		}
 	}
 
 	return nil

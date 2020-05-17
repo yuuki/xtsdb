@@ -7,6 +7,8 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/ingestserver/graphite"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/procutil"
 	vmparser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/graphite"
+
+	"github.com/yuuki/xtsdb/storage"
 )
 
 // insertHandler processes remote write for graphite plaintext protocol.
@@ -37,9 +39,19 @@ func insertRows(rows []vmparser.Row) error {
 
 // Serve runs a server.
 func Serve(addr string) error {
+	// Start
+	go func() {
+		log.Println("Starting streamer of old data points")
+		if err := storage.StreamVolatileDataPoints(); err != nil {
+			log.Printf("%+v\n")
+		}
+		log.Println("Shutdown streamer of old data points")
+	}()
+
 	graphiteServer := graphite.MustStart(addr, insertHandler)
 	defer graphiteServer.MustStop()
 
+	// TODO: Wait until goroutines stop
 	sig := procutil.WaitForSigterm()
 	log.Printf("received signal %s\n", sig)
 

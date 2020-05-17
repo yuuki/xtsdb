@@ -31,3 +31,16 @@ func AddRows(mrs []vmstorage.MetricRow) error {
 	}
 	return nil
 }
+
+// StreamVolatileDataPoints streams volatile datapoints to reliable stream.
+func StreamVolatileDataPoints() error {
+	r, err := redis.New()
+	if err != nil {
+		return err
+	}
+	if err := r.SubscribeExpiredDataPoints(); err != nil {
+		return err
+	}
+
+	return nil
+}
