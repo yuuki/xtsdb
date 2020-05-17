@@ -23,7 +23,6 @@ github.com/VictoriaMetrics/VictoriaMetrics/lib/syncwg
 github.com/VictoriaMetrics/VictoriaMetrics/lib/timerpool
 github.com/VictoriaMetrics/VictoriaMetrics/lib/uint64set
 github.com/VictoriaMetrics/VictoriaMetrics/lib/workingsetcache
-github.com/VictoriaMetrics/VictoriaMetrics/lib/writeconcurrencylimiter
 # github.com/VictoriaMetrics/fastcache v1.5.7
 github.com/VictoriaMetrics/fastcache
 # github.com/VictoriaMetrics/metrics v1.11.2
