@@ -67,5 +67,9 @@ github.com/valyala/histogram
 # golang.org/x/sys v0.0.0-20200501145240-bc7a7d42d5c3
 golang.org/x/sys/internal/unsafeheader
 golang.org/x/sys/unix
+# golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543
+## explicit
+golang.org/x/xerrors
+golang.org/x/xerrors/internal
 # gopkg.in/inf.v0 v0.9.1
 gopkg.in/inf.v0
