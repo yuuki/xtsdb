@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"github.com/yuuki/xtsdb/ingester"
+	"github.com/yuuki/xtsdb/storage"
 )
 
 const (
@@ -44,6 +45,8 @@ func (cli *CLI) Run(args []string) int {
 	if err := flags.Parse(args[1:]); err != nil {
 		return exitCodeErr
 	}
+
+	storage.Init()
 
 	if listenAddr == "" {
 		log.Println("any of ListenAddr option is required")
