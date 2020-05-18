@@ -43,7 +43,7 @@ func Serve(addr string) error {
 	go func() {
 		log.Println("Starting streamer of old data points")
 		if err := storage.StreamVolatileDataPoints(); err != nil {
-			log.Printf("%+v\n")
+			log.Printf("%+v\n", err)
 		}
 		log.Println("Shutdown streamer of old data points")
 	}()
