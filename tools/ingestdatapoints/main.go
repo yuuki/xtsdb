@@ -100,7 +100,6 @@ func main() {
 
 	// flusher
 	go func() {
-		// TODO: consumer group
 		// reading from expired-stream
 		// https://github.com/antirez/redis/issues/5543
 

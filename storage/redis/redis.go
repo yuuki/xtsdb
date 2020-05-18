@@ -99,3 +99,76 @@ func (r *Redis) SubscribeExpiredDataPoints() error {
 
 	return nil
 }
+
+// FlushExpiredDataPoints runs a loop of flushing data points
+// from Redis to DiskStore.
+func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []goredis.XMessage) error) error {
+	for {
+		expiredMetricIDs := []string{}
+		expiredStreamIDs := []string{}
+
+		// TODO: launch multiple goroutines
+		xstreams, err := r.client.XReadGroup(&goredis.XReadGroupArgs{
+			Group:    flusherXGroup,
+			Consumer: "flusher-1",
+			Streams:  []string{expiredStreamName, ">"},
+			Count:    100,
+			Block:    30 * time.Second,
+		}).Result()
+		if err != nil {
+			if err.Error() != "redis: nil" {
+				log.Println(err)
+			}
+			continue
+		}
+
+		for _, xstream := range xstreams {
+			for _, xmsg := range xstream.Messages {
+				for metricID := range xmsg.Values {
+					expiredMetricIDs = append(expiredMetricIDs, metricID)
+				}
+				expiredStreamIDs = append(expiredStreamIDs, xmsg.ID)
+			}
+		}
+		log.Println(expiredMetricIDs)
+
+		if len(expiredMetricIDs) < 1 {
+			continue
+		}
+
+		// begin transaction flush to cassandra
+		metricIDs := make([]string, len(expiredMetricIDs))
+		copy(metricIDs, expiredMetricIDs)
+		streamIDs := make([]string, len(expiredStreamIDs))
+		copy(streamIDs, expiredStreamIDs)
+
+		go func(metricIDs []string, streamIDs []string) {
+			fn := func(tx *goredis.Tx) error {
+				for _, metricID := range metricIDs {
+					xmsgs, err := tx.XRange(metricID, "-", "+").Result()
+					if err != nil {
+						return xerrors.Errorf("Could not xrange %v: %w", metricID, err)
+					}
+					if err := flushHandler(metricID, xmsgs); err != nil {
+						return err
+					}
+				}
+
+				// TODO: lua script for xack and del
+
+				if err := tx.XAck(expiredStreamName, flusherXGroup, streamIDs...).Err(); err != nil {
+					return xerrors.Errorf(": %w", err)
+				}
+
+				if err := tx.Del(metricIDs...).Err(); err != nil {
+					return xerrors.Errorf(": %w", err)
+				}
+				return nil
+			}
+			// TODO: retry
+			if err := r.client.Watch(fn, metricIDs...); err != nil {
+				log.Printf("failed transaction %v: %s", metricIDs, err)
+			}
+		}(metricIDs, streamIDs)
+	}
+}
