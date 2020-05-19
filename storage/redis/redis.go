@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	vmstorage "github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
@@ -40,27 +41,38 @@ func New() (*Redis, error) {
 
 // AddRows inserts rows into redis-server.
 func (r *Redis) AddRows(mrs []vmstorage.MetricRow) error {
+	log.Println(len(mrs))
+
+	var wg sync.WaitGroup
 	for _, row := range mrs {
-		mname := string(row.MetricNameRaw)
+		wg.Add(1)
+		go func(row vmstorage.MetricRow) error {
+			defer wg.Done()
 
-		// TODO: redis lua scripting
-		err := r.client.XAdd(&goredis.XAddArgs{
-			Stream: mname,
-			ID:     fmt.Sprintf("%d", row.Timestamp),
-			Values: map[string]interface{}{"": row.Value},
-		}).Err()
-		if err != nil {
-			log.Printf("Could not add stream: %s", err)
-			continue
-		}
+			mname := string(row.MetricNameRaw)
 
-		// TODO: check expired and set
-		key := prefixKeyForExpire + mname
-		if err := r.client.Set(key, true, config.Config.DurationExpires).Err(); err != nil {
-			log.Printf("Could not set stream: %s", err)
-			continue
-		}
+			// TODO: redis lua scripting
+			err := r.client.XAdd(&goredis.XAddArgs{
+				Stream: mname,
+				ID:     fmt.Sprintf("%d", row.Timestamp),
+				Values: map[string]interface{}{"": row.Value},
+			}).Err()
+			if err != nil {
+				log.Printf("Could not add stream: %s", err)
+				return err
+			}
+
+			// TODO: check expired and set
+			key := prefixKeyForExpire + mname
+			if err := r.client.Set(key, true, config.Config.DurationExpires).Err(); err != nil {
+				log.Printf("Could not set stream: %s", err)
+				return err
+			}
+
+			return nil
+		}(row)
 	}
+	wg.Wait()
 
 	return nil
 }
