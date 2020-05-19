@@ -7,15 +7,15 @@ import (
 	"time"
 
 	vmstorage "github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
-
 	goredis "github.com/go-redis/redis/v7"
 	"golang.org/x/xerrors"
+
+	"github.com/yuuki/xtsdb/config"
 )
 
 const (
 	// prefixEx is a prefix of expired keys.
 	prefixKeyForExpire = "ex:"
-	durationForExpire  = 5 * time.Second
 	expiredStreamName  = "expired-stream"
 	flusherXGroup      = "flushers"
 )
@@ -56,7 +56,7 @@ func (r *Redis) AddRows(mrs []vmstorage.MetricRow) error {
 
 		// TODO: check expired and set
 		key := prefixKeyForExpire + mname
-		if err := r.client.Set(key, true, durationForExpire).Err(); err != nil {
+		if err := r.client.Set(key, true, config.Config.DurationExpires).Err(); err != nil {
 			log.Printf("Could not set stream: %s", err)
 			continue
 		}

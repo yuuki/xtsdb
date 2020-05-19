@@ -6,7 +6,9 @@ import (
 	"io"
 	"log"
 	"os"
+	"time"
 
+	"github.com/yuuki/xtsdb/config"
 	"github.com/yuuki/xtsdb/ingester"
 	"github.com/yuuki/xtsdb/storage"
 )
@@ -33,7 +35,8 @@ func (cli *CLI) Run(args []string) int {
 	log.SetOutput(cli.errStream)
 
 	var (
-		listenAddr string
+		listenAddr      string
+		durationExpires string
 	)
 
 	flags := flag.NewFlagSet("xtsdb-ingester", flag.ContinueOnError)
@@ -42,9 +45,16 @@ func (cli *CLI) Run(args []string) int {
 		fmt.Fprint(cli.errStream, helpText)
 	}
 	flags.StringVar(&listenAddr, "graphiteListenAddr", "", "")
+	flags.StringVar(&durationExpires, "durationExpires", "1h", "")
 	if err := flags.Parse(args[1:]); err != nil {
 		return exitCodeErr
 	}
+
+	ts, err := time.ParseDuration(durationExpires)
+	if err != nil {
+		log.Printf("Could not parse %s : %s\n", durationExpires, err)
+	}
+	config.Config.DurationExpires = ts
 
 	storage.Init()
 
