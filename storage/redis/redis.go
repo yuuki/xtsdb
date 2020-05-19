@@ -72,7 +72,7 @@ func (r *Redis) initExpiredStream() error {
 	if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
 		return xerrors.Errorf("Could not create consumer group for the stream on redis: %w", err)
 	}
-	return err
+	return nil
 }
 
 func (r *Redis) SubscribeExpiredDataPoints() error {
