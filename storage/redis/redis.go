@@ -112,7 +112,6 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []goredis.XMess
 			Group:    flusherXGroup,
 			Consumer: "flusher-1",
 			Streams:  []string{expiredStreamName, ">"},
-			Count:    100,
 			Block:    30 * time.Second,
 		}).Result()
 		if err != nil {
