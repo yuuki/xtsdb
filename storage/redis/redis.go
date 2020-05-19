@@ -66,17 +66,25 @@ func (r *Redis) AddRows(mrs []vmstorage.MetricRow) error {
 	return nil
 }
 
-func (r *Redis) SubscribeExpiredDataPoints() error {
+func (r *Redis) initExpiredStream() error {
 	// Create consumer group for expired-stream.
 	err := r.client.XGroupCreateMkStream(expiredStreamName, flusherXGroup, "$").Err()
 	if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
 		return xerrors.Errorf("Could not create consumer group for the stream on redis: %w", err)
 	}
+	return err
+}
+
+func (r *Redis) SubscribeExpiredDataPoints() error {
+	// Create consumer group for expired-stream.
+	if err := r.initExpiredStream(); err != nil {
+		return err
+	}
 
 	pubsub := r.client.Subscribe("__keyevent@0__:expired")
 
 	// Wait for confirmation that subscription is created before publishing anything.
-	if _, err = pubsub.Receive(); err != nil {
+	if _, err := pubsub.Receive(); err != nil {
 		return xerrors.Errorf("Could not receive pub/sub on redis: %w", err)
 	}
 
@@ -103,6 +111,10 @@ func (r *Redis) SubscribeExpiredDataPoints() error {
 // FlushExpiredDataPoints runs a loop of flushing data points
 // from Redis to DiskStore.
 func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []goredis.XMessage) error) error {
+	if err := r.initExpiredStream(); err != nil {
+		return err
+	}
+
 	for {
 		expiredMetricIDs := []string{}
 		expiredStreamIDs := []string{}
