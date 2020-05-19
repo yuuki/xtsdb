@@ -60,7 +60,6 @@ func (r *Redis) AddRows(mrs []vmstorage.MetricRow) error {
 			log.Printf("Could not set stream: %s", err)
 			continue
 		}
-		fmt.Printf("Set expire to key '%s'\n", key)
 	}
 
 	return nil
