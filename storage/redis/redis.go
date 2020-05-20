@@ -41,6 +41,10 @@ func New() (*Redis, error) {
 
 // AddRows inserts rows into redis-server.
 func (r *Redis) AddRows(mrs []vmstorage.MetricRow) error {
+	if len(mrs) == 0 {
+		return nil
+	}
+
 	log.Println(len(mrs))
 
 	var wg sync.WaitGroup
