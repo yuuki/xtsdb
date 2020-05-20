@@ -3,6 +3,7 @@ package redis
 import (
 	"fmt"
 	"log"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -49,6 +50,10 @@ func (r *Redis) AddRows(mrs []vmstorage.MetricRow) error {
 
 	var wg sync.WaitGroup
 	for _, row := range mrs {
+		if math.IsNaN(row.Value) {
+			continue
+		}
+
 		wg.Add(1)
 		go func(row vmstorage.MetricRow) error {
 			defer wg.Done()
