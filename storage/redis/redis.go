@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"io"
 	"log"
-	"math"
 	"strings"
 	"time"
 
@@ -21,6 +20,17 @@ const (
 	prefixKeyForExpire = "ex:"
 	expiredStreamName  = "expired-stream"
 	flusherXGroup      = "flushers"
+
+	// TODO: check already set expire or skip setex
+	scriptForAddRows = `
+		local res
+		for i = 1, #KEYS do
+			redis.call('xadd', KEYS[i], ARGV[i*3-2], '', ARGV[i*3-1]);
+			res = redis.call('setex', 'ex:'..KEYS[i], ARGV[i*3], 1);
+		end
+		return res
+`
+	batchSizeAddRows = 310
 )
 
 // Redis provides a redis client.
@@ -45,21 +55,12 @@ func New() (*Redis, error) {
 	hash := hex.EncodeToString(h.Sum(nil))
 
 	// register script to redis-server.
-	err := r.Eval(scriptForAddRows, []string{"xtsdb-initialize", "ex:xtsdb-initialize"},
-		1000, 0.0, 10).Err()
-	if err != nil {
-		if !strings.Contains(err.Error(), "The ID specified in XADD is equal or smaller ") {
-			return nil, xerrors.Errorf("could not register script: %w", err)
-		}
+	if err := r.ScriptLoad(scriptForAddRows).Err(); err != nil {
+		return nil, xerrors.Errorf("could not register script: %w", err)
 	}
 
 	return &Redis{client: r, hashScriptAddRows: hash}, nil
 }
-
-const (
-	scriptForAddRows = "redis.call('xadd', KEYS[1], ARGV[1], '', ARGV[2]);" +
-		"return redis.call('setex', KEYS[2], ARGV[3], 1);"
-)
 
 // AddRows inserts rows into redis-server.
 func (r *Redis) AddRows(mrs []vmstorage.MetricRow) error {
@@ -67,22 +68,33 @@ func (r *Redis) AddRows(mrs []vmstorage.MetricRow) error {
 		return nil
 	}
 
+	evalKeys := make([]string, 0, batchSizeAddRows)
+	evalArgs := make([]interface{}, 0, batchSizeAddRows)
+
 	pipe := r.client.Pipeline()
 
-	for _, row := range mrs {
-		if math.IsNaN(row.Value) {
-			continue
+	// TODO: Remove NaN value
+	// scripting the process for batches of 20 items
+	for i := 0; i < len(mrs); i += batchSizeAddRows {
+		j := i + batchSizeAddRows
+		if j > len(mrs) {
+			j = len(mrs)
 		}
 
-		mname := string(row.MetricNameRaw)
-		keyForExpire := prefixKeyForExpire + mname
+		for _, row := range mrs[i:j] {
+			evalKeys = append(evalKeys, string(row.MetricNameRaw))
+			evalArgs = append(evalArgs, int(row.Timestamp), row.Value,
+				config.Config.DurationExpires.Seconds())
+		}
 
-		err := pipe.EvalSha(r.hashScriptAddRows, []string{mname, keyForExpire},
-			int(row.Timestamp), row.Value,
-			config.Config.DurationExpires.Seconds()).Err()
+		err := pipe.EvalSha(r.hashScriptAddRows, evalKeys, evalArgs...).Err()
 		if err != nil {
 			return xerrors.Errorf("Could not add rows to redis: %w", err)
 		}
+
+		// Reset buffer
+		evalKeys = evalKeys[:0]
+		evalArgs = evalArgs[:0]
 	}
 	if _, err := pipe.Exec(); err != nil {
 		return xerrors.Errorf("Got error of pipeline: %w", err)
