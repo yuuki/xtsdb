@@ -73,7 +73,7 @@ func (r *Redis) AddRows(mrs []vmstorage.MetricRow) error {
 		}
 	}
 	if _, err := pipe.Exec(); err != nil {
-		return xerrors.Errorf("Got error of pipeline: %w")
+		return xerrors.Errorf("Got error of pipeline: %w", err)
 	}
 
 	return nil
