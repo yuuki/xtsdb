@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"time"
 
@@ -37,6 +39,8 @@ func (cli *CLI) Run(args []string) int {
 	var (
 		listenAddr      string
 		durationExpires string
+
+		profile bool
 	)
 
 	flags := flag.NewFlagSet("xtsdb-ingester", flag.ContinueOnError)
@@ -46,6 +50,7 @@ func (cli *CLI) Run(args []string) int {
 	}
 	flags.StringVar(&listenAddr, "graphiteListenAddr", "", "")
 	flags.StringVar(&durationExpires, "durationExpires", "1h", "")
+	flags.BoolVar(&profile, "profile", false, "")
 	if err := flags.Parse(args[1:]); err != nil {
 		return exitCodeErr
 	}
@@ -61,6 +66,12 @@ func (cli *CLI) Run(args []string) int {
 	if listenAddr == "" {
 		log.Println("any of ListenAddr option is required")
 		return exitCodeErr
+	}
+
+	if profile {
+		go func() {
+			log.Println(http.ListenAndServe("localhost:6060", nil))
+		}()
 	}
 
 	log.Println("Starting xtsdb-ingester...")
