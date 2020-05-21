@@ -1,7 +1,9 @@
 package redis
 
 import (
-	"fmt"
+	"crypto/sha1"
+	"encoding/hex"
+	"io"
 	"log"
 	"math"
 	"strings"
@@ -23,7 +25,8 @@ const (
 
 // Redis provides a redis client.
 type Redis struct {
-	client *goredis.Client
+	client            *goredis.Client
+	hashScriptAddRows string
 }
 
 // New creates a Redis client.
@@ -36,8 +39,27 @@ func New() (*Redis, error) {
 	if err := r.Ping().Err(); err != nil {
 		return nil, xerrors.Errorf("could not ping: %w", err)
 	}
-	return &Redis{client: r}, nil
+
+	h := sha1.New()
+	io.WriteString(h, scriptForAddRows)
+	hash := hex.EncodeToString(h.Sum(nil))
+
+	// register script to redis-server.
+	err := r.Eval(scriptForAddRows, []string{"xtsdb-initialize", "ex:xtsdb-initialize"},
+		1000, 0.0, 10).Err()
+	if err != nil {
+		if !strings.Contains(err.Error(), "The ID specified in XADD is equal or smaller ") {
+			return nil, xerrors.Errorf("could not register script: %w", err)
+		}
+	}
+
+	return &Redis{client: r, hashScriptAddRows: hash}, nil
 }
+
+const (
+	scriptForAddRows = "redis.call('xadd', KEYS[1], ARGV[1], '', ARGV[2]);" +
+		"return redis.call('setex', KEYS[2], ARGV[3], 1);"
+)
 
 // AddRows inserts rows into redis-server.
 func (r *Redis) AddRows(mrs []vmstorage.MetricRow) error {
@@ -53,23 +75,13 @@ func (r *Redis) AddRows(mrs []vmstorage.MetricRow) error {
 		}
 
 		mname := string(row.MetricNameRaw)
+		keyForExpire := prefixKeyForExpire + mname
 
-		// TODO: redis lua scripting
-		err := pipe.XAdd(&goredis.XAddArgs{
-			Stream: mname,
-			ID:     fmt.Sprintf("%d", row.Timestamp),
-			Values: map[string]interface{}{"": row.Value},
-		}).Err()
+		err := pipe.EvalSha(r.hashScriptAddRows, []string{mname, keyForExpire},
+			int(row.Timestamp), row.Value,
+			config.Config.DurationExpires.Seconds()).Err()
 		if err != nil {
-			log.Printf("Could not add stream: %s", err)
-			return err
-		}
-
-		// TODO: check expired and set
-		key := prefixKeyForExpire + mname
-		if err := pipe.Set(key, true, config.Config.DurationExpires).Err(); err != nil {
-			log.Printf("Could not set stream: %s", err)
-			return err
+			return xerrors.Errorf("Could not add rows to redis: %w", err)
 		}
 	}
 	if _, err := pipe.Exec(); err != nil {
