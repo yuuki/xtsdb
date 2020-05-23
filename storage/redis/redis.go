@@ -21,12 +21,14 @@ const (
 	expiredStreamName  = "expired-stream"
 	flusherXGroup      = "flushers"
 
-	// TODO: check already set expire or skip setex
 	scriptForAddRows = `
 		local res
 		for i = 1, #KEYS do
-			redis.call('xadd', KEYS[i], ARGV[i*3-2], '', ARGV[i*3-1]);
-			res = redis.call('setex', 'ex:'..KEYS[i], ARGV[i*3], 1);
+			redis.call('XADD', KEYS[i], ARGV[i*3-2], '', ARGV[i*3-1]);
+			local key = 'ex:'..KEYS[i];
+			if redis.call('GET', key) ~= 1 then
+				res = redis.call('SETEX', key, ARGV[i*3], 1);
+			end
 		end
 		return res
 `
