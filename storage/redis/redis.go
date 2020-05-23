@@ -71,7 +71,7 @@ func (r *Redis) AddRows(mrs []vmstorage.MetricRow) error {
 	}
 
 	evalKeys := make([]string, 0, batchSizeAddRows)
-	evalArgs := make([]interface{}, 0, batchSizeAddRows)
+	evalArgs := make([]interface{}, 0, batchSizeAddRows*3)
 
 	pipe := r.client.Pipeline()
 
