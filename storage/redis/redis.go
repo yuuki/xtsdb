@@ -24,9 +24,9 @@ const (
 	scriptForAddRows = `
 		local res
 		for i = 1, #KEYS do
-			redis.call('XADD', KEYS[i], ARGV[i*3-2], '', ARGV[i*3-1]);
+			res = redis.call('XADD', KEYS[i], ARGV[i*3-2], '', ARGV[i*3-1]);
 			local key = 'ex:'..KEYS[i];
-			if redis.call('GET', key) ~= 1 then
+			if redis.call('GET', key) == false then
 				res = redis.call('SETEX', key, ARGV[i*3], 1);
 			end
 		end
