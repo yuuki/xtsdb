@@ -32,7 +32,7 @@ const (
 		end
 		return res
 `
-	batchSizeAddRows = 310
+	maxBatchSize = 500
 )
 
 // Redis provides a redis client.
@@ -70,15 +70,20 @@ func (r *Redis) AddRows(mrs []vmstorage.MetricRow) error {
 		return nil
 	}
 
-	evalKeys := make([]string, 0, batchSizeAddRows)
-	evalArgs := make([]interface{}, 0, batchSizeAddRows*3)
+	batchSize := len(mrs)
+	if batchSize > maxBatchSize {
+		batchSize = maxBatchSize
+	}
+
+	evalKeys := make([]string, 0, batchSize)
+	evalArgs := make([]interface{}, 0, batchSize*3)
 
 	pipe := r.client.Pipeline()
 
 	// TODO: Remove NaN value
-	// scripting the process for batches of 20 items
-	for i := 0; i < len(mrs); i += batchSizeAddRows {
-		j := i + batchSizeAddRows
+	// scripting the process for batches of items
+	for i := 0; i < len(mrs); i += batchSize {
+		j := i + batchSize
 		if j > len(mrs) {
 			j = len(mrs)
 		}
