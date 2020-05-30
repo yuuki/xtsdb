@@ -13,6 +13,11 @@ import (
 	"github.com/yuuki/xtsdb/storage"
 )
 
+var (
+	rowsInserted  = metrics.NewCounter(`xt_rows_inserted_total`)
+	rowsPerInsert = metrics.NewHistogram(`xt_rows_per_insert`)
+)
+
 // insertHandler processes remote write for graphite plaintext protocol.
 //
 // Copy code from github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/graphite.
@@ -36,6 +41,8 @@ func insertRows(rows []vmparser.Row) error {
 		}
 		ctx.WriteDataPoint(nil, ctx.Labels, r.Timestamp, r.Value)
 	}
+	rowsInserted.Add(len(rows))
+	rowsPerInsert.Update(float64(len(rows)))
 	return ctx.FlushBufs()
 }
 
