@@ -9,6 +9,7 @@ import (
 	"time"
 
 	vmstorage "github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
+	"github.com/VictoriaMetrics/metrics"
 	goredis "github.com/go-redis/redis/v7"
 	"golang.org/x/xerrors"
 
@@ -33,6 +34,11 @@ const (
 		return res
 `
 	maxBatchSize = 500
+)
+
+var (
+	metricsExpired = metrics.NewCounter(`xt_metrics_expired_total`)
+	metricsFlushed = metrics.NewCounter(`xt_metrics_flushed_total`)
 )
 
 // Redis provides a redis client.
@@ -147,6 +153,8 @@ func (r *Redis) SubscribeExpiredDataPoints() error {
 				msg, expiredStreamName, err)
 			continue
 		}
+
+		metricsExpired.Inc()
 	}
 
 	return nil
@@ -185,7 +193,6 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []goredis.XMess
 				expiredStreamIDs = append(expiredStreamIDs, xmsg.ID)
 			}
 		}
-		log.Println(expiredMetricIDs)
 
 		if len(expiredMetricIDs) < 1 {
 			continue
@@ -218,6 +225,9 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []goredis.XMess
 				if err := tx.Del(metricIDs...).Err(); err != nil {
 					return xerrors.Errorf(": %w", err)
 				}
+
+				metricsFlushed.Add(len(streamIDs))
+
 				return nil
 			}
 			// TODO: retry
