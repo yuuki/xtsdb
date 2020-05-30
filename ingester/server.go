@@ -3,10 +3,12 @@ package ingester
 import (
 	"io"
 	"log"
+	"net/http"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/ingestserver/graphite"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/procutil"
 	vmparser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/graphite"
+	"github.com/VictoriaMetrics/metrics"
 
 	"github.com/yuuki/xtsdb/storage"
 )
@@ -39,6 +41,14 @@ func insertRows(rows []vmparser.Row) error {
 
 // Serve runs a server.
 func Serve(addr string) error {
+	go func() {
+		// Expose the registered metrics at `/metrics` path.
+		http.HandleFunc("/metrics", func(w http.ResponseWriter, req *http.Request) {
+			metrics.WritePrometheus(w, true)
+		})
+		log.Fatal(http.ListenAndServe(":8080", nil))
+	}()
+
 	// Start
 	go func() {
 		log.Println("Starting streamer of old data points")

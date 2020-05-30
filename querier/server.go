@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/procutil"
+	"github.com/VictoriaMetrics/metrics"
 	"github.com/phyber/negroni-gzip/gzip"
 	"github.com/rs/cors"
 	"github.com/urfave/negroni"
@@ -21,7 +22,7 @@ func queryHandler(w http.ResponseWriter, r *http.Request) {
 
 	query := r.FormValue("query")
 	if len(query) == 0 {
-		return fmt.Errorf("missing `query` arg")
+		log.Fatal(fmt.Errorf("missing `query` arg"))
 	}
 	// start := r.FormValue("time")
 
@@ -42,6 +43,14 @@ func queryHandler(w http.ResponseWriter, r *http.Request) {
 
 // Serve runs a server.
 func Serve(addr string) error {
+	go func() {
+		// Expose the registered metrics at `/metrics` path.
+		http.HandleFunc("/metrics", func(w http.ResponseWriter, req *http.Request) {
+			metrics.WritePrometheus(w, true)
+		})
+		log.Fatal(http.ListenAndServe(":8080", nil))
+	}()
+
 	go func() {
 		n := negroni.New()
 		n.Use(negroni.NewRecovery())
