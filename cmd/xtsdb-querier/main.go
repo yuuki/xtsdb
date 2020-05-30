@@ -35,10 +35,8 @@ func (cli *CLI) Run(args []string) int {
 	log.SetOutput(cli.errStream)
 
 	var (
-		listenAddr      string
-		durationExpires string
-
-		profile bool
+		listenAddr string
+		profile    bool
 	)
 
 	flags := flag.NewFlagSet("xtsdb-querier", flag.ContinueOnError)

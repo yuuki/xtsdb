@@ -18,7 +18,7 @@ const defaultStep = 5 * 60 * 1000
 //
 // See https://prometheus.io/docs/prometheus/latest/querying/api/#instant-queries
 func queryHandler(w http.ResponseWriter, r *http.Request) {
-	ct := currentTime()
+	// ct := time.Now()
 
 	query := r.FormValue("query")
 	if len(query) == 0 {
@@ -35,7 +35,7 @@ func queryHandler(w http.ResponseWriter, r *http.Request) {
 	// }
 
 	if err := execQuery(query); err != nil {
-		log.Fataln(err)
+		log.Fatal(err)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -62,12 +62,11 @@ func Serve(addr string) error {
 			AllowedHeaders: []string{"Origin", "Accept", "Content-Type"},
 		}))
 
-		n.UseHandler(mux)
 		mux := http.NewServeMux()
 		mux.Handle("/api/v0/query", http.HandlerFunc(queryHandler))
+		n.UseHandler(mux)
 
 		srv := &http.Server{Addr: addr, Handler: n}
-
 		if err := srv.ListenAndServe(); err != nil {
 			log.Println(err)
 		}
