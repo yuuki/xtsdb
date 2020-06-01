@@ -16,7 +16,7 @@ func Serve() error {
 		http.HandleFunc("/metrics", func(w http.ResponseWriter, req *http.Request) {
 			metrics.WritePrometheus(w, true)
 		})
-		log.Fatal(http.ListenAndServe(":8080", nil))
+		log.Fatal(http.ListenAndServe(":8081", nil))
 	}()
 
 	if err := storage.FlushVolatileDataPoints(); err != nil {
