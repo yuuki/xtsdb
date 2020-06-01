@@ -226,14 +226,14 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []goredis.XMess
 					return xerrors.Errorf(": %w", err)
 				}
 
-				metricsFlushed.Add(len(streamIDs))
-
 				return nil
 			}
 			// TODO: retry
 			if err := r.client.Watch(fn, metricIDs...); err != nil {
 				log.Printf("failed transaction %v: %s", metricIDs, err)
 			}
+
+			metricsFlushed.Add(len(streamIDs))
 		}(metricIDs, streamIDs)
 	}
 }
