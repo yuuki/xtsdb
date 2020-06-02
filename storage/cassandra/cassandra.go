@@ -1,13 +1,16 @@
 package cassandra
 
 import (
+	"encoding/binary"
 	"log"
+	"math"
 	"strconv"
 	"strings"
 	"time"
 
 	goredis "github.com/go-redis/redis/v7"
 	"github.com/gocql/gocql"
+	"golang.org/x/xerrors"
 )
 
 // Cassandra provides a cassandra client.
@@ -33,35 +36,47 @@ func (c *Cassandra) Close() {
 	c.session.Close()
 }
 
+type datapoint struct {
+	timestamp int64
+	value     float64
+}
+
 // AddRows inserts rows into cassandra server.
 func (c *Cassandra) AddRows(metricName string, xmsgs []goredis.XMessage) error {
-	for _, xmsg := range xmsgs {
+	blob := make([]byte, len(xmsgs)*2*8) // 2 -> (timestamp, value) 8 -> bytes of int64 or float64
+
+	var startTime time.Time
+
+	for i, xmsg := range xmsgs {
 		ts := strings.TrimSuffix(xmsg.ID, "-0")
 		t, err := strconv.ParseInt(ts, 10, 64)
 		if err != nil {
 			log.Printf("Could not parse %s: %s\n", ts, err)
 			continue
 		}
-
-		timestamp := time.Unix(t, 0)
-
-		// TODO: Insert block of datapoints to reduce I/O/
-		for _, v := range xmsg.Values {
-			val, err := strconv.ParseFloat(v.(string), 64)
-			if err != nil {
-				log.Printf("Could not parse %v: %s\n", v, err)
-				continue
-			}
-			err = c.session.Query(`
-				INSERT INTO datapoint (metric_id, timestamp, value)
-				VALUES (?, ?, ?) `, metricName, timestamp, val,
-			).Exec()
-			if err != nil {
-				log.Printf("Could not insert datapoint (%v, %v, %v): %s\n",
-					metricName, timestamp, val, err)
-				continue
-			}
+		if startTime.IsZero() {
+			startTime = time.Unix(t, 0)
 		}
+
+		binary.BigEndian.PutUint64(blob[i*2*8:], uint64(t))
+
+		v := xmsg.Values[""]
+		val, err := strconv.ParseFloat(v.(string), 64)
+		if err != nil {
+			log.Printf("Could not parse %v: %s\n", v, err)
+			continue
+		}
+
+		binary.BigEndian.PutUint64(blob[i*2*8+8:], math.Float64bits(val))
+	}
+
+	err := c.session.Query(`
+		INSERT INTO datapoint (metric_id, timestamp, values)
+		VALUES (?, ?, ?)`, metricName, startTime, blob,
+	).Exec()
+	if err != nil {
+		return xerrors.Errorf("Could not insert datapoint (%v, %v): %w\n",
+			metricName, startTime, err)
 	}
 
 	return nil

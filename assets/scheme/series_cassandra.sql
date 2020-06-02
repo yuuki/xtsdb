@@ -1,7 +1,7 @@
 CREATE TABLE datapoint (
 	"metric_id" VARCHAR,
 	"timestamp" TIMESTAMP,
-	"value"     DOUBLE,
+	"values"    BLOB,
 
 	PRIMARY KEY ("metric_id", "timestamp"),
 );
