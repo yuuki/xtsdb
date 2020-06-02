@@ -9,6 +9,7 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -77,6 +78,7 @@ func New() (*Redis, error) {
 		r = goredis.NewClusterClient(&goredis.ClusterOptions{
 			Addrs:    addrs,
 			Password: "",
+			PoolSize: runtime.NumCPU() * 100,
 		})
 	default:
 		return nil, errors.New("redis addrs are empty")
@@ -117,7 +119,9 @@ func (r *Redis) AddRows(mrs []vmstorage.MetricRow) error {
 
 	// TODO: Remove NaN value
 	_, err := r.client.Pipelined(func(pipe goredis.Pipeliner) error {
-		for _, row := range mrs {
+		for i := range mrs {
+			row := &mrs[i]
+
 			name := "{" + string(row.MetricNameRaw) + "}" // redis hash tag
 			evalKeys := []string{name, prefixKeyForExpire + name}
 			evalArgs := []interface{}{int(row.Timestamp), row.Value,
