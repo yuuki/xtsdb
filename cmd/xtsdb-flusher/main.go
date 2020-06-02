@@ -7,7 +7,9 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"strings"
 
+	"github.com/yuuki/xtsdb/config"
 	"github.com/yuuki/xtsdb/flusher"
 	"github.com/yuuki/xtsdb/storage"
 )
@@ -34,18 +36,22 @@ func (cli *CLI) Run(args []string) int {
 	log.SetOutput(cli.errStream)
 
 	var (
-		workers int
+		workers   int
+		redisAddr string
 	)
 
 	flags := flag.NewFlagSet("xtsdb-ingester", flag.ContinueOnError)
 	flags.SetOutput(cli.errStream)
-	flags.IntVar(&workers, "workers", runtime.GOMAXPROCS(-1), "")
 	flags.Usage = func() {
 		fmt.Fprint(cli.errStream, helpText)
 	}
+	flags.StringVar(&redisAddr, "redisAddr", config.DefaultRedisAddr, "")
+	flags.IntVar(&workers, "workers", runtime.GOMAXPROCS(-1), "")
 	if err := flags.Parse(args[1:]); err != nil {
 		return exitCodeErr
 	}
+
+	config.Config.RedisAddrs = strings.Split(redisAddr, ",")
 
 	storage.Init()
 

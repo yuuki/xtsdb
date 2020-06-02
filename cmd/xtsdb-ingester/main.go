@@ -8,6 +8,7 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/yuuki/xtsdb/config"
@@ -38,6 +39,7 @@ func (cli *CLI) Run(args []string) int {
 
 	var (
 		listenAddr      string
+		redisAddr       string
 		durationExpires string
 
 		profile bool
@@ -49,11 +51,14 @@ func (cli *CLI) Run(args []string) int {
 		fmt.Fprint(cli.errStream, helpText)
 	}
 	flags.StringVar(&listenAddr, "graphiteListenAddr", "", "")
-	flags.StringVar(&durationExpires, "durationExpires", "1h", "")
+	flags.StringVar(&redisAddr, "redisAddr", config.DefaultRedisAddr, "")
+	flags.StringVar(&durationExpires, "durationExpires", config.DefaultDurationExpires, "")
 	flags.BoolVar(&profile, "profile", false, "")
 	if err := flags.Parse(args[1:]); err != nil {
 		return exitCodeErr
 	}
+
+	config.Config.RedisAddrs = strings.Split(redisAddr, ",")
 
 	ts, err := time.ParseDuration(durationExpires)
 	if err != nil {

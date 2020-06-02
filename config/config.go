@@ -3,10 +3,13 @@ package config
 import "time"
 
 const (
-	DefaultDurationExpires = 600 * time.Second
+	DefaultRedisAddr       = "127.0.0.1:6379"
+	DefaultDurationExpires = "1h"
 )
 
 type config struct {
+	// RedisAddrs is a slice of redis addrs (for redis cluster)
+	RedisAddrs []string
 	// DurationExpires is duration that datapoints on the memory store expires.
 	DurationExpires time.Duration
 }

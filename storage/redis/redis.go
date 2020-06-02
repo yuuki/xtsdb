@@ -3,6 +3,7 @@ package redis
 import (
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -45,19 +46,46 @@ var (
 	flushDuration  = metrics.NewSummary(`xt_flush_duration_seconds`)
 )
 
+// redisAPI abstratcts goredis.Client and goredis.ClusterClient.
+type redisAPI interface {
+	Ping() *goredis.StatusCmd
+	ScriptLoad(string) *goredis.StringCmd
+	Pipeline() goredis.Pipeliner
+	Pipelined(func(goredis.Pipeliner) error) ([]goredis.Cmder, error)
+	Subscribe(...string) *goredis.PubSub
+	XGroupCreateMkStream(string, string, string) *goredis.StatusCmd
+	XAdd(*goredis.XAddArgs) *goredis.StringCmd
+	XReadGroup(*goredis.XReadGroupArgs) *goredis.XStreamSliceCmd
+	XRange(string, string, string) *goredis.XMessageSliceCmd
+	Watch(func(*goredis.Tx) error, ...string) error
+}
+
 // Redis provides a redis client.
 type Redis struct {
-	client            *goredis.Client
+	client            redisAPI
 	hashScriptAddRows string
 }
 
 // New creates a Redis client.
 func New() (*Redis, error) {
-	r := goredis.NewClient(&goredis.Options{
-		Addr:     "127.0.0.1:6379",
-		Password: "",
-		DB:       0,
-	})
+	addrs := config.Config.RedisAddrs
+	var r redisAPI
+	switch size := len(addrs); {
+	case size == 1:
+		r = goredis.NewClient(&goredis.Options{
+			Addr:     addrs[0],
+			Password: "",
+			DB:       0,
+		})
+	case size > 1:
+		r = goredis.NewClusterClient(&goredis.ClusterOptions{
+			Addrs:    addrs,
+			Password: "",
+		})
+	default:
+		return nil, errors.New("redis addrs are empty")
+	}
+
 	if err := r.Ping().Err(); err != nil {
 		return nil, xerrors.Errorf("could not ping: %w", err)
 	}
