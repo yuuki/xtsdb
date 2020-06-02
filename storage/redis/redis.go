@@ -176,10 +176,10 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []goredis.XMess
 			Group:    flusherXGroup,
 			Consumer: "flusher-1",
 			Streams:  []string{expiredStreamName, ">"},
-			Block:    30 * time.Second,
+			Block:    5 * time.Second,
 		}).Result()
 		if err != nil {
-			if err.Error() != "redis: nil" {
+			if err != goredis.Nil {
 				log.Println(err)
 			}
 			continue
@@ -204,36 +204,39 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []goredis.XMess
 		streamIDs := make([]string, len(expiredStreamIDs))
 		copy(streamIDs, expiredStreamIDs)
 
+		for _, metricID := range metricIDs {
+			xmsgs, err := r.client.XRange(metricID, "-", "+").Result()
+			if err != nil {
+				return xerrors.Errorf("Could not xrange %v: %w", metricID, err)
+			}
+			if err := flushHandler(metricID, xmsgs); err != nil {
+				return err
+			}
+		}
+
 		fn := func(tx *goredis.Tx) error {
-			for _, metricID := range metricIDs {
-				xmsgs, err := tx.XRange(metricID, "-", "+").Result()
-				if err != nil {
-					return xerrors.Errorf("Could not xrange %v: %w", metricID, err)
-				}
-				if err := flushHandler(metricID, xmsgs); err != nil {
-					return err
-				}
-			}
-
 			// TODO: lua script for xack and del
-
-			if err := tx.XAck(expiredStreamName, flusherXGroup, streamIDs...).Err(); err != nil {
-				return xerrors.Errorf("Could not xack (%s,%s) (%v): %w", expiredStreamName, flusherXGroup, streamIDs, err)
-			}
-
-			if err := tx.XDel(expiredStreamName, streamIDs...).Err(); err != nil {
-				return xerrors.Errorf("Could not xdel (%s) (%v): %w", expiredStreamName, streamIDs, err)
-			}
-
-			if err := tx.Del(metricIDs...).Err(); err != nil {
-				return xerrors.Errorf("Could not del (%v): %w", metricIDs, err)
+			_, err := tx.Pipelined(func(pipe goredis.Pipeliner) error {
+				if err := pipe.XAck(expiredStreamName, flusherXGroup, streamIDs...).Err(); err != nil {
+					return xerrors.Errorf("Could not xack (%s,%s) (%v): %w", expiredStreamName, flusherXGroup, streamIDs, err)
+				}
+				if err := pipe.XDel(expiredStreamName, streamIDs...).Err(); err != nil {
+					return xerrors.Errorf("Could not xdel (%s) (%v): %w", expiredStreamName, streamIDs, err)
+				}
+				if err := pipe.Del(metricIDs...).Err(); err != nil {
+					return xerrors.Errorf("Could not del (%v): %w", metricIDs, err)
+				}
+				return nil
+			})
+			if err != nil {
+				return xerrors.Errorf("Could not complete to pipeline for deleting old data: %w", err)
 			}
 
 			return nil
 		}
 		// TODO: retry
 		if err := r.client.Watch(fn, append(metricIDs, expiredStreamName)...); err != nil {
-			log.Printf("failed transaction (%v): %s", metricIDs, err)
+			log.Printf("failed transaction (%v): %s\n", metricIDs, err)
 		}
 
 		metricsFlushed.Add(len(streamIDs))
