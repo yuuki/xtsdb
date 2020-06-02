@@ -42,6 +42,7 @@ const (
 var (
 	metricsExpired = metrics.NewCounter(`xt_metrics_expired_total`)
 	metricsFlushed = metrics.NewCounter(`xt_metrics_flushed_total`)
+	flushDuration  = metrics.NewSummary(`xt_flush_duration_seconds`)
 )
 
 // Redis provides a redis client.
@@ -175,6 +176,8 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []goredis.XMess
 		hostname, os.Getpid(), time.Now().UnixNano(), rand.Int31())
 
 	for {
+		startTime := time.Now()
+
 		expiredMetricIDs := []string{}
 		expiredStreamIDs := []string{}
 
@@ -246,6 +249,7 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []goredis.XMess
 			log.Printf("failed transaction (%v): %s\n", metricIDs, err)
 		}
 
+		flushDuration.UpdateDuration(startTime)
 		metricsFlushed.Add(len(streamIDs))
 	}
 }
