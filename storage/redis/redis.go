@@ -27,13 +27,9 @@ const (
 	flusherXGroup      = "flushers"
 
 	scriptForAddRows = `
-		local res
-		for i = 1, #KEYS do
-			res = redis.call('XADD', KEYS[i], ARGV[i*3-2], '', ARGV[i*3-1]);
-			local key = 'ex:'..KEYS[i];
-			if redis.call('GET', key) == false then
-				res = redis.call('SETEX', key, ARGV[i*3], 1);
-			end
+		local res = redis.call('XADD', KEYS[1], ARGV[1], '', ARGV[2]);
+		if redis.call('GET', KEYS[2]) == false then
+			res = redis.call('SETEX', KEYS[2], ARGV[3], 1);
 		end
 		return res
 `
@@ -119,40 +115,21 @@ func (r *Redis) AddRows(mrs []vmstorage.MetricRow) error {
 		return nil
 	}
 
-	batchSize := len(mrs)
-	if batchSize > maxBatchSize {
-		batchSize = maxBatchSize
-	}
-
-	evalKeys := make([]string, 0, batchSize)
-	evalArgs := make([]interface{}, 0, batchSize*3)
-
-	pipe := r.client.Pipeline()
-
 	// TODO: Remove NaN value
-	// scripting the process for batches of items
-	for i := 0; i < len(mrs); i += batchSize {
-		j := i + batchSize
-		if j > len(mrs) {
-			j = len(mrs)
+	_, err := r.client.Pipelined(func(pipe goredis.Pipeliner) error {
+		for _, row := range mrs {
+			name := "{" + string(row.MetricNameRaw) + "}" // redis hash tag
+			evalKeys := []string{name, prefixKeyForExpire + name}
+			evalArgs := []interface{}{int(row.Timestamp), row.Value,
+				config.Config.DurationExpires.Seconds()}
+			err := pipe.EvalSha(r.hashScriptAddRows, evalKeys, evalArgs...).Err()
+			if err != nil {
+				return xerrors.Errorf("Could not add rows to redis: %w", err)
+			}
 		}
-
-		for _, row := range mrs[i:j] {
-			evalKeys = append(evalKeys, string(row.MetricNameRaw))
-			evalArgs = append(evalArgs, int(row.Timestamp), row.Value,
-				config.Config.DurationExpires.Seconds())
-		}
-
-		err := pipe.EvalSha(r.hashScriptAddRows, evalKeys, evalArgs...).Err()
-		if err != nil {
-			return xerrors.Errorf("Could not add rows to redis: %w", err)
-		}
-
-		// Reset buffer
-		evalKeys = evalKeys[:0]
-		evalArgs = evalArgs[:0]
-	}
-	if _, err := pipe.Exec(); err != nil {
+		return nil
+	})
+	if err != nil {
 		return xerrors.Errorf("Got error of pipeline: %w", err)
 	}
 
