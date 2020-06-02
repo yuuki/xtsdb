@@ -95,8 +95,19 @@ func New() (*Redis, error) {
 	hash := hex.EncodeToString(h.Sum(nil))
 
 	// register script to redis-server.
-	if err := r.ScriptLoad(scriptForAddRows).Err(); err != nil {
-		return nil, xerrors.Errorf("could not register script: %w", err)
+	rcc, ok := r.(*goredis.ClusterClient)
+	if ok {
+		err := rcc.ForEachMaster(func(client *goredis.Client) error {
+			return client.ScriptLoad(scriptForAddRows).Err()
+		})
+		if err != nil {
+			return nil, xerrors.Errorf(
+				"could not register script to cluster masters: %w", err)
+		}
+	} else {
+		if err := r.ScriptLoad(scriptForAddRows).Err(); err != nil {
+			return nil, xerrors.Errorf("could not register script: %w", err)
+		}
 	}
 
 	return &Redis{client: r, hashScriptAddRows: hash}, nil
