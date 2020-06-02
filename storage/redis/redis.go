@@ -38,9 +38,10 @@ const (
 )
 
 var (
-	metricsExpired = metrics.NewCounter(`xt_metrics_expired_total`)
-	metricsFlushed = metrics.NewCounter(`xt_metrics_flushed_total`)
-	flushDuration  = metrics.NewSummary(`xt_flush_duration_seconds`)
+	metricsExpired     = metrics.NewCounter(`xt_metrics_expired_total`)
+	metricsFlushed     = metrics.NewCounter(`xt_metrics_flushed_total`)
+	flushDuration      = metrics.NewSummary(`xt_flush_duration_seconds`)
+	insertRowsDuration = metrics.NewSummary(`xt_insert_rows_duration_seconds`)
 )
 
 // redisAPI abstratcts goredis.Client and goredis.ClusterClient.
@@ -116,6 +117,7 @@ func (r *Redis) AddRows(mrs []vmstorage.MetricRow) error {
 	if len(mrs) == 0 {
 		return nil
 	}
+	startTime := time.Now()
 
 	// TODO: Remove NaN value
 	_, err := r.client.Pipelined(func(pipe goredis.Pipeliner) error {
@@ -137,6 +139,7 @@ func (r *Redis) AddRows(mrs []vmstorage.MetricRow) error {
 		return xerrors.Errorf("Got error of pipeline: %w", err)
 	}
 
+	insertRowsDuration.UpdateDuration(startTime)
 	return nil
 }
 
