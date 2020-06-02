@@ -218,18 +218,22 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []goredis.XMess
 			// TODO: lua script for xack and del
 
 			if err := tx.XAck(expiredStreamName, flusherXGroup, streamIDs...).Err(); err != nil {
-				return xerrors.Errorf(": %w", err)
+				return xerrors.Errorf("Could not xack (%s,%s) (%v): %w", expiredStreamName, flusherXGroup, streamIDs, err)
+			}
+
+			if err := tx.XDel(expiredStreamName, streamIDs...).Err(); err != nil {
+				return xerrors.Errorf("Could not xdel (%s) (%v): %w", expiredStreamName, streamIDs, err)
 			}
 
 			if err := tx.Del(metricIDs...).Err(); err != nil {
-				return xerrors.Errorf(": %w", err)
+				return xerrors.Errorf("Could not del (%v): %w", metricIDs, err)
 			}
 
 			return nil
 		}
 		// TODO: retry
-		if err := r.client.Watch(fn, metricIDs...); err != nil {
-			log.Printf("failed transaction %v: %s", metricIDs, err)
+		if err := r.client.Watch(fn, append(metricIDs, expiredStreamName)...); err != nil {
+			log.Printf("failed transaction (%v): %s", metricIDs, err)
 		}
 
 		metricsFlushed.Add(len(streamIDs))
