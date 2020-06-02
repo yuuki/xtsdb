@@ -3,8 +3,11 @@ package redis
 import (
 	"crypto/sha1"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"log"
+	"math/rand"
+	"os"
 	"strings"
 	"time"
 
@@ -167,6 +170,10 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []goredis.XMess
 		return err
 	}
 
+	hostname, _ := os.Hostname()
+	consumerID := fmt.Sprintf("flusher-%s-%d-%d-%d",
+		hostname, os.Getpid(), time.Now().UnixNano(), rand.Int31())
+
 	for {
 		expiredMetricIDs := []string{}
 		expiredStreamIDs := []string{}
@@ -174,9 +181,9 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []goredis.XMess
 		// TODO: launch multiple goroutines
 		xstreams, err := r.client.XReadGroup(&goredis.XReadGroupArgs{
 			Group:    flusherXGroup,
-			Consumer: "flusher-1",
+			Consumer: consumerID,
 			Streams:  []string{expiredStreamName, ">"},
-			Block:    5 * time.Second,
+			Count:    100,
 		}).Result()
 		if err != nil {
 			if err != goredis.Nil {

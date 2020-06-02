@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"runtime"
 
 	"github.com/yuuki/xtsdb/flusher"
 	"github.com/yuuki/xtsdb/storage"
@@ -32,8 +33,13 @@ func main() {
 func (cli *CLI) Run(args []string) int {
 	log.SetOutput(cli.errStream)
 
+	var (
+		workers int
+	)
+
 	flags := flag.NewFlagSet("xtsdb-ingester", flag.ContinueOnError)
 	flags.SetOutput(cli.errStream)
+	flags.IntVar(&workers, "workers", runtime.GOMAXPROCS(-1), "")
 	flags.Usage = func() {
 		fmt.Fprint(cli.errStream, helpText)
 	}
@@ -44,7 +50,7 @@ func (cli *CLI) Run(args []string) int {
 	storage.Init()
 
 	log.Println("Starting xtsdb-flusher...")
-	if err := flusher.Serve(); err != nil {
+	if err := flusher.Serve(workers); err != nil {
 		log.Printf("%+v\n", err)
 		return exitCodeErr
 	}

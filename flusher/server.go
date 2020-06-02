@@ -10,7 +10,7 @@ import (
 )
 
 // Serve runs a server of flusher.
-func Serve() error {
+func Serve(workers int) error {
 	go func() {
 		// Expose the registered metrics at `/metrics` path.
 		http.HandleFunc("/metrics", func(w http.ResponseWriter, req *http.Request) {
@@ -19,9 +19,14 @@ func Serve() error {
 		log.Fatal(http.ListenAndServe(":8081", nil))
 	}()
 
-	if err := storage.FlushVolatileDataPoints(); err != nil {
-		return err
+	for w := 1; w <= workers; w++ {
+		go func() {
+			if err := storage.FlushVolatileDataPoints(); err != nil {
+				log.Printf("%+v\n", err)
+			}
+		}()
 	}
+	log.Printf("launched flusher workers (%d)\n", workers)
 
 	// TODO: Wait until goroutines stop
 	sig := procutil.WaitForSigterm()
