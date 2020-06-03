@@ -258,9 +258,7 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []goredis.XMess
 		return err
 	}
 
-	hostname, _ := os.Hostname()
-	consumerID := fmt.Sprintf("flusher-%s-%d-%d-%d",
-		hostname, os.Getpid(), time.Now().UnixNano(), rand.Int31())
+	consumerID := generateConsumerID()
 
 	for {
 		startTime := time.Now()
@@ -339,4 +337,10 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []goredis.XMess
 		flushDuration.UpdateDuration(startTime)
 		metricsFlushed.Add(len(streamIDs))
 	}
+}
+
+func generateConsumerID() string {
+	hostname, _ := os.Hostname()
+	return fmt.Sprintf("flusher-%s-%d-%d-%d",
+		hostname, os.Getpid(), time.Now().UnixNano(), rand.Int31())
 }
