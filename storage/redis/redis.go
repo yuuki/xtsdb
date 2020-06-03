@@ -191,7 +191,7 @@ func (r *Redis) AddRows(mrs model.MetricRows) error {
 	// TODO: Remove NaN value
 	_, err := r.client.Pipelined(func(pipe goredis.Pipeliner) error {
 		for _, eb := range ebMap {
-			err := r.client.EvalSha(r.hashScriptAddRows, eb.keys, eb.args...).Err()
+			err := pipe.EvalSha(r.hashScriptAddRows, eb.keys, eb.args...).Err()
 			if err != nil {
 				return xerrors.Errorf("Could not add rows to redis (keylen:%d, arglen:%v): %w",
 					len(eb.keys), len(eb.args), err)
