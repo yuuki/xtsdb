@@ -85,7 +85,6 @@ func New() (*Redis, error) {
 		r = goredis.NewClusterClient(&goredis.ClusterOptions{
 			Addrs:    addrs,
 			Password: "",
-			PoolSize: runtime.NumCPU() * 100,
 		})
 	default:
 		return nil, errors.New("redis addrs are empty")
