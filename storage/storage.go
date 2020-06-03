@@ -3,10 +3,10 @@ package storage
 import (
 	"log"
 
-	vmstorage "github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 	goredis "github.com/go-redis/redis/v7"
 
 	"github.com/yuuki/xtsdb/storage/cassandra"
+	"github.com/yuuki/xtsdb/storage/model"
 	"github.com/yuuki/xtsdb/storage/redis"
 )
 
@@ -27,7 +27,7 @@ func Init() {
 }
 
 // AddRows adds mrs to the storage.
-func AddRows(mrs []vmstorage.MetricRow) error {
+func AddRows(mrs model.MetricRows) error {
 	if err := Store.Memstore.AddRows(mrs); err != nil {
 		return err
 	}

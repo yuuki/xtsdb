@@ -11,14 +11,15 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
-	vmstorage "github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 	"github.com/VictoriaMetrics/metrics"
 	goredis "github.com/go-redis/redis/v7"
 	"golang.org/x/xerrors"
 
 	"github.com/yuuki/xtsdb/config"
+	"github.com/yuuki/xtsdb/storage/model"
 )
 
 const (
@@ -28,10 +29,14 @@ const (
 	flusherXGroup      = "flushers"
 
 	scriptForAddRows = `
-		local res = redis.call('XADD', KEYS[1], ARGV[1], '', ARGV[2]);
-		if redis.call('GET', KEYS[2]) == false then
-			res = redis.call('SETEX', KEYS[2], ARGV[3], 1);
-		end
+		local res
+       	for i = 1, #KEYS do
+            res = redis.call('XADD', KEYS[i], ARGV[i*3-2], '', ARGV[i*3-1]);
+           	local key = 'ex:'..KEYS[i];
+           	if redis.call('GET', key) == false then
+           	    res = redis.call('SETEX', key, ARGV[i*3], 1);
+			end
+        end
 		return res
 `
 	maxBatchSize = 500
@@ -56,6 +61,7 @@ type redisAPI interface {
 	XReadGroup(*goredis.XReadGroupArgs) *goredis.XStreamSliceCmd
 	XRange(string, string, string) *goredis.XMessageSliceCmd
 	Watch(func(*goredis.Tx) error, ...string) error
+	EvalSha(string, []string, ...interface{}) *goredis.Cmd
 }
 
 // Redis provides a redis client.
@@ -112,31 +118,89 @@ func New() (*Redis, error) {
 	return &Redis{client: r, hashScriptAddRows: hash}, nil
 }
 
+type evalBuffer struct {
+	keys []string
+	args []interface{}
+}
+
+// getEvalBuffer returns a evalBuffer from pool.
+func getEvalBuffer() *evalBuffer {
+	select {
+	case eb := <-ebPoolCh:
+		return eb
+	default:
+		v := ebPool.Get()
+		if v == nil {
+			return &evalBuffer{}
+		}
+		return v.(*evalBuffer)
+	}
+}
+
+// putEvalBuffer returns eb to the pool.
+func putEvalBuffer(eb *evalBuffer) {
+	eb.reset()
+	select {
+	case ebPoolCh <- eb:
+	default:
+		ebPool.Put(eb)
+	}
+}
+
+// reset resets the eb.
+func (eb *evalBuffer) reset() {
+	eb.keys = eb.keys[:0]
+	eb.args = eb.args[:0]
+}
+
+var ebPool sync.Pool
+var ebPoolCh = make(chan *evalBuffer, runtime.GOMAXPROCS(-1))
+
 // AddRows inserts rows into redis-server.
-func (r *Redis) AddRows(mrs []vmstorage.MetricRow) error {
+func (r *Redis) AddRows(mrs model.MetricRows) error {
 	if len(mrs) == 0 {
 		return nil
 	}
 	startTime := time.Now()
 
+	ebMap := make(map[string]*evalBuffer, len(mrs))
+	for label := range mrs {
+		rows := mrs[label]
+		if len(rows) < 1 {
+			continue
+		}
+		eb := &evalBuffer{
+			keys: make([]string, 0, len(rows)),
+			args: make([]interface{}, 0, len(rows)*3),
+		}
+		for i := range rows {
+			row := &rows[i]
+			eb.keys = append(eb.keys, row.MetricName)
+			// TODO: fix int cast
+			eb.args = append(eb.args, int(row.Timestamp), row.Value,
+				config.Config.DurationExpires.Seconds())
+		}
+		ebMap[label] = eb
+	}
+	// defer func() {
+	// 	for label := range ebMap {
+	// 		defer putEvalBuffer(ebMap[label])
+	// 	}
+	// }()
+
 	// TODO: Remove NaN value
 	_, err := r.client.Pipelined(func(pipe goredis.Pipeliner) error {
-		for i := range mrs {
-			row := &mrs[i]
-
-			name := "{" + string(row.MetricNameRaw) + "}" // redis hash tag
-			evalKeys := []string{name, prefixKeyForExpire + name}
-			evalArgs := []interface{}{int(row.Timestamp), row.Value,
-				config.Config.DurationExpires.Seconds()}
-			err := pipe.EvalSha(r.hashScriptAddRows, evalKeys, evalArgs...).Err()
+		for _, eb := range ebMap {
+			err := r.client.EvalSha(r.hashScriptAddRows, eb.keys, eb.args...).Err()
 			if err != nil {
-				return xerrors.Errorf("Could not add rows to redis: %w", err)
+				return xerrors.Errorf("Could not add rows to redis (keylen:%d, arglen:%v): %w",
+					len(eb.keys), len(eb.args), err)
 			}
 		}
 		return nil
 	})
 	if err != nil {
-		return xerrors.Errorf("Got error of pipeline: %w", err)
+		return xerrors.Errorf("Got error of redis pipeline: %w", err)
 	}
 
 	insertRowsDuration.UpdateDuration(startTime)

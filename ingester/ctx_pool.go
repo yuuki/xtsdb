@@ -6,6 +6,8 @@ package ingester
 import (
 	"runtime"
 	"sync"
+
+	"github.com/yuuki/xtsdb/storage/model"
 )
 
 // GetInsertCtx returns InsertCtx from the pool.
@@ -19,7 +21,8 @@ func GetInsertCtx() *InsertCtx {
 		if v := insertCtxPool.Get(); v != nil {
 			return v.(*InsertCtx)
 		}
-		return &InsertCtx{}
+		mrs := make(model.MetricRows, 1)
+		return &InsertCtx{mrs: mrs}
 	}
 }
 

@@ -10,17 +10,16 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 
-	xstorage "github.com/yuuki/xtsdb/storage"
+	"github.com/yuuki/xtsdb/storage"
+	"github.com/yuuki/xtsdb/storage/model"
 )
 
 // InsertCtx contains common bits for data points insertion.
 type InsertCtx struct {
 	Labels []prompb.Label
 
-	mrs            []storage.MetricRow
-	metricNamesBuf []byte
+	mrs model.MetricRows
 }
 
 // Reset resets ctx for future fill with rowsLen rows.
@@ -32,74 +31,58 @@ func (ctx *InsertCtx) Reset(rowsLen int) {
 	ctx.Labels = ctx.Labels[:0]
 
 	for i := range ctx.mrs {
-		mr := &ctx.mrs[i]
-		mr.MetricNameRaw = nil
+		delete(ctx.mrs, i)
 	}
-	ctx.mrs = ctx.mrs[:0]
-	if n := rowsLen - cap(ctx.mrs); n > 0 {
-		ctx.mrs = append(ctx.mrs[:cap(ctx.mrs)], make([]storage.MetricRow, n)...)
-	}
-	ctx.mrs = ctx.mrs[:0]
-	ctx.metricNamesBuf = ctx.metricNamesBuf[:0]
 }
 
-func (ctx *InsertCtx) marshalMetricNameRaw(prefix []byte, labels []prompb.Label) []byte {
-	start := len(ctx.metricNamesBuf)
-	ctx.metricNamesBuf = append(ctx.metricNamesBuf, prefix...)
-	ctx.metricNamesBuf = storage.MarshalMetricNameRaw(ctx.metricNamesBuf, labels)
-	metricNameRaw := ctx.metricNamesBuf[start:]
-	return metricNameRaw[:len(metricNameRaw):len(metricNameRaw)]
+const (
+	hostLabelName = "hostname"
+)
+
+func (ctx *InsertCtx) concatMetricName(labels []prompb.Label) (string, *prompb.Label) {
+	var (
+		metricName     string
+		metricBaseName string
+		hostLabel      *prompb.Label
+	)
+
+	for i := range labels {
+		label := &labels[i]
+		labelName := bytesutil.ToUnsafeString(label.Name)
+		switch labelName {
+		case "":
+			metricBaseName = bytesutil.ToUnsafeString(label.Value)
+		case hostLabelName:
+			hostLabel = label
+			// redis hash tags
+			metricName += "{" + labelName + "=" + bytesutil.ToUnsafeString(label.Value) + ";" + "}"
+		default:
+			metricName += labelName + "=" + bytesutil.ToUnsafeString(label.Value) + ";"
+		}
+	}
+
+	return metricBaseName + ";" + metricName, hostLabel
 }
 
 // WriteDataPoint writes (timestamp, value) with the given prefix and labels into ctx buffer.
 func (ctx *InsertCtx) WriteDataPoint(prefix []byte, labels []prompb.Label, timestamp int64, value float64) {
-	metricNameRaw := ctx.marshalMetricNameRaw(prefix, labels)
-	ctx.addRow(metricNameRaw, timestamp, value)
+	metricName, hostLabel := ctx.concatMetricName(labels)
+	ctx.addRow(metricName, hostLabel, timestamp, value)
 }
 
-// WriteDataPointExt writes (timestamp, value) with the given metricNameRaw and labels into ctx buffer.
-//
-// It returns metricNameRaw for the given labels if len(metricNameRaw) == 0.
-func (ctx *InsertCtx) WriteDataPointExt(metricNameRaw []byte, labels []prompb.Label, timestamp int64, value float64) []byte {
-	if len(metricNameRaw) == 0 {
-		metricNameRaw = ctx.marshalMetricNameRaw(nil, labels)
-	}
-	ctx.addRow(metricNameRaw, timestamp, value)
-	return metricNameRaw
-}
-
-func (ctx *InsertCtx) addRow(metricNameRaw []byte, timestamp int64, value float64) {
-	mrs := ctx.mrs
+func (ctx *InsertCtx) addRow(metricName string, hostLabel *prompb.Label, timestamp int64, value float64) {
+	hostName := string(hostLabel.Value) // copy safe
+	mrs := ctx.mrs[hostName]
 	if cap(mrs) > len(mrs) {
 		mrs = mrs[:len(mrs)+1]
 	} else {
-		mrs = append(mrs, storage.MetricRow{})
+		mrs = append(mrs, model.MetricRow{})
 	}
 	mr := &mrs[len(mrs)-1]
-	ctx.mrs = mrs
-	mr.MetricNameRaw = metricNameRaw
+	ctx.mrs[hostName] = mrs
+	mr.MetricName = metricName
 	mr.Timestamp = timestamp
 	mr.Value = value
-}
-
-// AddLabelBytes adds (name, value) label to ctx.Labels.
-//
-// name and value must exist until ctx.Labels is used.
-func (ctx *InsertCtx) AddLabelBytes(name, value []byte) {
-	labels := ctx.Labels
-	if cap(labels) > len(labels) {
-		labels = labels[:len(labels)+1]
-	} else {
-		labels = append(labels, prompb.Label{})
-	}
-	label := &labels[len(labels)-1]
-
-	// Do not copy name and value contents for performance reasons.
-	// This reduces GC overhead on the number of objects and allocations.
-	label.Name = name
-	label.Value = value
-
-	ctx.Labels = labels
 }
 
 // AddLabel adds (name, value) label to ctx.Labels.
@@ -124,7 +107,7 @@ func (ctx *InsertCtx) AddLabel(name, value string) {
 
 // FlushBufs flushes buffered rows to the underlying storage.
 func (ctx *InsertCtx) FlushBufs() error {
-	if err := xstorage.AddRows(ctx.mrs); err != nil {
+	if err := storage.AddRows(ctx.mrs); err != nil {
 		return &httpserver.ErrorWithStatusCode{
 			Err:        fmt.Errorf("cannot store metrics: %s", err),
 			StatusCode: http.StatusServiceUnavailable,
