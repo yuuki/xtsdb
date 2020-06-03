@@ -283,10 +283,10 @@ func maybeGzipResponseWriter(w http.ResponseWriter, r *http.Request) http.Respon
 	ae = strings.ToLower(ae)
 	n := strings.Index(ae, "gzip")
 	if n < 0 {
-		// Do not apply gzip encoding to the response.
 		return w
 	}
-	// Apply gzip encoding to the response.
+	h := w.Header()
+	h.Set("Content-Encoding", "gzip")
 	zw := getGzipWriter(w)
 	bw := getBufioWriter(zw)
 	zrw := &gzipResponseWriter{
@@ -301,14 +301,7 @@ func maybeGzipResponseWriter(w http.ResponseWriter, r *http.Request) http.Respon
 //
 // The function must be called before the first w.Write* call.
 func DisableResponseCompression(w http.ResponseWriter) {
-	zrw, ok := w.(*gzipResponseWriter)
-	if !ok {
-		return
-	}
-	if zrw.firstWriteDone {
-		logger.Panicf("BUG: DisableResponseCompression must be called before sending the response")
-	}
-	zrw.disableCompression = true
+	w.Header().Del("Content-Encoding")
 }
 
 // EnableCORS enables https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS
@@ -350,23 +343,19 @@ type gzipResponseWriter struct {
 func (zrw *gzipResponseWriter) Write(p []byte) (int, error) {
 	if !zrw.firstWriteDone {
 		h := zrw.Header()
-		if zrw.statusCode == http.StatusNoContent {
+		if h.Get("Content-Encoding") != "gzip" {
+			// The request handler disabled gzip encoding.
+			// Send uncompressed response body.
 			zrw.disableCompression = true
+		} else if h.Get("Content-Type") == "" {
+			// Disable auto-detection of content-type, since it
+			// is incorrectly detected after the compression.
+			h.Set("Content-Type", "text/html")
 		}
-		if h.Get("Content-Encoding") != "" {
-			zrw.disableCompression = true
-		}
-		if !zrw.disableCompression {
-			h.Set("Content-Encoding", "gzip")
-			h.Del("Content-Length")
-			if h.Get("Content-Type") == "" {
-				// Disable auto-detection of content-type, since it
-				// is incorrectly detected after the compression.
-				h.Set("Content-Type", "text/html")
-			}
-		}
-		zrw.writeHeader()
 		zrw.firstWriteDone = true
+	}
+	if zrw.statusCode == 0 {
+		zrw.WriteHeader(http.StatusOK)
 	}
 	if zrw.disableCompression {
 		return zrw.ResponseWriter.Write(p)
@@ -375,14 +364,14 @@ func (zrw *gzipResponseWriter) Write(p []byte) (int, error) {
 }
 
 func (zrw *gzipResponseWriter) WriteHeader(statusCode int) {
-	zrw.statusCode = statusCode
-}
-
-func (zrw *gzipResponseWriter) writeHeader() {
-	if zrw.statusCode == 0 {
-		zrw.statusCode = http.StatusOK
+	if zrw.statusCode != 0 {
+		return
 	}
-	zrw.ResponseWriter.WriteHeader(zrw.statusCode)
+	if statusCode == http.StatusNoContent {
+		DisableResponseCompression(zrw.ResponseWriter)
+	}
+	zrw.ResponseWriter.WriteHeader(statusCode)
+	zrw.statusCode = statusCode
 }
 
 // Implements http.Flusher
@@ -400,7 +389,7 @@ func (zrw *gzipResponseWriter) Flush() {
 
 func (zrw *gzipResponseWriter) Close() error {
 	if !zrw.firstWriteDone {
-		zrw.writeHeader()
+		zrw.Header().Del("Content-Encoding")
 		return nil
 	}
 	zrw.Flush()
