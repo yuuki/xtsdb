@@ -24,9 +24,10 @@ import (
 
 const (
 	// prefixEx is a prefix of expired keys.
-	prefixKeyForExpire = "ex:"
-	expiredStreamName  = "expired-stream"
-	flusherXGroup      = "flushers"
+	prefixKeyForExpire  = "ex:"
+	expiredStreamName   = "expired-stream"
+	flusherXGroup       = "flushers"
+	expiredEventChannel = "__keyevent@0__:expired"
 
 	scriptForAddRows = `
 		local res
@@ -221,7 +222,7 @@ func (r *Redis) SubscribeExpiredDataPoints() error {
 		return err
 	}
 
-	pubsub := r.client.Subscribe("__keyevent@0__:expired")
+	pubsub := r.client.Subscribe(expiredEventChannel)
 
 	// Wait for confirmation that subscription is created before publishing anything.
 	if _, err := pubsub.Receive(); err != nil {
