@@ -24,6 +24,28 @@ func Init() {
 		log.Fatal(err)
 	}
 	Store = &Storage{Memstore: r}
+	mrsChan = make(chan model.MetricRows)
+	RunMemWriter(10)
+}
+
+var mrsChan chan model.MetricRows
+
+func RunMemWriter(num int) {
+	for i := 0; i < num; i++ {
+		go func(mrsc <-chan model.MetricRows) {
+			for mrs := range mrsc {
+				// dispatch job
+				if err := AddRows(mrs); err != nil {
+					log.Printf("%+v", err)
+				}
+			}
+		}(mrsChan)
+	}
+}
+
+func SubmitMemWriter(mrs model.MetricRows) error {
+	mrsChan <- mrs
+	return nil
 }
 
 // AddRows adds mrs to the storage.

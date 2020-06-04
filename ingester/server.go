@@ -11,6 +11,7 @@ import (
 	"github.com/VictoriaMetrics/metrics"
 
 	"github.com/yuuki/xtsdb/storage"
+	"github.com/yuuki/xtsdb/storage/model"
 )
 
 var (
@@ -22,15 +23,20 @@ var (
 //
 // Copy code from github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/graphite.
 func insertHandler(r io.Reader) error {
-	return vmparser.ParseStream(r, insertRows)
+	return vmparser.ParseStream(r, func(rows []vmparser.Row) error {
+		return insertRows(rows)
+	})
 }
 
+// insertRows inserts parsed rows.
+//
 // Copy code from github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/graphite.
 func insertRows(rows []vmparser.Row) error {
-	ctx := GetInsertCtx()
-	defer PutInsertCtx(ctx)
+	// ctx := GetInsertCtx()
+	// defer PutInsertCtx(ctx)
+	ctx := &InsertCtx{mrs: model.MetricRows{}}
 
-	ctx.Reset(len(rows))
+	// ctx.Reset(len(rows))
 	for i := range rows {
 		r := &rows[i]
 		ctx.Labels = ctx.Labels[:0]
