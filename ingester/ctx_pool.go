@@ -39,4 +39,4 @@ func PutInsertCtx(ctx *InsertCtx) {
 }
 
 var insertCtxPool sync.Pool
-var insertCtxPoolCh = make(chan *InsertCtx, runtime.GOMAXPROCS(-1)*4)
+var insertCtxPoolCh = make(chan *InsertCtx, runtime.GOMAXPROCS(-1))
