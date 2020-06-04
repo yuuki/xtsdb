@@ -9,9 +9,7 @@ import (
 	"log"
 	"math/rand"
 	"os"
-	"runtime"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/VictoriaMetrics/metrics"
@@ -118,44 +116,6 @@ func New() (*Redis, error) {
 	return &Redis{client: r, hashScriptAddRows: hash}, nil
 }
 
-type evalBuffer struct {
-	keys []string
-	args []interface{}
-}
-
-// getEvalBuffer returns a evalBuffer from pool.
-func getEvalBuffer() *evalBuffer {
-	select {
-	case eb := <-ebPoolCh:
-		return eb
-	default:
-		v := ebPool.Get()
-		if v == nil {
-			return &evalBuffer{}
-		}
-		return v.(*evalBuffer)
-	}
-}
-
-// putEvalBuffer returns eb to the pool.
-func putEvalBuffer(eb *evalBuffer) {
-	eb.reset()
-	select {
-	case ebPoolCh <- eb:
-	default:
-		ebPool.Put(eb)
-	}
-}
-
-// reset resets the eb.
-func (eb *evalBuffer) reset() {
-	eb.keys = eb.keys[:0]
-	eb.args = eb.args[:0]
-}
-
-var ebPool sync.Pool
-var ebPoolCh = make(chan *evalBuffer, runtime.GOMAXPROCS(-1))
-
 // AddRows inserts rows into redis-server.
 func (r *Redis) AddRows(mrs model.MetricRows) error {
 	if len(mrs) == 0 {
@@ -182,11 +142,6 @@ func (r *Redis) AddRows(mrs model.MetricRows) error {
 		}
 		ebMap[label] = eb
 	}
-	// defer func() {
-	// 	for label := range ebMap {
-	// 		defer putEvalBuffer(ebMap[label])
-	// 	}
-	// }()
 
 	// TODO: Remove NaN value
 	_, err := r.client.Pipelined(func(pipe goredis.Pipeliner) error {
