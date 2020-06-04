@@ -216,6 +216,7 @@ func (r *Redis) initExpiredStream() error {
 	return nil
 }
 
+// SubscribeExpiredDataPoints subscribes expired data points and inserts 'expired-stream'.
 func (r *Redis) SubscribeExpiredDataPoints() error {
 	// Create consumer group for expired-stream.
 	if err := r.initExpiredStream(); err != nil {
@@ -266,7 +267,6 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []goredis.XMess
 		expiredMetricIDs := []string{}
 		expiredStreamIDs := []string{}
 
-		// TODO: launch multiple goroutines
 		xstreams, err := r.client.XReadGroup(&goredis.XReadGroupArgs{
 			Group:    flusherXGroup,
 			Consumer: consumerID,
