@@ -116,6 +116,11 @@ func New() (*Redis, error) {
 	return &Redis{client: r, hashScriptAddRows: hash}, nil
 }
 
+type evalBuffer struct {
+	keys []string
+	args []interface{}
+}
+
 // AddRows inserts rows into redis-server.
 func (r *Redis) AddRows(mrs model.MetricRows) error {
 	if len(mrs) == 0 {
