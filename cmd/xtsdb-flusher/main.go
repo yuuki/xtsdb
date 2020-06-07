@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"runtime"
 	"strings"
@@ -38,6 +39,7 @@ func (cli *CLI) Run(args []string) int {
 	var (
 		workers   int
 		redisAddr string
+		profile   bool
 	)
 
 	flags := flag.NewFlagSet("xtsdb-ingester", flag.ContinueOnError)
@@ -47,8 +49,15 @@ func (cli *CLI) Run(args []string) int {
 	}
 	flags.StringVar(&redisAddr, "redisAddr", config.DefaultRedisAddr, "")
 	flags.IntVar(&workers, "workers", runtime.GOMAXPROCS(-1), "")
+	flags.BoolVar(&profile, "profile", false, "")
 	if err := flags.Parse(args[1:]); err != nil {
 		return exitCodeErr
+	}
+
+	if profile {
+		go func() {
+			log.Println(http.ListenAndServe("localhost:6061", nil))
+		}()
 	}
 
 	config.Config.RedisAddrs = strings.Split(redisAddr, ",")
