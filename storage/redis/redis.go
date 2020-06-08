@@ -59,6 +59,7 @@ type redisAPI interface {
 	XAdd(*goredis.XAddArgs) *goredis.StringCmd
 	XReadGroup(*goredis.XReadGroupArgs) *goredis.XStreamSliceCmd
 	XRange(string, string, string) *goredis.XMessageSliceCmd
+	Del(...string) *goredis.IntCmd
 	Watch(func(*goredis.Tx) error, ...string) error
 	EvalSha(string, []string, ...interface{}) *goredis.Cmd
 }
@@ -323,19 +324,31 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []goredis.XMess
 				if err := pipe.XDel(r.selfExpiredStreamKey, streamIDs...).Err(); err != nil {
 					return xerrors.Errorf("Could not xdel (%s) (%v): %w", expiredStreamName, streamIDs, err)
 				}
-				if err := pipe.Del(metricIDs...).Err(); err != nil {
-					return xerrors.Errorf("Could not del (%v): %w", metricIDs, err)
-				}
 				return nil
 			})
-			if err != nil {
-				return xerrors.Errorf("Could not complete to pipeline for deleting old data: %w", err)
-			}
-			return nil
+			return err
 		}
 		// TODO: retry
-		if err := r.client.Watch(fn, append(metricIDs, r.selfExpiredStreamKey)...); err != nil {
-			log.Printf("failed transaction (%v): %s\n", metricIDs, err)
+		if err := r.client.Watch(fn, r.selfExpiredStreamKey); err != nil {
+			log.Printf("failed transaction (%v...): %s\n", metricIDs[0], err)
+			continue
+		}
+
+		// TODO: handling in case of delete failure
+		mapMetricIDs := groupMetricIDsByHashTag(metricIDs)
+		_, err = r.client.Pipelined(func(pipe goredis.Pipeliner) error {
+			for _, ids := range mapMetricIDs {
+				if len(ids) < 1 {
+					continue
+				}
+				if err := pipe.Del(ids...).Err(); err != nil {
+					return xerrors.Errorf("Could not del (%v): %w", ids[0], err)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			log.Printf("Could not complete to pipeline for deleteing old metrics (%v...): %w", metricIDs[0], err)
 			continue
 		}
 
@@ -348,4 +361,27 @@ func generateConsumerID() string {
 	hostname, _ := os.Hostname()
 	return fmt.Sprintf("flusher-%s-%d-%d-%d",
 		hostname, os.Getpid(), time.Now().UnixNano(), rand.Int31())
+}
+
+func groupMetricIDsByHashTag(metricIDs []string) map[string][]string {
+	mapMetricID := make(map[string][]string)
+	for _, metricID := range metricIDs {
+		s := strings.Index(metricID, "{")
+		if s == -1 {
+			log.Printf("%s should be contained '{'", metricID)
+			continue
+		}
+		e := strings.Index(metricID, "}")
+		if e == -1 {
+			log.Printf("%s should be contained '}'", metricID)
+			continue
+		}
+		if s > e {
+			log.Printf("%s[%d:%d] bounds out of range", metricID, s, e)
+			continue
+		}
+		key := metricID[s+1 : e]
+		mapMetricID[key] = append(mapMetricID[key], metricID)
+	}
+	return mapMetricID
 }
