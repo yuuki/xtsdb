@@ -305,10 +305,12 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []goredis.XMess
 		for _, metricID := range metricIDs {
 			xmsgs, err := r.client.XRange(metricID, "-", "+").Result()
 			if err != nil {
-				return xerrors.Errorf("Could not xrange %v: %w", metricID, err)
+				log.Printf("Could not xrange %v: %+v", metricID, err)
+				continue
 			}
 			if err := flushHandler(metricID, xmsgs); err != nil {
-				return err
+				log.Printf("%+v", err)
+				continue
 			}
 		}
 
