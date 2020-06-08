@@ -43,41 +43,45 @@ type datapoint struct {
 }
 
 // AddRows inserts rows into cassandra server.
-func (c *Cassandra) AddRows(metricName string, xmsgs []goredis.XMessage) error {
-	blob := make([]byte, len(xmsgs)*2*8) // 2 -> (timestamp, value) 8 -> bytes of int64 or float64
+func (c *Cassandra) AddRows(mapRows map[string][]goredis.XMessage) error {
+	batch := c.session.NewBatch(gocql.UnloggedBatch)
+	for metricName, xmsgs := range mapRows {
+		blob := make([]byte, len(xmsgs)*2*8) // 2 -> (timestamp, value) 8 -> bytes of int64 or float64
+		var startTime time.Time
+		for i, xmsg := range xmsgs {
+			ts := strings.TrimSuffix(xmsg.ID, "-0")
+			t, err := strconv.ParseInt(ts, 10, 64)
+			if err != nil {
+				log.Printf("Could not parse %s: %s\n", ts, err)
+				continue
+			}
+			if startTime.IsZero() {
+				startTime = time.Unix(t, 0)
+			}
 
-	var startTime time.Time
+			binary.BigEndian.PutUint64(blob[i*2*8:], uint64(t))
 
-	for i, xmsg := range xmsgs {
-		ts := strings.TrimSuffix(xmsg.ID, "-0")
-		t, err := strconv.ParseInt(ts, 10, 64)
-		if err != nil {
-			log.Printf("Could not parse %s: %s\n", ts, err)
-			continue
+			v := xmsg.Values[""]
+			val, err := strconv.ParseFloat(v.(string), 64)
+			if err != nil {
+				log.Printf("Could not parse %v: %s\n", v, err)
+				continue
+			}
+
+			binary.BigEndian.PutUint64(blob[i*2*8+8:], math.Float64bits(val))
 		}
-		if startTime.IsZero() {
-			startTime = time.Unix(t, 0)
-		}
 
-		binary.BigEndian.PutUint64(blob[i*2*8:], uint64(t))
-
-		v := xmsg.Values[""]
-		val, err := strconv.ParseFloat(v.(string), 64)
-		if err != nil {
-			log.Printf("Could not parse %v: %s\n", v, err)
-			continue
-		}
-
-		binary.BigEndian.PutUint64(blob[i*2*8+8:], math.Float64bits(val))
+		batch.Query(`
+			INSERT INTO datapoint (metric_id, timestamp, values)
+			VALUES (?, ?, ?)`, metricName, startTime, blob,
+		)
+		// if err != nil {
+		// 	return xerrors.Errorf("Could not insert datapoint (%v, %v): %w\n",
+		// 		metricName, startTime, err)
+		// }
 	}
-
-	err := c.session.Query(`
-		INSERT INTO datapoint (metric_id, timestamp, values)
-		VALUES (?, ?, ?)`, metricName, startTime, blob,
-	).Exec()
-	if err != nil {
-		return xerrors.Errorf("Could not insert datapoint (%v, %v): %w\n",
-			metricName, startTime, err)
+	if err := c.session.ExecuteBatch(batch); err != nil {
+		return xerrors.Errorf("Got error ot batch: %w", err)
 	}
 
 	return nil

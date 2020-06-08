@@ -258,7 +258,7 @@ func (r *Redis) SubscribeExpiredDataPoints() error {
 
 // FlushExpiredDataPoints runs a loop of flushing data points
 // from Redis to DiskStore.
-func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []goredis.XMessage) error) error {
+func (r *Redis) FlushExpiredDataPoints(flushHandler func(map[string][]goredis.XMessage) error) error {
 	if err := r.initExpiredStream(); err != nil {
 		return err
 	}
@@ -303,16 +303,18 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []goredis.XMess
 		streamIDs := make([]string, len(expiredStreamIDs))
 		copy(streamIDs, expiredStreamIDs)
 
+		mapRows := make(map[string][]goredis.XMessage, len(metricIDs))
 		for _, metricID := range metricIDs {
 			xmsgs, err := r.client.XRange(metricID, "-", "+").Result()
 			if err != nil {
 				log.Printf("Could not xrange %v: %+v", metricID, err)
 				continue
 			}
-			if err := flushHandler(metricID, xmsgs); err != nil {
-				log.Printf("%+v", err)
-				continue
-			}
+			mapRows[metricID] = append(mapRows[metricID], xmsgs...)
+		}
+		if err := flushHandler(mapRows); err != nil {
+			log.Printf("%+v", err)
+			continue
 		}
 
 		fn := func(tx *goredis.Tx) error {

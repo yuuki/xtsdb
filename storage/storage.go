@@ -60,8 +60,8 @@ func FlushVolatileDataPoints() error {
 		return err
 	}
 	err = r.FlushExpiredDataPoints(
-		func(metricName string, xmsgs []goredis.XMessage) error {
-			return c.AddRows(metricName, xmsgs)
+		func(mapRows map[string][]goredis.XMessage) error {
+			return c.AddRows(mapRows)
 		},
 	)
 	if err != nil {
