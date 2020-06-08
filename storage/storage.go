@@ -5,6 +5,7 @@ import (
 
 	goredis "github.com/go-redis/redis/v7"
 
+	"github.com/yuuki/xtsdb/config"
 	"github.com/yuuki/xtsdb/storage/cassandra"
 	"github.com/yuuki/xtsdb/storage/model"
 	"github.com/yuuki/xtsdb/storage/redis"
@@ -19,7 +20,7 @@ var Store *Storage
 
 // Init creates a storage client.
 func Init() {
-	r, err := redis.New()
+	r, err := redis.New(config.Config.RedisAddrs, true)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -36,7 +37,7 @@ func AddRows(mrs model.MetricRows) error {
 
 // StreamVolatileDataPoints streams volatile datapoints to reliable stream.
 func StreamVolatileDataPoints() error {
-	r, err := redis.New()
+	r, err := redis.New([]string{config.Config.RedisPubSubAddr}, true)
 	if err != nil {
 		return err
 	}
@@ -50,7 +51,7 @@ func StreamVolatileDataPoints() error {
 // FlushVolatileDataPoints runs a loop of flushing data points
 // from MemStore to DiskStore.
 func FlushVolatileDataPoints() error {
-	r, err := redis.New()
+	r, err := redis.New(config.Config.RedisAddrs, true)
 	if err != nil {
 		return err
 	}

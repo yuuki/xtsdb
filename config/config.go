@@ -11,6 +11,8 @@ const (
 type config struct {
 	// RedisAddrs is a slice of redis addrs (for redis cluster)
 	RedisAddrs []string
+	// RedisPubSubAddr is a sharded redis addr for subscribing expired metrics.
+	RedisPubSubAddr string
 	// CassandraAddrs is a slice of cassandra addrs
 	CassandraAddrs []string
 	// DurationExpires is duration that datapoints on the memory store expires.

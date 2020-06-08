@@ -3,7 +3,6 @@ package redis
 import (
 	"crypto/sha1"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -74,29 +73,23 @@ type Redis struct {
 }
 
 // New creates a Redis client.
-func New() (*Redis, error) {
+func New(addrs []string, cluster bool) (*Redis, error) {
 	var (
 		r           redisAPI
-		cluster     bool
 		selfShardID int
 	)
 
-	addrs := config.Config.RedisAddrs
-	switch size := len(addrs); {
-	case size == 1:
+	if cluster {
+		r = goredis.NewClusterClient(&goredis.ClusterOptions{
+			Addrs:    addrs,
+			Password: "",
+		})
+	} else {
 		r = goredis.NewClient(&goredis.Options{
 			Addr:     addrs[0],
 			Password: "",
 			DB:       0,
 		})
-	case size > 1:
-		r = goredis.NewClusterClient(&goredis.ClusterOptions{
-			Addrs:    addrs,
-			Password: "",
-		})
-		cluster = true
-	default:
-		return nil, errors.New("redis addrs are empty")
 	}
 
 	if err := r.Ping().Err(); err != nil {
@@ -116,6 +109,7 @@ func New() (*Redis, error) {
 			return nil, xerrors.Errorf(
 				"could not register script to cluster masters: %w", err)
 		}
+		// TODO: rename RedisPubSubAddr
 		selfShardID, err = getSelfShardID(rcc, addrs[0])
 		if err != nil {
 			return nil, err
@@ -140,7 +134,7 @@ func New() (*Redis, error) {
 func getSelfShardID(rcc *goredis.ClusterClient, selfAddr string) (int, error) {
 	res, err := rcc.ClusterNodes().Result()
 	if err != nil {
-		return 0, xerrors.Errorf(
+		return -1, xerrors.Errorf(
 			"could not get cluster nodes: %w", err)
 	}
 	/** An example of output of CLUSTER NODES
@@ -154,7 +148,7 @@ func getSelfShardID(rcc *goredis.ClusterClient, selfAddr string) (int, error) {
 			s := strings.Split(line, " ")[6]
 			configEpoch, err := strconv.Atoi(s)
 			if err != nil {
-				return 0, xerrors.Errorf(
+				return -1, xerrors.Errorf(
 					"%q should be integer: %w", s, err)
 			}
 			// TODO: Dealing with the case where configEpoch is incremented
@@ -162,7 +156,7 @@ func getSelfShardID(rcc *goredis.ClusterClient, selfAddr string) (int, error) {
 			return configEpoch, nil
 		}
 	}
-	return 0, nil
+	return -1, xerrors.Errorf("not found selfAddr(%s) from CLUSTER NODES", selfAddr)
 }
 
 type evalBuffer struct {
@@ -220,7 +214,7 @@ func (r *Redis) initExpiredStream() error {
 	// Create consumer group for expired-stream.
 	err := r.client.XGroupCreateMkStream(r.selfExpiredStreamKey, flusherXGroup, "$").Err()
 	if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
-		return xerrors.Errorf("Could not create consumer group for the stream on redis: %w", err)
+		return xerrors.Errorf("Could not create consumer group for the stream (%s) on redis: %w", r.selfExpiredStreamKey, err)
 	}
 	return nil
 }

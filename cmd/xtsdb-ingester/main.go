@@ -40,6 +40,7 @@ func (cli *CLI) Run(args []string) int {
 	var (
 		listenAddr      string
 		redisAddr       string
+		redisPubSubAddr string
 		durationExpires string
 
 		profile bool
@@ -52,6 +53,7 @@ func (cli *CLI) Run(args []string) int {
 	}
 	flags.StringVar(&listenAddr, "graphiteListenAddr", "", "")
 	flags.StringVar(&redisAddr, "redisAddr", config.DefaultRedisAddr, "")
+	flags.StringVar(&redisPubSubAddr, "redisPubSubAddr", config.DefaultRedisAddr, "")
 	flags.StringVar(&durationExpires, "durationExpires", config.DefaultDurationExpires, "")
 	flags.BoolVar(&profile, "profile", false, "")
 	if err := flags.Parse(args[1:]); err != nil {
@@ -59,6 +61,7 @@ func (cli *CLI) Run(args []string) int {
 	}
 
 	config.Config.RedisAddrs = strings.Split(redisAddr, ",")
+	config.Config.RedisPubSubAddr = redisPubSubAddr
 
 	ts, err := time.ParseDuration(durationExpires)
 	if err != nil {
