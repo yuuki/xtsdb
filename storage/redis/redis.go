@@ -334,6 +334,7 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []goredis.XMess
 		// TODO: retry
 		if err := r.client.Watch(fn, append(metricIDs, r.selfExpiredStreamKey)...); err != nil {
 			log.Printf("failed transaction (%v): %s\n", metricIDs, err)
+			continue
 		}
 
 		flushDuration.UpdateDuration(startTime)
