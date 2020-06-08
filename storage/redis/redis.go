@@ -116,31 +116,9 @@ func New() (*Redis, error) {
 			return nil, xerrors.Errorf(
 				"could not register script to cluster masters: %w", err)
 		}
-
-		// Get config-epoch as a shard ID.
-		res, err := rcc.ClusterNodes().Result()
+		selfShardID, err = getSelfShardID(rcc, addrs[0])
 		if err != nil {
-			return nil, xerrors.Errorf(
-				"could not get cluster nodes: %w", err)
-		}
-		/** An example of output of CLUSTER NODES
-		01808c924272decdda8efdcc025c2ab34b17c049 10.0.0.210:6379@16379 master - 0 1591620071014 1 connected 0-4095
-		44d48a123e5cecb5f62027cc74eaa6c356d352d5 10.0.0.212:6379@16379 master - 0 1591620070000 3 connected 8192-12287
-		e95321c1c100fab5a40595d7683d5bf9550a9564 10.0.0.213:6379@16379 master - 0 1591620069974 4 connected 12288-16383
-		aa7c1f537643f99c68f0cd4e4fe9d8cfff8f14d6 10.0.0.211:6379@16379 myself,master - 0 1591620069000 2 connected 4096-8191
-		**/
-		for _, line := range strings.Split(res, "\n") {
-			if strings.Contains(line, addrs[0]) {
-				s := strings.Split(line, " ")[6]
-				configEpoch, err := strconv.Atoi(s)
-				if err != nil {
-					return nil, xerrors.Errorf(
-						"%q should be integer: %w", s, err)
-				}
-				// TODO: Dealing with the case where configEpoch is incremented
-				// when a slave is promoted.
-				selfShardID = configEpoch
-			}
+			return nil, err
 		}
 	} else {
 		// register script to redis-server.
@@ -156,6 +134,35 @@ func New() (*Redis, error) {
 		selfShardID:          selfShardID,
 		selfExpiredStreamKey: fmt.Sprintf("%s:%d", expiredStreamName, selfShardID),
 	}, nil
+}
+
+// getSelfShardID gets config-epoch as a shard ID.
+func getSelfShardID(rcc *goredis.ClusterClient, selfAddr string) (int, error) {
+	res, err := rcc.ClusterNodes().Result()
+	if err != nil {
+		return 0, xerrors.Errorf(
+			"could not get cluster nodes: %w", err)
+	}
+	/** An example of output of CLUSTER NODES
+	01808c924272decdda8efdcc025c2ab34b17c049 10.0.0.210:6379@16379 master - 0 1591620071014 1 connected 0-4095
+	44d48a123e5cecb5f62027cc74eaa6c356d352d5 10.0.0.212:6379@16379 master - 0 1591620070000 3 connected 8192-12287
+	e95321c1c100fab5a40595d7683d5bf9550a9564 10.0.0.213:6379@16379 master - 0 1591620069974 4 connected 12288-16383
+	aa7c1f537643f99c68f0cd4e4fe9d8cfff8f14d6 10.0.0.211:6379@16379 myself,master - 0 1591620069000 2 connected 4096-8191
+	**/
+	for _, line := range strings.Split(res, "\n") {
+		if strings.Contains(line, selfAddr) {
+			s := strings.Split(line, " ")[6]
+			configEpoch, err := strconv.Atoi(s)
+			if err != nil {
+				return 0, xerrors.Errorf(
+					"%q should be integer: %w", s, err)
+			}
+			// TODO: Dealing with the case where configEpoch is incremented
+			// when a slave is promoted.
+			return configEpoch, nil
+		}
+	}
+	return 0, nil
 }
 
 type evalBuffer struct {
