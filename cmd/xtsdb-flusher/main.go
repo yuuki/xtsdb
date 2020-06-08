@@ -37,9 +37,10 @@ func (cli *CLI) Run(args []string) int {
 	log.SetOutput(cli.errStream)
 
 	var (
-		workers   int
-		redisAddr string
-		profile   bool
+		workers       int
+		redisAddr     string
+		cassandraAddr string
+		profile       bool
 	)
 
 	flags := flag.NewFlagSet("xtsdb-ingester", flag.ContinueOnError)
@@ -48,6 +49,7 @@ func (cli *CLI) Run(args []string) int {
 		fmt.Fprint(cli.errStream, helpText)
 	}
 	flags.StringVar(&redisAddr, "redisAddr", config.DefaultRedisAddr, "")
+	flags.StringVar(&cassandraAddr, "cassandraAddr", config.DefaultCassandraAddr, "")
 	flags.IntVar(&workers, "workers", runtime.GOMAXPROCS(-1), "")
 	flags.BoolVar(&profile, "profile", false, "")
 	if err := flags.Parse(args[1:]); err != nil {
@@ -61,6 +63,7 @@ func (cli *CLI) Run(args []string) int {
 	}
 
 	config.Config.RedisAddrs = strings.Split(redisAddr, ",")
+	config.Config.CassandraAddrs = strings.Split(cassandraAddr, ",")
 
 	storage.Init()
 

@@ -11,6 +11,8 @@ import (
 	goredis "github.com/go-redis/redis/v7"
 	"github.com/gocql/gocql"
 	"golang.org/x/xerrors"
+
+	"github.com/yuuki/xtsdb/config"
 )
 
 // Cassandra provides a cassandra client.
@@ -20,8 +22,7 @@ type Cassandra struct {
 
 // New creates a Cassandra client.
 func New() (*Cassandra, error) {
-	// TODO: Support multi node
-	cluster := gocql.NewCluster("127.0.0.1:9042")
+	cluster := gocql.NewCluster(config.Config.CassandraAddrs...)
 	cluster.Keyspace = "xtsdb"
 	cluster.Consistency = gocql.Any
 	session, err := cluster.CreateSession()
