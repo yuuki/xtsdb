@@ -343,7 +343,7 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(map[string][]goredis.XM
 				if len(ids) < 1 {
 					continue
 				}
-				if err := pipe.Del(ids...).Err(); err != nil {
+				if err := pipe.Unlink(ids...).Err(); err != nil {
 					return xerrors.Errorf("Could not del (%v): %w", ids[0], err)
 				}
 			}
