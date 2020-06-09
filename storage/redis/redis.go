@@ -132,6 +132,14 @@ func New(addrs []string, cluster bool) (*Redis, error) {
 	}, nil
 }
 
+func (r *Redis) redisClient(addr string) *goredis.Client {
+	return goredis.NewClient(&goredis.Options{
+		Addr:     addr,
+		Password: "",
+		DB:       0,
+	})
+}
+
 // getSelfShardID gets config-epoch as a shard ID.
 func getSelfShardID(rcc *goredis.ClusterClient, selfAddr string) (int, error) {
 	res, err := rcc.ClusterNodes().Result()
@@ -222,20 +230,19 @@ func (r *Redis) initExpiredStream() error {
 }
 
 // SubscribeExpiredDataPoints subscribes expired data points and inserts 'expired-stream'.
-func (r *Redis) SubscribeExpiredDataPoints() error {
+func (r *Redis) SubscribeExpiredDataPoints(addr string) error {
 	// Create consumer group for expired-stream.
 	if err := r.initExpiredStream(); err != nil {
 		return err
 	}
 
-	pubsub := r.client.Subscribe(expiredEventChannel)
+	// Do not use ClusterClient because goredis routes based on hashing string of keyspace notifications channel.
+	pubsub := r.redisClient(addr).Subscribe(expiredEventChannel)
 
 	// Wait for confirmation that subscription is created before publishing anything.
 	if _, err := pubsub.Receive(); err != nil {
 		return xerrors.Errorf("Could not receive pub/sub on redis: %w", err)
 	}
-
-	log.Println("Waiting expired events")
 
 	ch := pubsub.Channel()
 	for msg := range ch {
@@ -266,7 +273,8 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(map[string][]goredis.XM
 
 	consumerID := generateConsumerID()
 
-	log.Printf("Subscribing '%s' as ('%s','%s')", r.selfExpiredStreamKey, flusherXGroup, consumerID)
+	log.Printf("Subscribing '%s' as ('%s','%s')",
+		r.selfExpiredStreamKey, flusherXGroup, consumerID)
 
 	for {
 		startTime := time.Now()

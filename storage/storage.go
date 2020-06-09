@@ -37,11 +37,14 @@ func AddRows(mrs model.MetricRows) error {
 
 // StreamVolatileDataPoints streams volatile datapoints to reliable stream.
 func StreamVolatileDataPoints() error {
-	r, err := redis.New([]string{config.Config.RedisPubSubAddr}, true)
+	addr := config.Config.RedisPubSubAddr
+	r, err := redis.New([]string{addr}, true)
 	if err != nil {
 		return err
 	}
-	if err := r.SubscribeExpiredDataPoints(); err != nil {
+	log.Printf("Subscribing expired events from '%s'", addr)
+
+	if err := r.SubscribeExpiredDataPoints(addr); err != nil {
 		return err
 	}
 
