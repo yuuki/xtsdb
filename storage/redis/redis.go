@@ -14,6 +14,7 @@ import (
 
 	"github.com/VictoriaMetrics/metrics"
 	goredis "github.com/go-redis/redis/v7"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/xerrors"
 
 	"github.com/yuuki/xtsdb/config"
@@ -265,6 +266,8 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(map[string][]goredis.XM
 
 	consumerID := generateConsumerID()
 
+	log.Printf("Subscribing '%s' as ('%s','%s')", r.selfExpiredStreamKey, flusherXGroup, consumerID)
+
 	for {
 		startTime := time.Now()
 
@@ -275,7 +278,7 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(map[string][]goredis.XM
 			Group:    flusherXGroup,
 			Consumer: consumerID,
 			Streams:  []string{r.selfExpiredStreamKey, ">"},
-			Count:    100,
+			Count:    20,
 		}).Result()
 		if err != nil {
 			if err != goredis.Nil {
@@ -317,40 +320,51 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(map[string][]goredis.XM
 			continue
 		}
 
-		fn := func(tx *goredis.Tx) error {
-			// TODO: lua script for xack and del
-			_, err := tx.Pipelined(func(pipe goredis.Pipeliner) error {
-				if err := pipe.XAck(r.selfExpiredStreamKey, flusherXGroup, streamIDs...).Err(); err != nil {
-					return xerrors.Errorf("Could not xack (%s,%s) (%v): %w", expiredStreamName, flusherXGroup, streamIDs, err)
-				}
-				if err := pipe.XDel(r.selfExpiredStreamKey, streamIDs...).Err(); err != nil {
-					return xerrors.Errorf("Could not xdel (%s) (%v): %w", expiredStreamName, streamIDs, err)
-				}
-				return nil
-			})
-			return err
-		}
-		// TODO: retry
-		if err := r.client.Watch(fn, r.selfExpiredStreamKey); err != nil {
-			log.Printf("failed transaction (%v...): %s\n", metricIDs[0], err)
-			continue
-		}
+		eg := errgroup.Group{}
 
-		// TODO: handling in case of delete failure
-		mapMetricIDs := groupMetricIDsByHashTag(metricIDs)
-		_, err = r.client.Pipelined(func(pipe goredis.Pipeliner) error {
-			for _, ids := range mapMetricIDs {
-				if len(ids) < 1 {
-					continue
-				}
-				if err := pipe.Unlink(ids...).Err(); err != nil {
-					return xerrors.Errorf("Could not del (%v): %w", ids[0], err)
-				}
+		eg.Go(func() error {
+			// TODO: retry
+			err = r.client.Watch(func(tx *goredis.Tx) error {
+				// TODO: lua script for xack and del
+				_, err := tx.Pipelined(func(pipe goredis.Pipeliner) error {
+					if err := pipe.XAck(r.selfExpiredStreamKey, flusherXGroup, streamIDs...).Err(); err != nil {
+						return xerrors.Errorf("Could not xack (%s,%s) (%v): %w", expiredStreamName, flusherXGroup, streamIDs, err)
+					}
+					if err := pipe.XDel(r.selfExpiredStreamKey, streamIDs...).Err(); err != nil {
+						return xerrors.Errorf("Could not xdel (%s) (%v): %w", expiredStreamName, streamIDs, err)
+					}
+					return nil
+				})
+				return err
+			}, r.selfExpiredStreamKey)
+			if err != nil {
+				return xerrors.Errorf("failed transaction (%v...): %w\n", metricIDs[0], err)
 			}
 			return nil
 		})
-		if err != nil {
-			log.Printf("Could not complete to pipeline for deleteing old metrics (%v...): %w", metricIDs[0], err)
+
+		eg.Go(func() error {
+			// TODO: handling in case of delete failure
+			mapMetricIDs := groupMetricIDsByHashTag(metricIDs)
+			_, err = r.client.Pipelined(func(pipe goredis.Pipeliner) error {
+				for _, ids := range mapMetricIDs {
+					if len(ids) < 1 {
+						continue
+					}
+					if err := pipe.Unlink(ids...).Err(); err != nil {
+						return xerrors.Errorf("Could not del (%v): %w", ids[0], err)
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				return xerrors.Errorf("Could not complete to pipeline for deleteing old metrics (%v...): %w", metricIDs[0], err)
+			}
+			return nil
+		})
+
+		if err := eg.Wait(); err != nil {
+			log.Printf("%+v", err)
 			continue
 		}
 
