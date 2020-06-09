@@ -11,5 +11,6 @@ require (
 	github.com/phyber/negroni-gzip v0.0.0-20180113114010-ef6356a5d029
 	github.com/rs/cors v1.7.0
 	github.com/urfave/negroni v1.0.0
+	golang.org/x/sync v0.0.0-20200317015054-43a5402ce75a
 	golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543
 )
