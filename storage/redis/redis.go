@@ -91,6 +91,7 @@ func New(addrs []string, cluster bool) (*Redis, error) {
 			Addrs:      addrs,
 			Password:   "",
 			MaxRetries: 2,
+			PoolSize:   50,
 		})
 	} else {
 		r = goredis.NewClient(&goredis.Options{
@@ -98,6 +99,7 @@ func New(addrs []string, cluster bool) (*Redis, error) {
 			Password:   "",
 			DB:         0,
 			MaxRetries: 2,
+			PoolSize:   50,
 		})
 	}
 
