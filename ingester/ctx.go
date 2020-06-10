@@ -30,9 +30,9 @@ func (ctx *InsertCtx) Reset(rowsLen int) {
 	}
 	ctx.Labels = ctx.Labels[:0]
 
-	for i := range ctx.mrs {
-		delete(ctx.mrs, i)
-	}
+	// for i := range ctx.mrs {
+	// 	delete(ctx.mrs, i)
+	// }
 }
 
 const (
@@ -107,7 +107,7 @@ func (ctx *InsertCtx) AddLabel(name, value string) {
 
 // FlushBufs flushes buffered rows to the underlying storage.
 func (ctx *InsertCtx) FlushBufs() error {
-	if err := storage.AddRows(ctx.mrs); err != nil {
+	if err := storage.SubmitMemWriter(ctx.mrs); err != nil {
 		return &httpserver.ErrorWithStatusCode{
 			Err:        fmt.Errorf("cannot store metrics: %s", err),
 			StatusCode: http.StatusServiceUnavailable,
