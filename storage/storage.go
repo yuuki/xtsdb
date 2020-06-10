@@ -2,7 +2,6 @@ package storage
 
 import (
 	"log"
-	"runtime"
 
 	goredis "github.com/go-redis/redis/v7"
 
@@ -26,8 +25,8 @@ func Init() {
 		log.Fatal(err)
 	}
 	Store = &Storage{Memstore: r}
-	mrsChan = make(chan model.MetricRows)
-	RunMemWriter(runtime.GOMAXPROCS(-1) * 32)
+	mrsChan = make(chan model.MetricRows, 1000)
+	RunMemWriter(1000)
 }
 
 var mrsChan chan model.MetricRows
