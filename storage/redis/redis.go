@@ -322,14 +322,21 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(map[string][]byte) erro
 		copy(streamIDs, expiredStreamIDs)
 
 		mapRows := make(map[string][]byte, len(metricIDs))
-		for _, metricID := range metricIDs {
-			dp, err := r.client.Get(metricID).Result()
-			if err != nil {
-				log.Printf("Could not get %v: %+v", metricID, err)
-				continue
+		vals, err := r.client.Pipelined(func(pipe goredis.Pipeliner) error {
+			for _, metricID := range metricIDs {
+				//TODO: mget
+				pipe.Get(metricID)
 			}
-			mapRows[metricID] = append(mapRows[metricID],
-				bytesutil.ToUnsafeBytes(dp)...)
+			return nil
+		})
+		if err != nil {
+			log.Printf("Could not pipeline get: %+v", err)
+			continue
+		}
+		for i, val := range vals {
+			metricID := metricIDs[i]
+			v := val.(*goredis.StringCmd).Val()
+			mapRows[metricID] = append(mapRows[metricID], bytesutil.ToUnsafeBytes(v)...)
 		}
 		if err := flushHandler(mapRows); err != nil {
 			log.Printf("%+v", err)
