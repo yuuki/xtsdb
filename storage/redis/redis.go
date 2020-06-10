@@ -88,14 +88,16 @@ func New(addrs []string, cluster bool) (*Redis, error) {
 
 	if cluster {
 		r = goredis.NewClusterClient(&goredis.ClusterOptions{
-			Addrs:    addrs,
-			Password: "",
+			Addrs:      addrs,
+			Password:   "",
+			MaxRetries: 2,
 		})
 	} else {
 		r = goredis.NewClient(&goredis.Options{
-			Addr:     addrs[0],
-			Password: "",
-			DB:       0,
+			Addr:       addrs[0],
+			Password:   "",
+			DB:         0,
+			MaxRetries: 2,
 		})
 	}
 
@@ -321,7 +323,6 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(map[string][]byte) erro
 		streamIDs := make([]string, len(expiredStreamIDs))
 		copy(streamIDs, expiredStreamIDs)
 
-		mapRows := make(map[string][]byte, len(metricIDs))
 		vals, err := r.client.Pipelined(func(pipe goredis.Pipeliner) error {
 			for _, metricID := range metricIDs {
 				//TODO: mget
@@ -333,6 +334,7 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(map[string][]byte) erro
 			log.Printf("Could not pipeline get: %+v", err)
 			continue
 		}
+		mapRows := make(map[string][]byte, len(metricIDs))
 		for i, val := range vals {
 			metricID := metricIDs[i]
 			v := val.(*goredis.StringCmd).Val()
