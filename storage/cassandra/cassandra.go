@@ -21,6 +21,10 @@ func New() (*Cassandra, error) {
 	cluster := gocql.NewCluster(config.Config.CassandraAddrs...)
 	cluster.Keyspace = "xtsdb"
 	cluster.Consistency = gocql.Any
+	cluster.RetryPolicy = &gocql.ExponentialBackoffRetryPolicy{
+		NumRetries: 2,
+		Min:        20 * time.Millisecond,
+	}
 	session, err := cluster.CreateSession()
 	if err != nil {
 		return nil, err
