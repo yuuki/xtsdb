@@ -3,8 +3,6 @@ package storage
 import (
 	"log"
 
-	goredis "github.com/go-redis/redis/v7"
-
 	"github.com/yuuki/xtsdb/config"
 	"github.com/yuuki/xtsdb/storage/cassandra"
 	"github.com/yuuki/xtsdb/storage/model"
@@ -85,7 +83,7 @@ func FlushVolatileDataPoints() error {
 		return err
 	}
 	err = r.FlushExpiredDataPoints(
-		func(mapRows map[string][]goredis.XMessage) error {
+		func(mapRows map[string][]byte) error {
 			return c.AddRows(mapRows)
 		},
 	)

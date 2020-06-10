@@ -2,13 +2,9 @@ package cassandra
 
 import (
 	"encoding/binary"
-	"log"
-	"math"
-	"strconv"
-	"strings"
 	"time"
+	"unsafe"
 
-	goredis "github.com/go-redis/redis/v7"
 	"github.com/gocql/gocql"
 	"golang.org/x/xerrors"
 
@@ -37,48 +33,20 @@ func (c *Cassandra) Close() {
 	c.session.Close()
 }
 
-type datapoint struct {
-	timestamp int64
-	value     float64
-}
-
 // AddRows inserts rows into cassandra server.
-func (c *Cassandra) AddRows(mapRows map[string][]goredis.XMessage) error {
+func (c *Cassandra) AddRows(mapRows map[string][]byte) error {
 	batch := c.session.NewBatch(gocql.UnloggedBatch)
-	for metricName, xmsgs := range mapRows {
-		blob := make([]byte, len(xmsgs)*2*8) // 2 -> (timestamp, value) 8 -> bytes of int64 or float64
-		var startTime time.Time
-		for i, xmsg := range xmsgs {
-			ts := strings.TrimSuffix(xmsg.ID, "-0")
-			t, err := strconv.ParseInt(ts, 10, 64)
-			if err != nil {
-				log.Printf("Could not parse %s: %s\n", ts, err)
-				continue
-			}
-			if startTime.IsZero() {
-				startTime = time.Unix(t, 0)
-			}
-
-			binary.BigEndian.PutUint64(blob[i*2*8:], uint64(t))
-
-			v := xmsg.Values[""]
-			val, err := strconv.ParseFloat(v.(string), 64)
-			if err != nil {
-				log.Printf("Could not parse %v: %s\n", v, err)
-				continue
-			}
-
-			binary.BigEndian.PutUint64(blob[i*2*8+8:], math.Float64bits(val))
+	for metricName, datapoints := range mapRows {
+		if len(datapoints) < 8 {
+			continue
 		}
+		ts := binary.BigEndian.Uint64(datapoints[0:8])
+		startTime := time.Unix(*(*int64)(unsafe.Pointer(&ts)), 0)
 
 		batch.Query(`
 			INSERT INTO datapoint (metric_id, timestamp, values)
-			VALUES (?, ?, ?)`, metricName, startTime, blob,
+			VALUES (?, ?, ?)`, metricName, startTime, datapoints,
 		)
-		// if err != nil {
-		// 	return xerrors.Errorf("Could not insert datapoint (%v, %v): %w\n",
-		// 		metricName, startTime, err)
-		// }
 	}
 	if err := c.session.ExecuteBatch(batch); err != nil {
 		return xerrors.Errorf("Got error ot batch: %w", err)

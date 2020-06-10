@@ -2,16 +2,20 @@ package redis
 
 import (
 	"crypto/sha1"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/rand"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+	"unsafe"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/metrics"
 	goredis "github.com/go-redis/redis/v7"
 	"golang.org/x/sync/errgroup"
@@ -31,10 +35,10 @@ const (
 	scriptForAddRows = `
 		local res
        	for i = 1, #KEYS do
-            res = redis.call('XADD', KEYS[i], ARGV[i*3-2], '', ARGV[i*3-1]);
+            res = redis.call('APPEND', KEYS[i], ARGV[i*2-1]);
            	local key = 'ex:'..KEYS[i];
            	if redis.call('GET', key) == false then
-           	    res = redis.call('SETEX', key, ARGV[i*3], 1);
+           	    res = redis.call('SETEX', key, ARGV[i*2], 1);
 			end
         end
 		return res
@@ -60,6 +64,7 @@ type redisAPI interface {
 	XAdd(*goredis.XAddArgs) *goredis.StringCmd
 	XReadGroup(*goredis.XReadGroupArgs) *goredis.XStreamSliceCmd
 	XRange(string, string, string) *goredis.XMessageSliceCmd
+	Get(key string) *goredis.StringCmd
 	Del(...string) *goredis.IntCmd
 	Watch(func(*goredis.Tx) error, ...string) error
 	EvalSha(string, []string, ...interface{}) *goredis.Cmd
@@ -189,14 +194,16 @@ func (r *Redis) AddRows(mrs model.MetricRows) error {
 		}
 		eb := &evalBuffer{
 			keys: make([]string, 0, len(rows)),
-			args: make([]interface{}, 0, len(rows)*3),
+			args: make([]interface{}, 0, len(rows)*2),
 		}
+		datapoints := make([]byte, len(rows)*2*8) // 2 -> (timestamp, value) 8 -> bytes of int64 or float64
 		for i := range rows {
 			row := &rows[i]
+			dp := datapoints[i*2*8 : (i+1)*2*8]
+			binary.BigEndian.PutUint64(dp[0:8], *(*uint64)(unsafe.Pointer(&row.Timestamp)))
+			binary.BigEndian.PutUint64(dp[8:16], math.Float64bits(row.Value))
 			eb.keys = append(eb.keys, row.MetricName)
-			// TODO: fix int cast
-			eb.args = append(eb.args, int(row.Timestamp), row.Value,
-				config.Config.DurationExpires.Seconds())
+			eb.args = append(eb.args, bytesutil.ToUnsafeString(dp), config.Config.DurationExpires.Seconds())
 		}
 		ebMap[label] = eb
 	}
@@ -266,7 +273,7 @@ func (r *Redis) SubscribeExpiredDataPoints(addr string) error {
 
 // FlushExpiredDataPoints runs a loop of flushing data points
 // from Redis to DiskStore.
-func (r *Redis) FlushExpiredDataPoints(flushHandler func(map[string][]goredis.XMessage) error) error {
+func (r *Redis) FlushExpiredDataPoints(flushHandler func(map[string][]byte) error) error {
 	if err := r.initExpiredStream(); err != nil {
 		return err
 	}
@@ -314,14 +321,15 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(map[string][]goredis.XM
 		streamIDs := make([]string, len(expiredStreamIDs))
 		copy(streamIDs, expiredStreamIDs)
 
-		mapRows := make(map[string][]goredis.XMessage, len(metricIDs))
+		mapRows := make(map[string][]byte, len(metricIDs))
 		for _, metricID := range metricIDs {
-			xmsgs, err := r.client.XRange(metricID, "-", "+").Result()
+			dp, err := r.client.Get(metricID).Result()
 			if err != nil {
-				log.Printf("Could not xrange %v: %+v", metricID, err)
+				log.Printf("Could not get %v: %+v", metricID, err)
 				continue
 			}
-			mapRows[metricID] = append(mapRows[metricID], xmsgs...)
+			mapRows[metricID] = append(mapRows[metricID],
+				bytesutil.ToUnsafeBytes(dp)...)
 		}
 		if err := flushHandler(mapRows); err != nil {
 			log.Printf("%+v", err)
