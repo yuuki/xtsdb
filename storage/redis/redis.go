@@ -10,6 +10,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -88,18 +89,24 @@ func New(addrs []string, cluster bool) (*Redis, error) {
 
 	if cluster {
 		r = goredis.NewClusterClient(&goredis.ClusterOptions{
-			Addrs:      addrs,
-			Password:   "",
-			MaxRetries: 2,
-			PoolSize:   50,
+			Addrs:        addrs,
+			Password:     "",
+			ReadTimeout:  500 * time.Millisecond,
+			WriteTimeout: 500 * time.Millisecond,
+			PoolTimeout:  1 * time.Second,
+			MaxRetries:   2,
+			PoolSize:     25 * runtime.NumCPU(),
 		})
 	} else {
 		r = goredis.NewClient(&goredis.Options{
-			Addr:       addrs[0],
-			Password:   "",
-			DB:         0,
-			MaxRetries: 2,
-			PoolSize:   50,
+			Addr:         addrs[0],
+			Password:     "",
+			DB:           0,
+			MaxRetries:   2,
+			ReadTimeout:  500 * time.Millisecond,
+			WriteTimeout: 500 * time.Millisecond,
+			PoolTimeout:  1 * time.Second,
+			PoolSize:     25 * runtime.NumCPU(),
 		})
 	}
 
