@@ -326,15 +326,9 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(map[string][]byte) erro
 			continue
 		}
 
-		// begin transaction flush to cassandra
-		metricIDs := make([]string, len(expiredMetricIDs))
-		copy(metricIDs, expiredMetricIDs)
-		streamIDs := make([]string, len(expiredStreamIDs))
-		copy(streamIDs, expiredStreamIDs)
-
 		vals, err := r.client.Pipelined(func(pipe goredis.Pipeliner) error {
-			for _, metricID := range metricIDs {
-				//TODO: mget
+			for _, metricID := range expiredMetricIDs {
+				// TODO: mget
 				pipe.Get(metricID)
 			}
 			return nil
@@ -343,9 +337,9 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(map[string][]byte) erro
 			log.Printf("Could not pipeline get: %+v", err)
 			continue
 		}
-		mapRows := make(map[string][]byte, len(metricIDs))
+		mapRows := make(map[string][]byte, len(expiredMetricIDs))
 		for i, val := range vals {
-			metricID := metricIDs[i]
+			metricID := expiredMetricIDs[i]
 			v := val.(*goredis.StringCmd).Val()
 			mapRows[metricID] = append(mapRows[metricID], bytesutil.ToUnsafeBytes(v)...)
 		}
@@ -361,25 +355,25 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(map[string][]byte) erro
 			err = r.client.Watch(func(tx *goredis.Tx) error {
 				// TODO: lua script for xack and del
 				_, err := tx.Pipelined(func(pipe goredis.Pipeliner) error {
-					if err := pipe.XAck(r.selfExpiredStreamKey, flusherXGroup, streamIDs...).Err(); err != nil {
-						return xerrors.Errorf("Could not xack (%s,%s) (%v): %w", expiredStreamName, flusherXGroup, streamIDs, err)
+					if err := pipe.XAck(r.selfExpiredStreamKey, flusherXGroup, expiredStreamIDs...).Err(); err != nil {
+						return xerrors.Errorf("Could not xack (%s,%s) (%v): %w", expiredStreamName, flusherXGroup, expiredStreamIDs, err)
 					}
-					if err := pipe.XDel(r.selfExpiredStreamKey, streamIDs...).Err(); err != nil {
-						return xerrors.Errorf("Could not xdel (%s) (%v): %w", expiredStreamName, streamIDs, err)
+					if err := pipe.XDel(r.selfExpiredStreamKey, expiredStreamIDs...).Err(); err != nil {
+						return xerrors.Errorf("Could not xdel (%s) (%v): %w", expiredStreamName, expiredStreamIDs, err)
 					}
 					return nil
 				})
 				return err
 			}, r.selfExpiredStreamKey)
 			if err != nil {
-				return xerrors.Errorf("failed transaction (%v...): %w\n", metricIDs[0], err)
+				return xerrors.Errorf("failed transaction (%v...): %w\n", expiredMetricIDs[0], err)
 			}
 			return nil
 		})
 
 		eg.Go(func() error {
 			// TODO: handling in case of delete failure
-			mapMetricIDs := groupMetricIDsByHashTag(metricIDs)
+			mapMetricIDs := groupMetricIDsByHashTag(expiredMetricIDs)
 			_, err = r.client.Pipelined(func(pipe goredis.Pipeliner) error {
 				for _, ids := range mapMetricIDs {
 					if len(ids) < 1 {
@@ -392,7 +386,7 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(map[string][]byte) erro
 				return nil
 			})
 			if err != nil {
-				return xerrors.Errorf("Could not complete to pipeline for deleteing old metrics (%v...): %w", metricIDs[0], err)
+				return xerrors.Errorf("Could not complete to pipeline for deleteing old metrics (%v...): %w", expiredMetricIDs[0], err)
 			}
 			return nil
 		})
@@ -403,7 +397,7 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(map[string][]byte) erro
 		}
 
 		flushDuration.UpdateDuration(startTime)
-		metricsFlushed.Add(len(streamIDs))
+		metricsFlushed.Add(len(expiredStreamIDs))
 	}
 }
 
