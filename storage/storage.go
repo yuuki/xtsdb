@@ -23,8 +23,8 @@ func Init() {
 		log.Fatal(err)
 	}
 	Store = &Storage{Memstore: r}
-	mrsChan = make(chan model.MetricRows, 1000)
-	RunMemWriter(1000)
+	mrsChan = make(chan model.MetricRows, 1500)
+	RunMemWriter(1500)
 }
 
 var mrsChan chan model.MetricRows
