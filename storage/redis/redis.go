@@ -355,12 +355,8 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(map[string][]byte) erro
 			err = r.client.Watch(func(tx *goredis.Tx) error {
 				// TODO: lua script for xack and del
 				_, err := tx.Pipelined(func(pipe goredis.Pipeliner) error {
-					if err := pipe.XAck(r.selfExpiredStreamKey, flusherXGroup, expiredStreamIDs...).Err(); err != nil {
-						return xerrors.Errorf("Could not xack (%s,%s) (%v): %w", expiredStreamName, flusherXGroup, expiredStreamIDs, err)
-					}
-					if err := pipe.XDel(r.selfExpiredStreamKey, expiredStreamIDs...).Err(); err != nil {
-						return xerrors.Errorf("Could not xdel (%s) (%v): %w", expiredStreamName, expiredStreamIDs, err)
-					}
+					pipe.XAck(r.selfExpiredStreamKey, flusherXGroup, expiredStreamIDs...)
+					pipe.XDel(r.selfExpiredStreamKey, expiredStreamIDs...)
 					return nil
 				})
 				return err
@@ -379,9 +375,7 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(map[string][]byte) erro
 					if len(ids) < 1 {
 						continue
 					}
-					if err := pipe.Unlink(ids...).Err(); err != nil {
-						return xerrors.Errorf("Could not del (%v): %w", ids[0], err)
-					}
+					pipe.Unlink(ids...)
 				}
 				return nil
 			})
