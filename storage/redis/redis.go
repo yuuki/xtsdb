@@ -227,7 +227,7 @@ func (r *Redis) AddRows(mrs model.MetricRows) error {
 			ttlf := eseconds + math.Mod(*(*float64)(unsafe.Pointer(&id)), *(*float64)(unsafe.Pointer(&eseconds)))
 
 			eb.keys = append(eb.keys, row.MetricName)
-			eb.args = append(eb.args, bytesutil.ToUnsafeString(dp), *(*int32)(unsafe.Pointer(&ttlf)))
+			eb.args = append(eb.args, bytesutil.ToUnsafeString(dp), math.Float64bits(ttlf))
 		}
 		ebMap[label] = eb
 	}
