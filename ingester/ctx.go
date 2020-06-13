@@ -107,7 +107,7 @@ func (ctx *InsertCtx) AddLabel(name, value string) {
 
 // FlushBufs flushes buffered rows to the underlying storage.
 func (ctx *InsertCtx) FlushBufs() error {
-	if err := storage.SubmitMemWriter(ctx.mrs); err != nil {
+	if err := storage.AddRows(ctx.mrs); err != nil {
 		return &httpserver.ErrorWithStatusCode{
 			Err:        fmt.Errorf("cannot store metrics: %s", err),
 			StatusCode: http.StatusServiceUnavailable,
