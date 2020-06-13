@@ -258,10 +258,10 @@ func (r *Redis) AddRows(mrs model.MetricRows) error {
 			binary.BigEndian.PutUint64(dp[8:16], math.Float64bits(row.Value))
 
 			id := getMetricID(row.MetricName)
-			ttlf := eseconds + math.Mod(*(*float64)(unsafe.Pointer(&id)), *(*float64)(unsafe.Pointer(&eseconds)))
+			ttl := int(eseconds + math.Mod(float64(id), eseconds))
 
 			eb.keys = append(eb.keys, row.MetricName)
-			eb.args = append(eb.args, bytesutil.ToUnsafeString(dp), math.Float64bits(ttlf))
+			eb.args = append(eb.args, bytesutil.ToUnsafeString(dp), ttl)
 		}
 		ebMap[label] = eb
 	}
