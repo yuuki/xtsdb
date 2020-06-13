@@ -267,7 +267,7 @@ func (r *Redis) AddRows(mrs model.MetricRows) error {
 	}
 
 	// TODO: Remove NaN value
-	_, err := r.client.Pipelined(func(pipe goredis.Pipeliner) error {
+	cmds, err := r.client.Pipelined(func(pipe goredis.Pipeliner) error {
 		for _, eb := range ebMap {
 			err := pipe.EvalSha(r.hashScriptAddRows, eb.keys, eb.args...).Err()
 			if err != nil {
@@ -278,7 +278,18 @@ func (r *Redis) AddRows(mrs model.MetricRows) error {
 		return nil
 	})
 	if err != nil {
-		return xerrors.Errorf("Got error of redis pipeline: %w", err)
+		var (
+			firstErr       error
+			firstCmdString string
+		)
+		for _, cmd := range cmds {
+			if err := cmd.Err(); err != nil {
+				firstErr = err
+				firstCmdString = cmd.String()
+				break
+			}
+		}
+		return xerrors.Errorf("Got error of redis pipeline (%q): %w", firstCmdString, firstErr)
 	}
 
 	insertRowsDuration.UpdateDuration(startTime)
