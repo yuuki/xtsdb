@@ -52,7 +52,7 @@ var (
 				redis.call('XADD', expiredStreamKey, '*', KEYS[i], "")
 				redis.call('SET', ek, 1, "EX", ARGV[i*2])
 			end
-			if redis.call('GET', ek) == false then
+			if redis.call('EXISTS', ek) == 0 then
 				redis.call('SET', ek, 1, "EX", ARGV[i*2])
 			end
 		end
