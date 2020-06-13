@@ -47,13 +47,13 @@ var (
 		local expiredKeyPrefix = '%s'
        	for i = 1, #KEYS do
 			local ek = expiredKeyPrefix..KEYS[i]
-			res = redis.call('APPEND', KEYS[i], ARGV[i*2-1]);
+			res = redis.call('APPEND', KEYS[i], ARGV[i*2-1])
 			if redis.call('STRLEN', KEYS[i]) >= maxKeyLen then
 				redis.call('XADD', expiredStreamKey, '*', KEYS[i])
-				redis.call('SETEX', ek, ARGV[i*2], 1);
+				redis.call('SET', ek, 1, "EX", ARGV[i*2])
 			end
 			if redis.call('GET', ek) == false then
-				redis.call('SETEX', ek, ARGV[i*2], 1);
+				redis.call('SET', ek, 1, "EX", ARGV[i*2])
 			end
 		end
 		return res
