@@ -42,6 +42,7 @@ func (cli *CLI) Run(args []string) int {
 		redisAddr       string
 		redisPubSubAddr string
 		durationExpires string
+		maxSeriesLength int
 
 		profile bool
 	)
@@ -55,6 +56,7 @@ func (cli *CLI) Run(args []string) int {
 	flags.StringVar(&redisAddr, "redisAddr", config.DefaultRedisAddr, "")
 	flags.StringVar(&redisPubSubAddr, "redisPubSubAddr", config.DefaultRedisAddr, "")
 	flags.StringVar(&durationExpires, "durationExpires", config.DefaultDurationExpires, "")
+	flags.IntVar(&maxSeriesLength, "maxSeriesLength", config.DefaultMaxSeriesLength, "")
 	flags.BoolVar(&profile, "profile", false, "")
 	if err := flags.Parse(args[1:]); err != nil {
 		return exitCodeErr
@@ -62,6 +64,7 @@ func (cli *CLI) Run(args []string) int {
 
 	config.Config.RedisAddrs = strings.Split(redisAddr, ",")
 	config.Config.RedisPubSubAddr = redisPubSubAddr
+	config.Config.MaxSeriesLength = maxSeriesLength
 
 	ts, err := time.ParseDuration(durationExpires)
 	if err != nil {

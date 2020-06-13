@@ -32,7 +32,6 @@ const (
 	expiredStreamName   = "expired-stream"
 	flusherXGroup       = "flushers"
 	expiredEventChannel = "__keyevent@0__:expired"
-	maxKeyLen           = (8 + 8) * 40 // datapoint = int64 + float64
 )
 
 var (
@@ -140,6 +139,7 @@ func New(addrs []string) (*Redis, error) {
 		script           string
 		selfShardID      int
 		expiredStreamKey string = expiredStreamName
+		maxSeriesLen     int    = (8 + 8) * config.Config.MaxSeriesLength // datapoint = int64 + float64
 	)
 
 	if rcc, ok := r.(*goredis.ClusterClient); ok {
@@ -151,7 +151,7 @@ func New(addrs []string) (*Redis, error) {
 		}
 
 		expiredStreamKey = fmt.Sprintf("%s:%d", expiredStreamName, selfShardID)
-		script = fmt.Sprintf(scriptForAddRows, maxKeyLen, expiredStreamKey, prefixKeyForExpire)
+		script = fmt.Sprintf(scriptForAddRows, maxSeriesLen, expiredStreamKey, prefixKeyForExpire)
 
 		// register script to redis-server.
 		err = rcc.ForEachMaster(func(client *goredis.Client) error {
@@ -162,7 +162,7 @@ func New(addrs []string) (*Redis, error) {
 				"could not register script to cluster masters: %w", err)
 		}
 	} else {
-		script = fmt.Sprintf(scriptForAddRows, maxKeyLen, expiredStreamKey, prefixKeyForExpire)
+		script = fmt.Sprintf(scriptForAddRows, maxSeriesLen, expiredStreamKey, prefixKeyForExpire)
 		// register script to redis-server.
 		if err := r.ScriptLoad(script).Err(); err != nil {
 			return nil, xerrors.Errorf("could not register script: %w", err)

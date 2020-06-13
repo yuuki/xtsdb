@@ -6,6 +6,7 @@ const (
 	DefaultRedisAddr       = "127.0.0.1:6379"
 	DefaultCassandraAddr   = "127.0.0.1:9042"
 	DefaultDurationExpires = "1h"
+	DefaultMaxSeriesLength = 100
 )
 
 type config struct {
@@ -17,6 +18,7 @@ type config struct {
 	CassandraAddrs []string
 	// DurationExpires is duration that datapoints on the memory store expires.
 	DurationExpires time.Duration
+	MaxSeriesLength int
 }
 
 // Config is set from the environment variables and command-line flag values.
