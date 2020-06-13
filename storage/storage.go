@@ -18,13 +18,13 @@ var Store *Storage
 
 // Init creates a storage client.
 func Init() {
-	r, err := redis.New(config.Config.RedisAddrs, true)
+	r, err := redis.New(config.Config.RedisAddrs)
 	if err != nil {
 		log.Fatal(err)
 	}
 	Store = &Storage{Memstore: r}
-	mrsChan = make(chan model.MetricRows, 1500)
-	RunMemWriter(1500)
+	// mrsChan = make(chan model.MetricRows, 1500)
+	// RunMemWriter(1500)
 }
 
 var mrsChan chan model.MetricRows
@@ -58,7 +58,7 @@ func AddRows(mrs model.MetricRows) error {
 // StreamVolatileDataPoints streams volatile datapoints to reliable stream.
 func StreamVolatileDataPoints() error {
 	addr := config.Config.RedisPubSubAddr
-	r, err := redis.New([]string{addr}, true)
+	r, err := redis.New([]string{addr})
 	if err != nil {
 		return err
 	}
@@ -74,7 +74,7 @@ func StreamVolatileDataPoints() error {
 // FlushVolatileDataPoints runs a loop of flushing data points
 // from MemStore to DiskStore.
 func FlushVolatileDataPoints() error {
-	r, err := redis.New(config.Config.RedisAddrs, true)
+	r, err := redis.New(config.Config.RedisAddrs)
 	if err != nil {
 		return err
 	}

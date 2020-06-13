@@ -11,7 +11,6 @@ import (
 	"math"
 	"math/rand"
 	"os"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -33,7 +32,7 @@ const (
 	expiredStreamName   = "expired-stream"
 	flusherXGroup       = "flushers"
 	expiredEventChannel = "__keyevent@0__:expired"
-	maxKeyLen           = (8 + 8) * 50 // datapoint = int64 + float64
+	maxKeyLen           = (8 + 8) * 40 // datapoint = int64 + float64
 )
 
 var (
@@ -48,15 +47,16 @@ var (
 		local expiredStreamKey = '%s'
 		local expiredKeyPrefix = '%s'
        	for i = 1, #KEYS do
+			local ek = expiredKeyPrefix..KEYS[i]
 			res = redis.call('APPEND', KEYS[i], ARGV[i*2-1]);
 			if redis.call('STRLEN', KEYS[i]) >= maxKeyLen then
 				redis.call('XADD', expiredStreamKey, '*', KEYS[i])
+				redis.call('SETEX', ek, ARGV[i*2], 1);
 			end
-			local ek = expiredKeyPrefix..KEYS[i]
 			if redis.call('GET', ek) == false then
-           	    redis.call('SETEX', ek, ARGV[i*2], 1);
+				redis.call('SETEX', ek, ARGV[i*2], 1);
 			end
-        end
+		end
 		return res
 	`
 )
@@ -87,21 +87,41 @@ type Redis struct {
 	selfExpiredStreamKey string
 }
 
+func isCluster(addr string) (bool, error) {
+	red := goredis.NewClient(&goredis.Options{
+		Addr:     addr,
+		Password: "",
+	})
+	v, err := red.Info("CLUSTER").Result()
+	if err != nil {
+		return false, xerrors.Errorf("Could not get INFO CLUSTER")
+	}
+	if kv := strings.SplitN(v, ":", 2); len(kv) > 1 {
+		if kv[1] == "1" {
+			return true, nil
+		}
+		return false, nil
+	} else {
+		return false, xerrors.Errorf("invalid format of INFO CLUSTER: %q", kv)
+	}
+	panic("not reachable")
+}
+
 // New creates a Redis client.
-func New(addrs []string, cluster bool) (*Redis, error) {
+func New(addrs []string) (*Redis, error) {
 	var (
 		r redisAPI
 	)
 
+	cluster, err := isCluster(addrs[0])
+	if err != nil {
+		return nil, err
+	}
 	if cluster {
 		r = goredis.NewClusterClient(&goredis.ClusterOptions{
-			Addrs:    addrs,
-			Password: "",
-			// ReadTimeout:  500 * time.Millisecond,
-			// WriteTimeout: 500 * time.Millisecond,
-			// PoolTimeout:  1 * time.Second,
+			Addrs:      addrs,
+			Password:   "",
 			MaxRetries: 2,
-			PoolSize:   100 * runtime.NumCPU(),
 		})
 	} else {
 		r = goredis.NewClient(&goredis.Options{
@@ -109,10 +129,6 @@ func New(addrs []string, cluster bool) (*Redis, error) {
 			Password:   "",
 			DB:         0,
 			MaxRetries: 2,
-			// ReadTimeout:  500 * time.Millisecond,
-			// WriteTimeout: 500 * time.Millisecond,
-			// PoolTimeout:  1 * time.Second,
-			PoolSize: 100 * runtime.NumCPU(),
 		})
 	}
 
