@@ -33,19 +33,7 @@ const (
 	expiredStreamName   = "expired-stream"
 	flusherXGroup       = "flushers"
 	expiredEventChannel = "__keyevent@0__:expired"
-
-	scriptForAddRows = `
-		local res
-       	for i = 1, #KEYS do
-            res = redis.call('APPEND', KEYS[i], ARGV[i*2-1]);
-           	local key = 'ex:'..KEYS[i];
-			   if redis.call('GET', key) == false then
-           	    res = redis.call('SETEX', key, ARGV[i*2], 1);
-			end
-        end
-		return res
-`
-	maxBatchSize = 500
+	maxKeyLen           = (8 + 8) * 50 // datapoint = int64 + float64
 )
 
 var (
@@ -53,6 +41,24 @@ var (
 	metricsFlushed     = metrics.NewCounter(`xt_metrics_flushed_total`)
 	flushDuration      = metrics.NewSummary(`xt_flush_duration_seconds`)
 	insertRowsDuration = metrics.NewSummary(`xt_insert_rows_duration_seconds`)
+
+	scriptForAddRows = `
+		local res
+		local maxKeyLen = %d
+		local expiredStreamKey = '%s'
+		local expiredKeyPrefix = '%s'
+       	for i = 1, #KEYS do
+			res = redis.call('APPEND', KEYS[i], ARGV[i*2-1]);
+			if redis.call('STRLEN', KEYS[i]) >= maxKeyLen then
+				redis.call('XADD', expiredStreamKey, '*', KEYS[i])
+			end
+			local ek = expiredKeyPrefix..KEYS[i]
+			if redis.call('GET', ek) == false then
+           	    redis.call('SETEX', ek, ARGV[i*2], 1);
+			end
+        end
+		return res
+	`
 )
 
 // redisAPI abstratcts goredis.Client and goredis.ClusterClient.
@@ -84,8 +90,7 @@ type Redis struct {
 // New creates a Redis client.
 func New(addrs []string, cluster bool) (*Redis, error) {
 	var (
-		r           redisAPI
-		selfShardID int
+		r redisAPI
 	)
 
 	if cluster {
@@ -115,38 +120,51 @@ func New(addrs []string, cluster bool) (*Redis, error) {
 		return nil, xerrors.Errorf("could not ping: %w", err)
 	}
 
-	h := sha1.New()
-	io.WriteString(h, scriptForAddRows)
-	hash := hex.EncodeToString(h.Sum(nil))
+	var (
+		script           string
+		selfShardID      int
+		expiredStreamKey string = expiredStreamName
+	)
 
 	if rcc, ok := r.(*goredis.ClusterClient); ok {
+		// TODO: rename RedisPubSubAddr
+		var err error
+		selfShardID, err = getSelfShardID(rcc, addrs[0])
+		if err != nil {
+			return nil, err
+		}
+
+		expiredStreamKey = fmt.Sprintf("%s:%d", expiredStreamName, selfShardID)
+		script = fmt.Sprintf(scriptForAddRows, maxKeyLen, expiredStreamKey, prefixKeyForExpire)
+
 		// register script to redis-server.
-		err := rcc.ForEachMaster(func(client *goredis.Client) error {
-			return client.ScriptLoad(scriptForAddRows).Err()
+		err = rcc.ForEachMaster(func(client *goredis.Client) error {
+			return client.ScriptLoad(script).Err()
 		})
 		if err != nil {
 			return nil, xerrors.Errorf(
 				"could not register script to cluster masters: %w", err)
 		}
-		// TODO: rename RedisPubSubAddr
-		selfShardID, err = getSelfShardID(rcc, addrs[0])
-		if err != nil {
-			return nil, err
-		}
 	} else {
+		script = fmt.Sprintf(scriptForAddRows, maxKeyLen, expiredStreamKey, prefixKeyForExpire)
 		// register script to redis-server.
-		if err := r.ScriptLoad(scriptForAddRows).Err(); err != nil {
+		if err := r.ScriptLoad(script).Err(); err != nil {
 			return nil, xerrors.Errorf("could not register script: %w", err)
 		}
 	}
 
-	return &Redis{
+	h := sha1.New()
+	io.WriteString(h, script)
+	hash := hex.EncodeToString(h.Sum(nil))
+
+	red := &Redis{
 		client:               r,
 		cluster:              cluster,
 		hashScriptAddRows:    hash,
 		selfShardID:          selfShardID,
-		selfExpiredStreamKey: fmt.Sprintf("%s:%d", expiredStreamName, selfShardID),
-	}, nil
+		selfExpiredStreamKey: expiredStreamKey,
+	}
+	return red, nil
 }
 
 func (r *Redis) redisClient(addr string) *goredis.Client {
