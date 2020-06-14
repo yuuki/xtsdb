@@ -248,6 +248,7 @@ func (r *Redis) AddRows(mrs model.MetricRows) error {
 		}
 		datapoints := make([]byte, len(rows)*2*8) // 2 -> (timestamp, value) 8 -> bytes of int64 or float64
 		for i := range rows {
+			// TODO: Remove NaN value
 			row := &rows[i]
 
 			dp := datapoints[i*2*8 : (i+1)*2*8]
@@ -262,14 +263,9 @@ func (r *Redis) AddRows(mrs model.MetricRows) error {
 		ebMap[label] = eb
 	}
 
-	// TODO: Remove NaN value
 	cmds, err := r.client.Pipelined(func(pipe goredis.Pipeliner) error {
 		for _, eb := range ebMap {
-			err := pipe.EvalSha(r.hashScriptAddRows, eb.keys, eb.args...).Err()
-			if err != nil {
-				return xerrors.Errorf("Could not add rows to redis (keylen:%d, arglen:%v): %w",
-					len(eb.keys), len(eb.args), err)
-			}
+			pipe.EvalSha(r.hashScriptAddRows, eb.keys, eb.args...)
 		}
 		return nil
 	})
