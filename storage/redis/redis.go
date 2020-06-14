@@ -32,6 +32,7 @@ const (
 	expiredStreamName   = "expired-stream"
 	flusherXGroup       = "flushers"
 	expiredEventChannel = "__keyevent@0__:expired"
+	flusherReadCount    = 500
 )
 
 var (
@@ -357,7 +358,7 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []byte) error) 
 			Group:    flusherXGroup,
 			Consumer: consumerID,
 			Streams:  []string{r.selfExpiredStreamKey, ">"},
-			Count:    20,
+			Count:    flusherReadCount,
 		}).Result()
 		if err != nil {
 			if err != goredis.Nil {
@@ -385,7 +386,9 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []byte) error) 
 			eg.Go(func() error {
 				res, err := r.client.Get(mid).Result()
 				if err != nil {
-					return xerrors.Errorf("Could not GET %q: %w", mid, err)
+					if err != goredis.Nil {
+						return xerrors.Errorf("Could not GET %q: %w", mid, err)
+					}
 				}
 				datapoints := bytesutil.ToUnsafeBytes(res)
 				return flushHandler(mid, datapoints)
