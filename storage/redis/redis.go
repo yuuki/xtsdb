@@ -28,6 +28,7 @@ import (
 const (
 	// prefixEx is a prefix of expired keys.
 	prefixKeyForExpire  = "ex:"
+	prefixKeyTS         = "ts:"
 	expiredStreamName   = "expired-stream"
 	flusherXGroup       = "flushers"
 	expiredEventChannel = "__keyevent@0__:expired"
@@ -45,15 +46,16 @@ var (
 		local expiredStreamKey = '%s'
 		local expiredKeyPrefix = '%s'
        	for i = 1, #KEYS do
-			local tk = 'ts'..KEYS[i]
+			local tk = 'ts:'..KEYS[i]
 			local ek = expiredKeyPrefix..KEYS[i]
 			res = redis.call('APPEND', tk, ARGV[i*2-1])
-			if redis.call('STRLEN', tk) >= maxKeyLen then
-				redis.call('XADD', expiredStreamKey, '*', tk, "")
-				redis.call('SET', ek, 1, "EX", ARGV[i*2])
-			end
 			if redis.call('EXISTS', ek) == 0 then
 				redis.call('SET', ek, 1, "EX", ARGV[i*2])
+			else
+				if redis.call('TTL', ek) < 30 then
+					redis.call('XADD', expiredStreamKey, '*', tk, "")
+					redis.call('DEL', ek)
+				end
 			end
 		end
 		return res
@@ -381,7 +383,7 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []byte) error) 
 		for _, mid := range expiredMetricIDs {
 			mid := mid
 			eg.Go(func() error {
-				res, err := r.client.Get(mid).Result()
+				res, err := r.client.Get(prefixKeyTS + mid).Result()
 				if err != nil {
 					return xerrors.Errorf("Could not GET %q: %w", mid, err)
 				}
