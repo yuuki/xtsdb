@@ -94,19 +94,22 @@ func isCluster(addr string) (bool, error) {
 		Addr:     addr,
 		Password: "",
 	})
-	v, err := red.Info("CLUSTER").Result()
+	res, err := red.Info("CLUSTER").Result()
 	if err != nil {
 		return false, xerrors.Errorf("Could not get INFO CLUSTER")
 	}
-	if kv := strings.SplitN(v, ":", 2); len(kv) > 1 {
-		if kv[1] == "1" {
-			return true, nil
+	if lines := strings.Split(res, "\r\n"); len(lines) > 1 {
+		if kv := strings.Split(lines[1], ":"); len(kv) > 1 {
+			log.Println(kv[1])
+			if kv[1] == "0" {
+				return false, nil
+			}
+			if kv[1] == "1" {
+				return true, nil
+			}
 		}
-		return false, nil
-	} else {
-		return false, xerrors.Errorf("invalid format of INFO CLUSTER: %q", kv)
 	}
-	panic("not reachable")
+	return false, xerrors.Errorf("invalid format of INFO CLUSTER: %q", res)
 }
 
 // New creates a Redis client.
