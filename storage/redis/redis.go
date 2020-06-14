@@ -335,7 +335,7 @@ func (r *Redis) SubscribeExpiredDataPoints(addr string) error {
 
 // FlushExpiredDataPoints runs a loop of flushing data points
 // from Redis to DiskStore.
-func (r *Redis) FlushExpiredDataPoints(flushHandler func(map[string][]byte) error) error {
+func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []byte) error) error {
 	if err := r.initExpiredStream(); err != nil {
 		return err
 	}
@@ -377,29 +377,25 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(map[string][]byte) erro
 			continue
 		}
 
-		vals, err := r.client.Pipelined(func(pipe goredis.Pipeliner) error {
-			for _, metricID := range expiredMetricIDs {
-				// TODO: mget
-				pipe.Get(metricID)
-			}
-			return nil
-		})
-		if err != nil {
-			log.Printf("Could not pipeline get: %+v", err)
-			continue
+		eg := errgroup.Group{}
+		for _, mid := range expiredMetricIDs {
+			mid := mid
+			eg.Go(func() error {
+				res, err := r.client.Get(mid).Result()
+				if err != nil {
+					return xerrors.Errorf("Could not GET %q: %w", mid, err)
+				}
+				datapoints := bytesutil.ToUnsafeBytes(res)
+				return flushHandler(mid, datapoints)
+			})
 		}
-		mapRows := make(map[string][]byte, len(expiredMetricIDs))
-		for i, val := range vals {
-			metricID := expiredMetricIDs[i]
-			v := val.(*goredis.StringCmd).Val()
-			mapRows[metricID] = append(mapRows[metricID], bytesutil.ToUnsafeBytes(v)...)
-		}
-		if err := flushHandler(mapRows); err != nil {
+
+		if err := eg.Wait(); err != nil {
 			log.Printf("%+v", err)
 			continue
 		}
 
-		eg := errgroup.Group{}
+		eg = errgroup.Group{}
 
 		eg.Go(func() error {
 			// TODO: retry
@@ -420,13 +416,9 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(map[string][]byte) erro
 
 		eg.Go(func() error {
 			// TODO: handling in case of delete failure
-			mapMetricIDs := groupMetricIDsByHashTag(expiredMetricIDs)
 			_, err = r.client.Pipelined(func(pipe goredis.Pipeliner) error {
-				for _, ids := range mapMetricIDs {
-					if len(ids) < 1 {
-						continue
-					}
-					pipe.Unlink(ids...)
+				for _, id := range expiredMetricIDs {
+					pipe.Unlink(id)
 				}
 				return nil
 			})

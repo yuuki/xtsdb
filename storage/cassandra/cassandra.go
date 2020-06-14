@@ -38,23 +38,18 @@ func (c *Cassandra) Close() {
 }
 
 // AddRows inserts rows into cassandra server.
-func (c *Cassandra) AddRows(mapRows map[string][]byte) error {
-	batch := c.session.NewBatch(gocql.UnloggedBatch)
-	for metricName, datapoints := range mapRows {
-		if len(datapoints) < 8 {
-			continue
-		}
-		ts := binary.BigEndian.Uint64(datapoints[0:8])
-		startTime := time.Unix(*(*int64)(unsafe.Pointer(&ts)), 0)
-
-		batch.Query(`
-			INSERT INTO datapoint (metric_id, timestamp, values)
-			VALUES (?, ?, ?)`, metricName, startTime, datapoints,
-		)
+func (c *Cassandra) AddRows(metricID string, datapoints []byte) error {
+	if len(datapoints) < 8 {
+		return nil
 	}
-	if err := c.session.ExecuteBatch(batch); err != nil {
-		return xerrors.Errorf("Got error ot batch: %w", err)
+	ts := binary.BigEndian.Uint64(datapoints[0:8])
+	startTime := time.Unix(*(*int64)(unsafe.Pointer(&ts)), 0)
+	err := c.session.Query(`
+		INSERT INTO datapoint (metric_id, timestamp, values)
+		VALUES (?, ?, ?)`, metricID, startTime, datapoints,
+	).Exec()
+	if err != nil {
+		return xerrors.Errorf("Could not insert %q: %w", metricID, err)
 	}
-
 	return nil
 }

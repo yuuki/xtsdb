@@ -83,8 +83,8 @@ func FlushVolatileDataPoints() error {
 		return err
 	}
 	err = r.FlushExpiredDataPoints(
-		func(mapRows map[string][]byte) error {
-			return c.AddRows(mapRows)
+		func(mid string, datapoints []byte) error {
+			return c.AddRows(mid, datapoints)
 		},
 	)
 	if err != nil {
