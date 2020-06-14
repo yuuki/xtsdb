@@ -383,7 +383,7 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []byte) error) 
 		for _, mid := range expiredMetricIDs {
 			mid := mid
 			eg.Go(func() error {
-				res, err := r.client.Get(prefixKeyTS + mid).Result()
+				res, err := r.client.Get(mid).Result()
 				if err != nil {
 					return xerrors.Errorf("Could not GET %q: %w", mid, err)
 				}
