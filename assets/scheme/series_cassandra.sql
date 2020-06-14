@@ -1,5 +1,5 @@
 CREATE TABLE datapoint (
-	"metric_id" VARCHAR,
+	"metric_id" BLOB,
 	"timestamp" TIMESTAMP,
 	"values"    BLOB,
 

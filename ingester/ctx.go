@@ -49,16 +49,14 @@ func (ctx *InsertCtx) concatMetricName(labels []prompb.Label) (string, *prompb.L
 	for i := range labels {
 		label := &labels[i]
 		labelName := bytesutil.ToUnsafeString(label.Name)
-		switch labelName {
-		case "":
+		if labelName == "" {
 			metricBaseName = bytesutil.ToUnsafeString(label.Value)
-		case hostLabelName:
-			hostLabel = label
-			// redis hash tags
-			metricName += "{" + labelName + "=" + bytesutil.ToUnsafeString(label.Value) + ";" + "}"
-		default:
-			metricName += labelName + "=" + bytesutil.ToUnsafeString(label.Value) + ";"
+			continue
 		}
+		if labelName == hostLabelName {
+			hostLabel = label
+		}
+		metricName += labelName + "=" + bytesutil.ToUnsafeString(label.Value) + ";"
 	}
 
 	return metricBaseName + ";" + metricName, hostLabel
@@ -83,6 +81,7 @@ func (ctx *InsertCtx) addRow(metricName string, hostLabel *prompb.Label, timesta
 	mr.MetricName = metricName
 	mr.Timestamp = timestamp
 	mr.Value = value
+	mr.SetMetricID(hostName)
 }
 
 // AddLabel adds (name, value) label to ctx.Labels.

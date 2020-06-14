@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"log"
 	"math"
@@ -46,10 +45,11 @@ var (
 		local expiredStreamKey = '%s'
 		local expiredKeyPrefix = '%s'
        	for i = 1, #KEYS do
+			local tk = 'ts'..KEYS[i]
 			local ek = expiredKeyPrefix..KEYS[i]
-			res = redis.call('APPEND', KEYS[i], ARGV[i*2-1])
-			if redis.call('STRLEN', KEYS[i]) >= maxKeyLen then
-				redis.call('XADD', expiredStreamKey, '*', KEYS[i], "")
+			res = redis.call('APPEND', tk, ARGV[i*2-1])
+			if redis.call('STRLEN', tk) >= maxKeyLen then
+				redis.call('XADD', expiredStreamKey, '*', tk, "")
 				redis.call('SET', ek, 1, "EX", ARGV[i*2])
 			end
 			if redis.call('EXISTS', ek) == 0 then
@@ -225,12 +225,6 @@ type evalBuffer struct {
 	args []interface{}
 }
 
-func getMetricID(metricName string) uint64 {
-	h := fnv.New64a()
-	h.Write(bytesutil.ToUnsafeBytes(metricName))
-	return h.Sum64()
-}
-
 // AddRows inserts rows into redis-server.
 func (r *Redis) AddRows(mrs model.MetricRows) error {
 	if len(mrs) == 0 {
@@ -257,10 +251,9 @@ func (r *Redis) AddRows(mrs model.MetricRows) error {
 			binary.BigEndian.PutUint64(dp[0:8], *(*uint64)(unsafe.Pointer(&row.Timestamp)))
 			binary.BigEndian.PutUint64(dp[8:16], math.Float64bits(row.Value))
 
-			id := getMetricID(row.MetricName)
-			ttl := int(eseconds + math.Mod(float64(id), eseconds))
+			ttl := int(eseconds + math.Mod(float64(row.MetricNameHash()), eseconds))
 
-			eb.keys = append(eb.keys, row.MetricName)
+			eb.keys = append(eb.keys, row.MetricID)
 			eb.args = append(eb.args, bytesutil.ToUnsafeString(dp), ttl)
 		}
 		ebMap[label] = eb
