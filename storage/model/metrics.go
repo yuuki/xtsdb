@@ -24,10 +24,8 @@ func (mr *MetricRow) MetricNameHash() uint64 {
 
 func (mr *MetricRow) SetMetricID(instance string) {
 	mid := xxhash.Sum64String(mr.MetricName)
-	instanceID := xxhash.Sum64String(instance)
 	// redis hash tag
-	mr.MetricID = stringFromUint64(mid) +
-		":{" + stringFromUint64(instanceID) + "}"
+	mr.MetricID = ":{" + instance + ";}" + stringFromUint64(mid)
 }
 
 func stringFromUint64(id uint64) string {
