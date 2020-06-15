@@ -51,10 +51,10 @@ var (
 			local ek = expiredKeyPrefix..KEYS[i]
 			res = redis.call('APPEND', tk, ARGV[i*2-1])
 			if redis.call('EXISTS', ek) == 0 then
-				redis.call('SET', ek, 1, "EX", ARGV[i*2])
+				redis.call('SET', ek, 1, 'EX', ARGV[i*2])
 			else
 				if redis.call('TTL', ek) < 30 then
-					redis.call('XADD', expiredStreamKey, '*', tk, "")
+					redis.call('XADD', expiredStreamKey, '*', tk, '')
 					redis.call('DEL', ek)
 				end
 			end
@@ -100,7 +100,6 @@ func isCluster(addr string) (bool, error) {
 	}
 	if lines := strings.Split(res, "\r\n"); len(lines) > 1 {
 		if kv := strings.Split(lines[1], ":"); len(kv) > 1 {
-			log.Println(kv[1])
 			if kv[1] == "0" {
 				return false, nil
 			}
