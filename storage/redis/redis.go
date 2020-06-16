@@ -263,48 +263,39 @@ func (r *Redis) AddRows(mrs model.MetricRows) error {
 		ebMap[label] = eb
 	}
 
-	expiringKeys := []*goredis.Cmd{}
-	cmds, err := r.client.Pipelined(func(pipe goredis.Pipeliner) error {
-		for _, eb := range ebMap {
-			ret := pipe.EvalSha(r.hashScriptAddRows, eb.keys, eb.args...)
-			expiringKeys = append(expiringKeys, ret)
-		}
-		return nil
-	})
-	if err != nil {
-		var (
-			firstErr       error
-			firstCmdString string
-		)
-		for _, cmd := range cmds {
-			if err := cmd.Err(); err != nil {
-				firstErr = err
-				firstCmdString = cmd.String()
-				break
-			}
-		}
-		return xerrors.Errorf("Got error of redis pipeline (%q): %w", firstCmdString, firstErr)
-	}
-	if len(expiringKeys) > 0 {
-		go func() {
-			_, err := r.client.Pipelined(func(pipe goredis.Pipeliner) error {
-				for _, val := range expiringKeys {
-					for _, v := range val.Val().([]interface{}) {
-						metricID := v.(string)
-						pipe.XAdd(&goredis.XAddArgs{
-							Stream: r.selfExpiredStreamKey,
-							ID:     "*",
-							Values: map[string]interface{}{prefixKeyTS + metricID: ""},
-						})
-						pipe.Del(prefixKeyForExpire + metricID)
-					}
-				}
-				return nil
-			})
+	var eg errgroup.Group
+	for _, eb := range ebMap {
+		eb := eb
+		eg.Go(func() error {
+			v, err := r.client.EvalSha(r.hashScriptAddRows, eb.keys, eb.args...).Result()
 			if err != nil {
-				log.Printf("%+v", xerrors.Errorf("Got error of pipeline for handling expiring keys: %w", err))
+				return xerrors.Errorf("Could not exec EVALSHA: %w", err)
 			}
-		}()
+			vals := v.([]interface{})
+			if len(vals) < 1 {
+				return nil
+			}
+			var firstErr error
+			for _, v := range v.([]interface{}) {
+				metricID := v.(string)
+				_, err := r.client.Pipelined(func(pipe goredis.Pipeliner) error {
+					pipe.XAdd(&goredis.XAddArgs{
+						Stream: r.selfExpiredStreamKey,
+						ID:     "*",
+						Values: map[string]interface{}{prefixKeyTS + metricID: ""},
+					})
+					pipe.Del(prefixKeyForExpire + metricID)
+					return nil
+				})
+				if err != nil {
+					firstErr = xerrors.Errorf("Could not append expired stream %q: %w", metricID, err)
+				}
+			}
+			return firstErr
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		return err
 	}
 
 	insertRowsDuration.UpdateDuration(startTime)
