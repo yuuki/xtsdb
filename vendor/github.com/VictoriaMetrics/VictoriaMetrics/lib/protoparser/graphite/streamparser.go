@@ -142,4 +142,4 @@ func putStreamContext(ctx *streamContext) {
 }
 
 var streamContextPool sync.Pool
-var streamContextPoolCh = make(chan *streamContext, runtime.GOMAXPROCS(-1))
+var streamContextPoolCh = make(chan *streamContext, runtime.GOMAXPROCS(-1)*10)
