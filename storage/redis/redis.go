@@ -42,24 +42,21 @@ var (
 	insertRowsDuration = metrics.NewSummary(`xt_insert_rows_duration_seconds`)
 
 	scriptForAddRows = `
-		local res
-		local maxKeyLen = %d
-		local expiredStreamKey = '%s'
 		local expiredKeyPrefix = '%s'
+		local expiringKey = {}
        	for i = 1, #KEYS do
 			local tk = 'ts:'..KEYS[i]
 			local ek = expiredKeyPrefix..KEYS[i]
-			res = redis.call('APPEND', tk, ARGV[i*2-1])
+			redis.call('APPEND', tk, ARGV[i*2-1])
 			if redis.call('EXISTS', ek) == 0 then
 				redis.call('SET', ek, 1, 'EX', ARGV[i*2])
 			else
 				if redis.call('TTL', ek) < 30 then
-					redis.call('XADD', expiredStreamKey, '*', tk, '')
-					redis.call('DEL', ek)
+				    table.insert(expiringKey, KEYS[i])
 				end
 			end
 		end
-		return res
+		return expiringKey
 	`
 )
 
@@ -87,6 +84,7 @@ type Redis struct {
 	hashScriptAddRows    string
 	selfShardID          int
 	selfExpiredStreamKey string
+	targetAddr           string
 }
 
 func isCluster(addr string) (bool, error) {
@@ -144,7 +142,6 @@ func New(addrs []string) (*Redis, error) {
 		script           string
 		selfShardID      int
 		expiredStreamKey string = expiredStreamName
-		maxSeriesLen     int    = (8 + 8) * config.Config.MaxSeriesLength // datapoint = int64 + float64
 	)
 
 	if rcc, ok := r.(*goredis.ClusterClient); ok {
@@ -156,7 +153,7 @@ func New(addrs []string) (*Redis, error) {
 		}
 
 		expiredStreamKey = fmt.Sprintf("%s:%d", expiredStreamName, selfShardID)
-		script = fmt.Sprintf(scriptForAddRows, maxSeriesLen, expiredStreamKey, prefixKeyForExpire)
+		script = fmt.Sprintf(scriptForAddRows, prefixKeyForExpire)
 
 		// register script to redis-server.
 		err = rcc.ForEachMaster(func(client *goredis.Client) error {
@@ -167,7 +164,7 @@ func New(addrs []string) (*Redis, error) {
 				"could not register script to cluster masters: %w", err)
 		}
 	} else {
-		script = fmt.Sprintf(scriptForAddRows, maxSeriesLen, expiredStreamKey, prefixKeyForExpire)
+		script = fmt.Sprintf(scriptForAddRows, prefixKeyForExpire)
 		// register script to redis-server.
 		if err := r.ScriptLoad(script).Err(); err != nil {
 			return nil, xerrors.Errorf("could not register script: %w", err)
@@ -184,6 +181,7 @@ func New(addrs []string) (*Redis, error) {
 		hashScriptAddRows:    hash,
 		selfShardID:          selfShardID,
 		selfExpiredStreamKey: expiredStreamKey,
+		targetAddr:           addrs[0],
 	}
 	return red, nil
 }
@@ -211,11 +209,11 @@ func getSelfShardID(rcc *goredis.ClusterClient, selfAddr string) (int, error) {
 	**/
 	for _, line := range strings.Split(res, "\n") {
 		if strings.Contains(line, selfAddr) {
-			s := strings.Split(line, " ")[6]
-			configEpoch, err := strconv.Atoi(s)
+			items := strings.Split(line, " ")
+			configEpoch, err := strconv.Atoi(items[6])
 			if err != nil {
 				return -1, xerrors.Errorf(
-					"%q should be integer: %w", s, err)
+					"%q should be integer: %w", items[6], err)
 			}
 			// TODO: Dealing with the case where configEpoch is incremented
 			// when a slave is promoted.
@@ -265,9 +263,11 @@ func (r *Redis) AddRows(mrs model.MetricRows) error {
 		ebMap[label] = eb
 	}
 
+	expiringKeys := []*goredis.Cmd{}
 	cmds, err := r.client.Pipelined(func(pipe goredis.Pipeliner) error {
 		for _, eb := range ebMap {
-			pipe.EvalSha(r.hashScriptAddRows, eb.keys, eb.args...)
+			ret := pipe.EvalSha(r.hashScriptAddRows, eb.keys, eb.args...)
+			expiringKeys = append(expiringKeys, ret)
 		}
 		return nil
 	})
@@ -285,6 +285,27 @@ func (r *Redis) AddRows(mrs model.MetricRows) error {
 		}
 		return xerrors.Errorf("Got error of redis pipeline (%q): %w", firstCmdString, firstErr)
 	}
+	if len(expiringKeys) > 0 {
+		go func() {
+			_, err := r.client.Pipelined(func(pipe goredis.Pipeliner) error {
+				for _, val := range expiringKeys {
+					for _, v := range val.Val().([]interface{}) {
+						metricID := v.(string)
+						pipe.XAdd(&goredis.XAddArgs{
+							Stream: r.selfExpiredStreamKey,
+							ID:     "*",
+							Values: map[string]interface{}{prefixKeyTS + metricID: ""},
+						})
+						pipe.Del(prefixKeyForExpire + metricID)
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				log.Printf("%+v", xerrors.Errorf("Got error of pipeline for handling expiring keys: %w", err))
+			}
+		}()
+	}
 
 	insertRowsDuration.UpdateDuration(startTime)
 	return nil
@@ -293,7 +314,10 @@ func (r *Redis) AddRows(mrs model.MetricRows) error {
 func (r *Redis) initExpiredStream() error {
 	// Create consumer group for expired-stream.
 	err := r.client.XGroupCreateMkStream(r.selfExpiredStreamKey, flusherXGroup, "$").Err()
-	if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
+	if err != nil {
+		if err.Error() == "BUSYGROUP Consumer Group name already exists" {
+			return nil
+		}
 		return xerrors.Errorf("Could not create consumer group for the stream (%s) on redis: %w", r.selfExpiredStreamKey, err)
 	}
 	return nil
