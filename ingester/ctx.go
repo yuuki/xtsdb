@@ -69,7 +69,12 @@ func (ctx *InsertCtx) WriteDataPoint(prefix []byte, labels []prompb.Label, times
 }
 
 func (ctx *InsertCtx) addRow(metricName string, hostLabel *prompb.Label, timestamp int64, value float64) {
-	hostName := string(hostLabel.Value) // copy safe
+	var hostName string
+	if hostLabel == nil {
+		hostName = "empty"
+	} else {
+		hostName = string(hostLabel.Value)
+	}
 	mrs := ctx.mrs[hostName]
 	if cap(mrs) > len(mrs) {
 		mrs = mrs[:len(mrs)+1]
