@@ -425,18 +425,14 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []byte) error) 
 		eg = errgroup.Group{}
 
 		eg.Go(func() error {
-			// TODO: retry
-			err = r.client.Watch(func(tx *goredis.Tx) error {
-				// TODO: lua script for xack and del
-				_, err := tx.Pipelined(func(pipe goredis.Pipeliner) error {
-					pipe.XAck(r.selfExpiredStreamKey, flusherXGroup, expiredStreamIDs...)
-					pipe.XDel(r.selfExpiredStreamKey, expiredStreamIDs...)
-					return nil
-				})
-				return err
-			}, r.selfExpiredStreamKey)
+			// TODO: lua script for xack and del
+			_, err := r.client.Pipelined(func(pipe goredis.Pipeliner) error {
+				pipe.XAck(r.selfExpiredStreamKey, flusherXGroup, expiredStreamIDs...)
+				pipe.XDel(r.selfExpiredStreamKey, expiredStreamIDs...)
+				return nil
+			})
 			if err != nil {
-				return xerrors.Errorf("failed transaction (%v...): %w\n", expiredMetricIDs[0], err)
+				return xerrors.Errorf("Could not ack and del (%v...): %w\n", expiredMetricIDs[0], err)
 			}
 			return nil
 		})
