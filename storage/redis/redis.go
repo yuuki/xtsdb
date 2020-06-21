@@ -94,7 +94,10 @@ func isCluster(addr string) (bool, error) {
 	})
 	res, err := red.Info("CLUSTER").Result()
 	if err != nil {
-		return false, xerrors.Errorf("Could not get INFO CLUSTER")
+		if strings.Contains(err.Error(), "This instance has cluster support disabled") {
+			return false, nil
+		}
+		return false, xerrors.Errorf("Could not get INFO CLUSTER: %w", err)
 	}
 	if lines := strings.Split(res, "\r\n"); len(lines) > 1 {
 		if kv := strings.Split(lines[1], ":"); len(kv) > 1 {
