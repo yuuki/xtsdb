@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -38,6 +39,7 @@ const (
 var (
 	metricsExpired     = metrics.NewCounter(`xt_metrics_expired_total`)
 	metricsFlushed     = metrics.NewCounter(`xt_metrics_flushed_total`)
+	datapointsFlushed  = metrics.NewCounter(`xt_datapoints_flushed_total`)
 	flushDuration      = metrics.NewSummary(`xt_flush_duration_seconds`)
 	insertRowsDuration = metrics.NewSummary(`xt_insert_rows_duration_seconds`)
 
@@ -396,6 +398,8 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []byte) error) 
 			continue
 		}
 
+		var datapointsCnt int32
+
 		eg := errgroup.Group{}
 		for _, mid := range expiredMetricIDs {
 			mid := mid
@@ -407,6 +411,7 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []byte) error) 
 					}
 				}
 				datapoints := bytesutil.ToUnsafeBytes(res)
+				atomic.AddInt32(&datapointsCnt, int32(len(datapoints)/16))
 				return flushHandler(mid, datapoints)
 			})
 		}
@@ -452,6 +457,7 @@ func (r *Redis) FlushExpiredDataPoints(flushHandler func(string, []byte) error) 
 
 		flushDuration.UpdateDuration(startTime)
 		metricsFlushed.Add(len(expiredStreamIDs))
+		datapointsFlushed.Add(int(datapointsCnt))
 	}
 }
 
