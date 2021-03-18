@@ -18,6 +18,14 @@ Xtsdb is a scalable time series database on two tiers of Redis and Cassandra.
   - Google BigTable (To be added)
   - Google Cloud Storage (To be added)
 
+## Experiments
+
+[xtsdb-experiments](https://github.com/yuuki/xtsdb-experiments)
+
+## Papers
+
+1. <u>坪内佑樹</u>, 脇坂朝人, 濱田健, 松木雅幸, 小林隆浩, 阿部博, 松本亮介, **[HeteroTSDB: 異種分散KVS間の自動階層化による高性能な時系列データベース](http://id.nii.ac.jp/1001/00210244/)**, 情報処理学会論文誌, Vol.62, No.3, pp.818-828, 2021年3月. [[paper](https://yuuk.io/papers/2021/heterotsdb_ipsj_journal.pdf)] [[code](https://github.com/yuuki/xtsdb)]
+
 ## License
 
 ```
