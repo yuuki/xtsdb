@@ -18,6 +18,31 @@ Xtsdb is a scalable time series database on two tiers of Redis and Cassandra.
   - Google BigTable (To be added)
   - Google Cloud Storage (To be added)
 
+## Building Binaries
+
+### Using Docker (AMD64)
+
+To build AMD64 binaries using Docker, follow these steps:
+
+1. Build the binaries using the provided Dockerfile:
+```bash
+docker build --platform linux/amd64 -t xtsdb-builder .
+```
+
+2. Extract the binaries from the container:
+```bash
+docker create --name temp-container xtsdb-builder
+docker cp temp-container:/app/xtsdb-ingester .
+docker cp temp-container:/app/xtsdb-flusher .
+docker cp temp-container:/app/xtsdb-querier .
+docker rm temp-container
+```
+
+This will create three AMD64 binaries in your current directory:
+- `xtsdb-ingester`: The ingestion service
+- `xtsdb-flusher`: The flushing service
+- `xtsdb-querier`: The query service
+
 ## Experiments
 
 [xtsdb-experiments](https://github.com/yuuki/xtsdb-experiments)
