@@ -33,6 +33,12 @@ series ID is the xxhash64 of `name 0xff value 0xff ...` over the sorted
 labels. Because the hash input is fixed, IDs do not depend on label order
 or on the in-memory label representation; a golden test pins the function.
 
+Two different label sets can hash to the same ID: over the series held
+during the retention period, the probability is about n²/2⁶⁵ (2.7e-4 for
+10⁸ series, 2.7% for 10⁹). Such collisions are detected when the series
+is indexed (see [Series index](#series-index-cassandra)): the series that
+recorded the ID first keeps it, and samples of the other one are rejected.
+
 **Shards.** A series belongs to hot-tier shard
 `(id >> 32) mod storage.shards`. All keys of a shard share the Redis hash
 tag `{N}`, so they live in one Redis Cluster slot and Lua scripts over a
@@ -90,7 +96,8 @@ Before anything is stored, the ingester:
   skew) or further than `max_sample_future` in the future, so that
   out-of-range timestamps never reach the index;
 - writes the index, so that a stored sample always belongs to a
-  discoverable series.
+  discoverable series, and rejects the samples of a series whose ID is
+  already used by a different label set (`outcome="collision"`).
 
 Graphite TCP lines wait at most one second in a batch, whether or not more
 data arrives. Connections are capped (`graphite_max_connections`), idle
@@ -269,6 +276,30 @@ on, guarded by an LRU cache and de-duplicated within a batch. Index rows
 live two days longer than samples. Day partitions keep postings bounded and
 make lookups time aware: a series that disappeared last month is not a
 candidate for today's queries.
+
+**Collision detection.** The `series` row is written with one lightweight
+transaction per series and day:
+
+```sql
+UPDATE series USING TTL ? SET labels = ? WHERE series_id = ?
+  IF labels IN (?, null)
+```
+
+It creates the row, or refreshes its TTL when it already holds the same
+labels. When the ID belongs to different labels, nothing is written: the
+ingester rejects the samples of the new series (`outcome="collision"`,
+remote write answers 400), counts the series in
+`xtsdb_ingester_series_collisions_total`, logs both label sets and does not
+write its postings or label values. Later samples of that series are
+rejected from a small cache without asking Cassandra again. The ingester's
+cache of indexed series is keyed by the ID and a second, independent hash
+of the labels, so a colliding series is never taken for the cached one.
+Transactions use `LOCAL_SERIAL` when `cassandra.consistency` is a `LOCAL_`
+level and `SERIAL` otherwise.
+
+The transaction costs a few more round trips than a plain write, once per
+series and day. 128-bit series IDs would make collisions practically
+impossible, but would change the storage format.
 
 ## Read path
 

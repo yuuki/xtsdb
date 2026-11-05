@@ -39,12 +39,24 @@ func NewIndex(s *gocql.Session, retention time.Duration, readConcurrency int) *I
 }
 
 // WriteSeries records a series and its postings for a day.
+//
+// The series row is written with a lightweight transaction that succeeds
+// only if the ID is unused or already belongs to the same labels (which
+// refreshes its TTL). If it belongs to other labels, the IDs collide: no
+// postings are written and a *storage.SeriesCollisionError is returned.
+// The ingester does this once per series and day.
 func (x *Index) WriteSeries(ctx context.Context, day int32, id model.SeriesID, lset labels.Labels) error {
+	m := lset.Map()
+	var existing map[string]string
+	applied, err := x.session.Query(`UPDATE series USING TTL ? SET labels = ? WHERE series_id = ? IF labels IN (?, null)`,
+		x.ttl, m, int64(id), m).Idempotent(true).ScanCASContext(ctx, &existing)
+	if err != nil {
+		return fmt.Errorf("index series %s: %w", id, err)
+	}
+	if !applied {
+		return &storage.SeriesCollisionError{ID: id, Labels: lset, Existing: labels.FromMap(existing)}
+	}
 	g, ctx := errgroup.WithContext(ctx)
-	g.Go(func() error {
-		return x.session.Query(`INSERT INTO series (series_id, labels) VALUES (?, ?) USING TTL ?`,
-			int64(id), lset.Map(), x.ttl).Idempotent(true).ExecContext(ctx)
-	})
 	lset.Range(func(l labels.Label) {
 		g.Go(func() error {
 			return x.session.Query(`INSERT INTO postings (day, name, value, series_id) VALUES (?, ?, ?, ?) USING TTL ?`,

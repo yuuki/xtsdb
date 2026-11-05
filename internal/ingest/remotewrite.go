@@ -222,5 +222,8 @@ func describeRejections(res Result) string {
 	if res.Invalid > 0 {
 		parts = append(parts, fmt.Sprintf("%d samples of invalid series (first: %v)", res.Invalid, res.FirstInvalid))
 	}
+	if res.Collision > 0 {
+		parts = append(parts, fmt.Sprintf("%d samples of series whose ID collides with another series", res.Collision))
+	}
 	return fmt.Sprintf("accepted %d samples, rejected %s", res.Accepted, strings.Join(parts, ", "))
 }

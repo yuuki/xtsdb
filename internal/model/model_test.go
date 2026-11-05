@@ -67,6 +67,17 @@ func TestIDGolden(t *testing.T) {
 	}
 }
 
+func TestCheckIsIndependentOfID(t *testing.T) {
+	a := labels.FromStrings("__name__", "up", "job", "a")
+	b := labels.FromStrings("__name__", "up", "job", "b")
+	if Check(a) == uint64(ID(a)) {
+		t.Fatal("Check must not equal ID")
+	}
+	if Check(a) == Check(b) || Check(a) != Check(a.Copy()) {
+		t.Fatal("Check must be a deterministic hash of the labels")
+	}
+}
+
 func TestIDDistinguishesBoundaries(t *testing.T) {
 	a := labels.FromStrings("__name__", "a", "b", "c")
 	b := labels.FromStrings("__name__", "ab", "", "c")

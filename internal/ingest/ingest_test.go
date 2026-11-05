@@ -109,6 +109,63 @@ func TestWriterDoesNotStoreUnindexedSamples(t *testing.T) {
 	}
 }
 
+// Two label sets with the same series ID: the one recorded first keeps the
+// ID, samples of the other are rejected and none of its index entries are
+// written.
+func TestWriterRejectsCollidingSeries(t *testing.T) {
+	w, hot, index := newTestWriter(t)
+	w.idOf = func(labels.Labels) model.SeriesID { return 42 } // every series collides
+	ctx := context.Background()
+	now := time.Now().UnixMilli()
+	a := labels.FromStrings("__name__", "up", "job", "a")
+	b := labels.FromStrings("__name__", "up", "job", "b")
+	write := func(lset labels.Labels, ts int64) Result {
+		t.Helper()
+		res, err := w.Write(ctx, []Series{{Labels: lset, Samples: []model.Sample{{T: ts, V: 1}, {T: ts + 1, V: 2}}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	if res := write(a, now); res.Accepted != 2 {
+		t.Fatalf("first series: %+v", res)
+	}
+	if res := write(b, now+10); res.Collision != 2 || res.Accepted != 0 || res.Rejected() != 2 {
+		t.Fatalf("colliding series must be rejected: %+v", res)
+	}
+	// The owner keeps writing (from the cache), the other one is still
+	// rejected without asking the index again.
+	writes := index.Writes
+	if res := write(a, now+20); res.Accepted != 2 {
+		t.Fatalf("owner: %+v", res)
+	}
+	if res := write(b, now+30); res.Collision != 2 {
+		t.Fatalf("colliding series must stay rejected: %+v", res)
+	}
+	if index.Writes != writes {
+		t.Fatalf("index written %d more times", index.Writes-writes)
+	}
+	// Both in one batch.
+	res, err := w.Write(ctx, []Series{
+		{Labels: b, Samples: []model.Sample{{T: now + 40, V: 1}}},
+		{Labels: a, Samples: []model.Sample{{T: now + 41, V: 1}}},
+	})
+	if err != nil || res.Accepted != 1 || res.Collision != 1 {
+		t.Fatalf("mixed batch: %+v %v", res, err)
+	}
+	got, err := hot.Read(ctx, []model.SeriesID{42}, now-1000, now+1000)
+	if err != nil || len(got[42]) != 5 {
+		t.Fatalf("hot tier holds %v for ID 42, want the 5 samples of the owner (%v)", got[42], err)
+	}
+	vals, _ := index.LabelValues(ctx, model.Day(now), "job")
+	if fmt.Sprint(vals) != "[a]" {
+		t.Fatalf("label values of the colliding series must not be indexed: %v", vals)
+	}
+	if !strings.Contains(describeRejections(Result{Collision: 3}), "collides") {
+		t.Fatal("collisions must be described")
+	}
+}
+
 func TestParseGraphiteLine(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	cases := []struct {

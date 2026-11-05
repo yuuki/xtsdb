@@ -163,7 +163,8 @@ Watch in particular:
 | `xtsdb_hot_pending_chunks`, `xtsdb_hot_inflight_chunks` | Chunks held in Redis. |
 | `xtsdb_flusher_chunks_total{outcome="error"}` | Failed flushes; they are retried after the lease. |
 | `xtsdb_hot_quarantined_chunks`, `xtsdb_flusher_chunks_total{outcome="quarantined"}` | Undecodable chunks moved out of the way. Should stay at zero; inspect them with `xtsdb quarantine list`. |
-| `xtsdb_ingester_samples_total{outcome=...}` | Accepted samples and rejections: `too_old`, `too_new`, `invalid`, `chunk_full`, `unsupported` (histograms), `throttled`, `error`. |
+| `xtsdb_ingester_samples_total{outcome=...}` | Accepted samples and rejections: `too_old`, `too_new`, `invalid`, `chunk_full`, `collision`, `unsupported` (histograms), `throttled`, `error`. |
+| `xtsdb_ingester_series_collisions_total` | Series refused because another label set already uses their 64-bit ID. Both label sets are logged. |
 | `xtsdb_graphite_lines_total{outcome="dropped"}`, `xtsdb_graphite_connections_total{outcome="rejected"}` | Graphite overload. |
 
 **Quarantined chunks.** A chunk that Redis holds but that cannot be decoded
@@ -213,7 +214,9 @@ Cassandra 5.0.9, Prometheus 3.15.1 and Grafana 13.3.0.
   Redis (32 MiB); more are rejected as `chunk_full`.
 - Queries reach back at most `storage.retention`, or
   `querier.max_query_lookback` (default one year) when retention is 0.
-- Series are identified by a 64-bit hash of their labels.
+- Series are identified by a 64-bit hash of their labels. Collisions are
+  detected: the series that was indexed first keeps the ID and samples of
+  the other one are rejected (`outcome="collision"`).
 - Very high-cardinality label pairs (millions of series sharing one value on
   one day) produce large Cassandra partitions in the index.
 - Only Redis/Valkey and Cassandra are implemented, but the tiers sit behind

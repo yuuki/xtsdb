@@ -4,6 +4,8 @@ package storage
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
 	"github.com/prometheus/prometheus/model/labels"
 
@@ -131,9 +133,31 @@ type ColdStore interface {
 	Ping(ctx context.Context) error
 }
 
+// ErrSeriesCollision means that a series ID is already used by a different
+// label set. It is wrapped in a *SeriesCollisionError.
+var ErrSeriesCollision = errors.New("series ID collision")
+
+// SeriesCollisionError reports that two label sets hash to the same series
+// ID. The series that recorded the ID first keeps it.
+type SeriesCollisionError struct {
+	ID       model.SeriesID
+	Labels   labels.Labels // the series that was refused
+	Existing labels.Labels // the series that owns the ID
+}
+
+func (e *SeriesCollisionError) Error() string {
+	return fmt.Sprintf("series ID %s of %s is already used by %s", e.ID, e.Labels, e.Existing)
+}
+
+// Unwrap returns ErrSeriesCollision.
+func (e *SeriesCollisionError) Unwrap() error { return ErrSeriesCollision }
+
 // IndexWriter records which series and label values exist on a given day.
 // All writes are idempotent.
 type IndexWriter interface {
+	// WriteSeries records a series and its postings for a day. If the ID
+	// already belongs to a different label set, nothing is written and a
+	// *SeriesCollisionError is returned.
 	WriteSeries(ctx context.Context, day int32, id model.SeriesID, lset labels.Labels) error
 	WriteLabelValue(ctx context.Context, day int32, name, value string) error
 	WriteLabelName(ctx context.Context, day int32, name string) error

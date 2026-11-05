@@ -354,6 +354,9 @@ func (x *Index) WriteSeries(_ context.Context, day int32, id model.SeriesID, lse
 	if x.FailWrites != nil {
 		return x.FailWrites
 	}
+	if old, ok := x.series[id]; ok && !labels.Equal(old, lset) {
+		return &storage.SeriesCollisionError{ID: id, Labels: lset, Existing: old}
+	}
 	x.Writes++
 	x.series[id] = lset
 	lset.Range(func(l labels.Label) {

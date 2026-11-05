@@ -88,8 +88,22 @@ const separator = '\xff'
 // ID computes the series ID of canonical labels. The hash input is fixed
 // (name, 0xff, value, 0xff, ...) and does not depend on the in-memory label
 // representation, so IDs are stable across builds and versions.
-func ID(lset labels.Labels) SeriesID {
-	d := xxhash.New()
+//
+// Different label sets can share an ID (about n²/2⁶⁵ for n series). The
+// index detects this when it records a series; see Check.
+func ID(lset labels.Labels) SeriesID { return SeriesID(hash(lset, 0)) }
+
+// checkSeed makes Check independent of ID.
+const checkSeed = 0x9e3779b97f4a7c15
+
+// Check is a second hash of canonical labels, independent of ID. Two label
+// sets with the same ID almost certainly have different checks, which lets
+// caches of known series tell colliding series apart without holding their
+// labels. It is not part of the storage format.
+func Check(lset labels.Labels) uint64 { return hash(lset, checkSeed) }
+
+func hash(lset labels.Labels, seed uint64) uint64 {
+	d := xxhash.NewWithSeed(seed)
 	var buf [1]byte
 	buf[0] = separator
 	lset.Range(func(l labels.Label) {
@@ -98,7 +112,7 @@ func ID(lset labels.Labels) SeriesID {
 		_, _ = d.WriteString(l.Value)
 		_, _ = d.Write(buf[:])
 	})
-	return SeriesID(d.Sum64())
+	return d.Sum64()
 }
 
 // Layout describes how series are spread over shards and how their samples

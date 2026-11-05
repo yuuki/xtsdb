@@ -2,6 +2,7 @@ package cassandra
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"os"
@@ -234,6 +235,41 @@ func TestIndex(t *testing.T) {
 	}
 	if len(ls) != 1 || !labels.Equal(ls[model.ID(a)], a) {
 		t.Fatalf("series labels = %v", ls)
+	}
+}
+
+func TestIndexDetectsCollisions(t *testing.T) {
+	s := newTestSession(t)
+	x := NewIndex(s, 24*time.Hour, 8)
+	ctx := context.Background()
+	const day = int32(20_000)
+	id := model.SeriesID(0x8000000000000042)
+	a := labels.FromStrings("__name__", "up", "job", "api")
+	b := labels.FromStrings("__name__", "up", "job", "db")
+	if err := x.WriteSeries(ctx, day, id, a); err != nil {
+		t.Fatal(err)
+	}
+	if err := x.WriteSeries(ctx, day+1, id, a); err != nil {
+		t.Fatalf("the same series must be recorded again: %v", err)
+	}
+	err := x.WriteSeries(ctx, day, id, b)
+	var coll *storage.SeriesCollisionError
+	if !errors.As(err, &coll) || !errors.Is(err, storage.ErrSeriesCollision) {
+		t.Fatalf("expected a collision, got %v", err)
+	}
+	if coll.ID != id || !labels.Equal(coll.Existing, a) || !labels.Equal(coll.Labels, b) {
+		t.Fatalf("unexpected collision %+v", coll)
+	}
+	if ids, _ := x.Postings(ctx, day, "job", "db"); len(ids) != 0 {
+		t.Fatalf("postings of the refused series were written: %v", ids)
+	}
+	ls, err := x.SeriesLabels(ctx, []model.SeriesID{id})
+	if err != nil || !labels.Equal(ls[id], a) {
+		t.Fatalf("the owner's labels must be kept: %v %v", ls, err)
+	}
+	var ttl int
+	if err := s.Query(`SELECT TTL(labels) FROM series WHERE series_id = ?`, int64(id)).Scan(&ttl); err != nil || ttl <= 0 {
+		t.Fatalf("series row must carry a TTL: %d %v", ttl, err)
 	}
 }
 
