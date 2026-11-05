@@ -1,5 +1,5 @@
 GO       ?= go
-VERSION  ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+VERSION  ?= $(shell git describe --tags --always --dirty 2>/dev/null | sed 's/^v//' || echo dev)
 REVISION ?= $(shell git rev-parse HEAD 2>/dev/null)
 LDFLAGS  := -s -w \
 	-X github.com/yuuki/xtsdb/internal/version.Version=$(VERSION) \
@@ -36,6 +36,14 @@ lint:
 .PHONY: docker
 docker:
 	docker build --build-arg VERSION=$(VERSION) --build-arg REVISION=$(REVISION) -t xtsdb:$(VERSION) .
+
+.PHONY: snapshot
+snapshot: ## Build release archives into dist/ without publishing (needs GoReleaser v2)
+	goreleaser release --snapshot --clean
+
+.PHONY: release-notes
+release-notes: ## Print the CHANGELOG.md section of VERSION, as the release workflow does
+	@scripts/release-notes.sh $(VERSION)
 
 .PHONY: up
 up: ## Start the quickstart stack (xtsdb, Redis, Cassandra, Prometheus, Grafana)

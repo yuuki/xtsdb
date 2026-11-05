@@ -10,7 +10,7 @@ xtsdb implements the ideas of the HeteroTSDB paper (see [Papers](#papers)):
 use each store for what it is good at, and scale each tier independently.
 
 > **Status:** v2 is a ground-up rewrite. The storage format is not
-> compatible with 0.x, and there is no tagged release yet.
+> compatible with 0.x. Changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## Features
 
@@ -63,6 +63,28 @@ flowchart LR
 
 See [docs/architecture.md](docs/architecture.md) for the data layout, the
 hand-off protocol and its failure handling.
+
+## Installing
+
+- **Container image** for linux/amd64 and linux/arm64:
+  `docker pull ghcr.io/yuuki/xtsdb:2` (or a full version such as `2.0.0`).
+  It runs `xtsdb all` with [examples/xtsdb.yaml](examples/xtsdb.yaml); set
+  `XTSDB_REDIS_ADDRS` and `XTSDB_CASSANDRA_HOSTS`, or mount your own file
+  over `/etc/xtsdb/xtsdb.yaml`.
+- **Binaries** for Linux and macOS (amd64, arm64) are attached to the
+  [GitHub releases](https://github.com/yuuki/xtsdb/releases), with
+  `sha256sums.txt`:
+
+  ```bash
+  curl -LO https://github.com/yuuki/xtsdb/releases/download/v2.0.0/xtsdb-2.0.0.linux-amd64.tar.gz
+  tar xzf xtsdb-2.0.0.linux-amd64.tar.gz
+  ./xtsdb version
+  ```
+
+- **From source** with Go 1.27: `make build` writes `bin/xtsdb`.
+
+Until the first release is tagged, use the Quickstart below, which builds
+the image from source.
 
 ## Quickstart
 
@@ -275,7 +297,11 @@ make test               # unit tests
 make test-integration   # starts Redis and Cassandra with Docker Compose, then runs all tests
 make lint               # go vet + golangci-lint
 make docker             # container image
+make snapshot           # release archives in dist/, without publishing
 ```
+
+Releases are made by pushing a version tag; see
+[docs/releasing.md](docs/releasing.md).
 
 Integration tests run against the servers named by
 `XTSDB_TEST_REDIS_ADDRS` (comma separated; set `XTSDB_TEST_REDIS_CLUSTER=1`

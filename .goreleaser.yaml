@@ -1,0 +1,57 @@
+# GoReleaser configuration: binaries and archives attached to GitHub
+# releases. Container images are built by .github/workflows/release.yml.
+#
+#   goreleaser release --snapshot --clean   # local dry run into dist/
+version: 2
+
+project_name: xtsdb
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: xtsdb
+    main: ./cmd/xtsdb
+    binary: xtsdb
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/yuuki/xtsdb/internal/version.Version={{ .Version }}
+      - -X github.com/yuuki/xtsdb/internal/version.Revision={{ .FullCommit }}
+      - -X github.com/yuuki/xtsdb/internal/version.BuildDate={{ .Date }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+
+archives:
+  - id: xtsdb
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}-{{ .Version }}.{{ .Os }}-{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+      - CHANGELOG.md
+      - examples/xtsdb.yaml
+
+checksum:
+  name_template: sha256sums.txt
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+# Release notes come from CHANGELOG.md (see the release workflow).
+changelog:
+  disable: true
+
+release:
+  github:
+    owner: yuuki
+    name: xtsdb
+  prerelease: auto
+  footer: |
+    Container image: `ghcr.io/yuuki/xtsdb:{{ .Version }}` (linux/amd64, linux/arm64).
