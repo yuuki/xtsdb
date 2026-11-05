@@ -116,7 +116,8 @@ func (h *Hot) Load(_ context.Context, refs []storage.ChunkRef) (storage.LoadResu
 			continue
 		}
 		res.Chunks = append(res.Chunks, storage.HotChunk{
-			Ref: ref, Fragment: c.fragment, Size: size(c), Samples: chunk.Normalize(slices.Clone(c.raw)),
+			Ref: ref, Fragment: c.fragment, Size: size(c), Records: len(c.raw),
+			Samples: chunk.Normalize(slices.Clone(c.raw)),
 		})
 	}
 	return res, nil
@@ -270,8 +271,10 @@ func (c *Cold) Read(_ context.Context, ids []model.SeriesID, mint, maxt int64) (
 		keys = append(keys, k)
 	}
 	slices.SortFunc(keys, func(a, b coldKey) int {
+		// The clustering order of the Cassandra table, which stores the
+		// digest as a signed bigint.
 		return cmp.Or(cmp.Compare(a.start, b.start), cmp.Compare(a.fragment, b.fragment),
-			cmp.Compare(a.total, b.total), cmp.Compare(a.digest, b.digest), cmp.Compare(a.part, b.part))
+			cmp.Compare(a.total, b.total), cmp.Compare(int64(a.digest), int64(b.digest)), cmp.Compare(a.part, b.part))
 	})
 	out := make(map[model.SeriesID][]model.Sample)
 	for _, id := range ids {

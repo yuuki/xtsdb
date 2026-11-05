@@ -136,6 +136,54 @@ func TestChunkVersionsAndParts(t *testing.T) {
 	}
 }
 
+// Versions of a window take precedence in (fragment, total, digest) order,
+// with the digest compared as a signed 64-bit value.
+func TestChunkVersionPrecedence(t *testing.T) {
+	s := newTestSession(t)
+	const hour = int64(time.Hour / time.Millisecond)
+	store := NewChunkStore(s, 24*time.Hour, hour, 8, nil)
+	ctx := context.Background()
+	start := int64(20_000) * model.DayMillis
+	write := func(id model.SeriesID, frag int64, total int, digest uint64, v float64) {
+		t.Helper()
+		samples := []model.Sample{{T: start + 1, V: v}}
+		err := store.WriteChunk(ctx, storage.ColdChunk{
+			Series: id, Start: start, Fragment: frag, Total: total, Digest: digest,
+			MaxT: start + 1, Count: 1, Encoding: chunk.EncodingXOR, Data: encode(t, samples),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func(id model.SeriesID) float64 {
+		t.Helper()
+		got, err := store.Read(ctx, []model.SeriesID{id}, start, start+hour)
+		if err != nil || len(got[id]) != 1 {
+			t.Fatalf("read: %v %v", got, err)
+		}
+		return got[id][0].V
+	}
+	// A later state of the same incarnation (more records) wins over an
+	// earlier one, whatever the digests.
+	write(1, 5, 3, 0x7fff_ffff_ffff_ffff, 1)
+	write(1, 5, 4, 1, 2)
+	if v := read(1); v != 2 {
+		t.Fatalf("version with more records must win, got %v", v)
+	}
+	// A later incarnation wins over a longer earlier one.
+	write(2, 5, 9, 1, 1)
+	write(2, 6, 1, 1, 2)
+	if v := read(2); v != 2 {
+		t.Fatalf("later fragment must win, got %v", v)
+	}
+	// Equal (fragment, total): the digest as a signed value decides.
+	write(3, 5, 3, 0x8000_0000_0000_0000, 1) // negative
+	write(3, 5, 3, 1, 2)
+	if v := read(3); v != 2 {
+		t.Fatalf("larger signed digest must win, got %v", v)
+	}
+}
+
 func TestIndex(t *testing.T) {
 	s := newTestSession(t)
 	x := NewIndex(s, 24*time.Hour, 8)

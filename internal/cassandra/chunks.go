@@ -97,9 +97,9 @@ func (c *ChunkStore) Read(ctx context.Context, ids []model.SeriesID, mint, maxt 
 
 func (c *ChunkStore) readSeries(ctx context.Context, id model.SeriesID, days []int32, from, mint, maxt int64) ([]model.Sample, error) {
 	// Rows arrive in clustering order, so the parts of a version are
-	// consecutive and versions of a window are ordered by (fragment, total):
-	// later incarnations and more complete versions come last and win when
-	// merged.
+	// consecutive and versions of a window are ordered by (fragment, total,
+	// digest): later incarnations, then later states of an incarnation, come
+	// last and win when merged (see storage.ColdChunk).
 	type version struct {
 		start, fragment, digest int64
 		total                   int

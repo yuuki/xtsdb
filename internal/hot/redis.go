@@ -7,6 +7,7 @@
 //	<prefix>:{N}:due                  sorted set: chunk member -> due time
 //	<prefix>:{N}:inf                  sorted set: chunk member -> lease expiry
 //	<prefix>:{N}:infdue               sorted set: in-flight member -> due time
+//	<prefix>:{N}:clock                last fragment issued in the shard
 //	<prefix>:{N}:q:<series>:<window>:<digest>  quarantined (undecodable) chunk
 //	<prefix>:{N}:qidx                 sorted set: quarantine key -> expiry time
 //	<prefix>:meta                     hash: layout parameters
@@ -176,6 +177,7 @@ func (s *Store) tag(shard int) string { return s.prefix + ":{" + strconv.Itoa(sh
 func (s *Store) dueKey(shard int) string         { return s.tag(shard) + ":due" }
 func (s *Store) inflightKey(shard int) string    { return s.tag(shard) + ":inf" }
 func (s *Store) inflightDueKey(shard int) string { return s.tag(shard) + ":infdue" }
+func (s *Store) clockKey(shard int) string       { return s.tag(shard) + ":clock" }
 func (s *Store) chunkKey(shard int, member string) string {
 	return s.tag(shard) + ":c:" + member
 }
@@ -263,11 +265,11 @@ func (s *Store) Append(ctx context.Context, batch []storage.SeriesSamples) (stor
 		for len(members) > 0 {
 			n := min(len(members), maxChunksPerCall)
 			call := scriptCall{
-				keys:    make([]string, 0, n+2),
+				keys:    make([]string, 0, n+3),
 				args:    make([]any, 0, 3*n+1),
 				samples: make([]int, 0, n),
 			}
-			call.keys = append(call.keys, s.dueKey(shard), s.inflightKey(shard))
+			call.keys = append(call.keys, s.dueKey(shard), s.inflightKey(shard), s.clockKey(shard))
 			call.args = append(call.args, s.maxChunkBytes)
 			for _, m := range members[:n] {
 				c := chunks[m]
@@ -399,7 +401,13 @@ func (s *Store) Load(ctx context.Context, refs []storage.ChunkRef) (storage.Load
 			}
 			continue
 		}
-		res.Chunks = append(res.Chunks, storage.HotChunk{Ref: refs[i], Fragment: frag, Size: len(b), Samples: samples})
+		res.Chunks = append(res.Chunks, storage.HotChunk{
+			Ref:      refs[i],
+			Fragment: frag,
+			Size:     len(b),
+			Records:  (len(b) - chunk.HeaderLen) / chunk.RecordLen,
+			Samples:  samples,
+		})
 	}
 	return res, nil
 }

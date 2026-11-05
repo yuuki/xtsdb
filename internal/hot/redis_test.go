@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -581,5 +582,67 @@ func TestManySeriesAcrossShards(t *testing.T) {
 	}
 	if len(got) != 2000 {
 		t.Fatalf("read %d series, want 2000", len(got))
+	}
+}
+
+// Fragments come from a hybrid clock per shard: they keep increasing when
+// the Redis clock is behind the last fragment issued (a clock step
+// backwards, or a failover to a node with a slower clock).
+func TestFragmentsSurviveClockStep(t *testing.T) {
+	layout := model.Layout{Shards: 1, ChunkRange: 300, Grace: 0}
+	s, client := newTestStore(t, layout, time.Minute)
+	ctx := context.Background()
+	fragment := func(id model.SeriesID) int64 {
+		t.Helper()
+		now := nowMs()
+		if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: id, Samples: []model.Sample{{T: now, V: 1}}}}); err != nil {
+			t.Fatal(err)
+		}
+		hdr := client.GetRange(ctx, s.chunkKey(0, member(id, layout.WindowStart(id, now))), 0, 15).Val()
+		f, err := strconv.ParseInt(hdr, 10, 64)
+		if err != nil {
+			t.Fatalf("header %q: %v", hdr, err)
+		}
+		return f
+	}
+	first := fragment(1)
+	if us := time.Now().UnixMicro(); first < us-int64(time.Minute/time.Microsecond) || first > us {
+		t.Fatalf("fragment %d does not follow the server clock (%d)", first, us)
+	}
+	// The last fragment issued is ahead of the clock, as if the clock had
+	// stepped back by a day.
+	ahead := time.Now().Add(24 * time.Hour).UnixMicro()
+	client.Set(ctx, s.clockKey(0), strconv.FormatInt(ahead, 10), 0)
+	if f := fragment(2); f != ahead+1 {
+		t.Fatalf("fragment %d, want %d", f, ahead+1)
+	}
+	if f := fragment(3); f != ahead+2 {
+		t.Fatalf("fragment %d, want %d", f, ahead+2)
+	}
+	// Appending to an existing chunk does not advance the clock.
+	_ = fragment(3)
+	if got := client.Get(ctx, s.clockKey(0)).Val(); got != fmt.Sprintf("%016d", ahead+2) {
+		t.Fatalf("shard clock %s, want %d", got, ahead+2)
+	}
+	// Chunks with such fragments are completed normally.
+	refs := waitClaim(t, s, 0)
+	chunks, _, err := load(ctx, s, refs)
+	if err != nil || len(chunks) == 0 {
+		t.Fatalf("load: %v %v", chunks, err)
+	}
+	if err := s.Complete(ctx, chunks); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range chunks {
+		want := 1
+		if c.Ref.Series == 3 {
+			want = 2
+		}
+		if c.Records != want {
+			t.Fatalf("series %d: %d records, want %d", c.Ref.Series, c.Records, want)
+		}
+		if client.Exists(ctx, s.chunkKey(0, member(c.Ref.Series, c.Ref.Start))).Val() != 0 {
+			t.Fatalf("chunk %+v was not completed", c.Ref)
+		}
 	}
 }

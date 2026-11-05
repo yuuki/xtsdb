@@ -27,36 +27,52 @@ const allowOOM = "#!lua flags=allow-oom\n"
 
 // appendScript appends raw samples to chunks.
 //
-// KEYS[1] = due set, KEYS[2] = in-flight set, KEYS[3..] = chunk keys
+// A new chunk starts with its fragment: 16 ASCII digits that identify this
+// incarnation of the window and order it after every earlier one. The
+// fragment comes from a hybrid clock per shard: the server time in
+// microseconds, or one more than the last fragment of the shard if the
+// clock is behind it. Fragments therefore keep increasing when the Redis
+// clock steps backwards (NTP, failover to a node with a slower clock), and
+// after a restore from an older snapshot, which rewinds the last fragment,
+// the clock has normally moved past it.
+//
+// KEYS[1] = due set, KEYS[2] = in-flight set, KEYS[3] = shard clock,
+// KEYS[4..] = chunk keys
 // ARGV[1] = maximum chunk size in bytes
 // ARGV[2..] = (member, due, data) for every chunk key
 // Returns {closed, full}: 0-based indexes of chunks whose window was closed
 // and of chunks that would exceed the maximum size.
 var appendScript = redis.NewScript(prelude + `
-local hdr = string.rep('0', 10 - string.len(t[1])) .. t[1] .. string.rep('0', 6 - string.len(t[2])) .. t[2]
+local frag = tonumber(t[1]) * 1000000 + tonumber(t[2])
+local last = tonumber(redis.call('GET', KEYS[3]) or '0') or 0
+if frag <= last then frag = last + 1 end
+local hdr = string.format('%016.0f', frag)
 local maxBytes = tonumber(ARGV[1])
 local closed, full = {}, {}
-for i = 3, #KEYS do
-  local j = (i - 3) * 3 + 1
+local created = false
+for i = 4, #KEYS do
+  local j = (i - 4) * 3 + 1
   local member = ARGV[j + 1]
   local due = tonumber(ARGV[j + 2])
   local data = ARGV[j + 3]
   if now >= due or redis.call('ZSCORE', KEYS[2], member) then
-    closed[#closed + 1] = i - 3
+    closed[#closed + 1] = i - 4
   else
     local len = redis.call('STRLEN', KEYS[i])
     if len == 0 then len = string.len(hdr) end
     if len + string.len(data) > maxBytes then
-      full[#full + 1] = i - 3
+      full[#full + 1] = i - 4
     else
       if redis.call('EXISTS', KEYS[i]) == 0 then
         redis.call('SET', KEYS[i], hdr)
         redis.call('ZADD', KEYS[1], due, member)
+        created = true
       end
       redis.call('APPEND', KEYS[i], data)
     end
   end
 end
+if created then redis.call('SET', KEYS[3], hdr) end
 return {closed, full}
 `)
 

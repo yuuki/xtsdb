@@ -35,10 +35,17 @@ type ChunkRef struct {
 
 // HotChunk is a closed hot chunk loaded for flushing.
 type HotChunk struct {
-	Ref      ChunkRef
-	Fragment int64 // identifies this incarnation of the chunk
-	Size     int   // encoded size when loaded; used to detect later appends
-	Samples  []model.Sample
+	Ref ChunkRef
+	// Fragment identifies this incarnation of the window. Later
+	// incarnations have larger fragments.
+	Fragment int64
+	Size     int // encoded size when loaded; used to detect later appends
+	// Records is the number of samples appended to this incarnation,
+	// including those that were overwritten by a later sample with the same
+	// timestamp. An incarnation only grows, so a larger count means a later
+	// state of it.
+	Records int
+	Samples []model.Sample // sorted and de-duplicated
 }
 
 // LoadResult is the outcome of HotStore.Load.
@@ -92,12 +99,22 @@ type HotStore interface {
 // identify the version of the chunk that was persisted: if the same window
 // is persisted again with different content (for example after Redis was
 // restored from an older snapshot), it is stored as a separate version
-// instead of overwriting a more complete one. Reads merge all versions.
+// instead of overwriting a more complete one.
+//
+// Reads merge all versions of a window. Where versions disagree on the
+// value at a timestamp, the version that is greatest in (Fragment, Total,
+// Digest) order wins: the latest incarnation, then the latest state of an
+// incarnation (the most records appended). Versions that are equal in
+// (Fragment, Total) can only come from diverging histories of one
+// incarnation, after a restore or a failover; which one is newer cannot be
+// known, and the digest decides, deterministically but arbitrarily.
 type ColdChunk struct {
 	Series   model.SeriesID
 	Start    int64
 	Fragment int64
-	Total    int    // samples in the whole chunk
+	// Total is the number of samples appended to the incarnation in the hot
+	// tier (HotChunk.Records), including overwritten ones.
+	Total    int
 	Digest   uint64 // hash of the whole chunk's samples
 	Part     int
 	MaxT     int64

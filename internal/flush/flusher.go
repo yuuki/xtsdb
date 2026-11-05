@@ -271,7 +271,7 @@ func (f *Flusher) persist(ctx context.Context, c storage.HotChunk) error {
 			Series:   c.Ref.Series,
 			Start:    c.Ref.Start,
 			Fragment: c.Fragment,
-			Total:    len(c.Samples),
+			Total:    c.Records,
 			Digest:   digest,
 			Part:     part,
 			MaxT:     samples[len(samples)-1].T,

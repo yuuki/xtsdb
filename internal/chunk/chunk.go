@@ -19,8 +19,10 @@ import (
 	"github.com/yuuki/xtsdb/internal/model"
 )
 
-// HeaderLen is the length of the hot chunk header: the creation time of the
-// chunk in microseconds, rendered by the Redis server as 16 ASCII digits.
+// HeaderLen is the length of the hot chunk header: the fragment of the
+// chunk, rendered by the Redis server as 16 ASCII digits. Fragments come
+// from a hybrid clock (microseconds, kept increasing per shard) and order
+// the incarnations of a window.
 const HeaderLen = 16
 
 // RecordLen is the size of one raw sample record.
@@ -38,9 +40,9 @@ func AppendRaw(dst []byte, samples []model.Sample) []byte {
 	return dst
 }
 
-// DecodeHot decodes a hot chunk value. It returns the fragment ID (the
-// chunk creation time in microseconds) and the samples sorted by time with
-// duplicates resolved in favour of the latest write.
+// DecodeHot decodes a hot chunk value. It returns the fragment and the
+// samples sorted by time with duplicates resolved in favour of the latest
+// write.
 func DecodeHot(b []byte) (fragment int64, samples []model.Sample, err error) {
 	if len(b) < HeaderLen || (len(b)-HeaderLen)%RecordLen != 0 {
 		return 0, nil, fmt.Errorf("%w: length %d", ErrCorrupt, len(b))

@@ -49,18 +49,25 @@ A window is *due* at `start + chunk_range + grace_period`.
 ## Hot tier (Redis)
 
 ```
-<prefix>:{N}:c:<series>:<window>   chunk: 16-byte header + 16-byte records
-<prefix>:{N}:due                   ZSET  member -> due time (ms), not yet claimed
-<prefix>:{N}:inf                   ZSET  member -> lease expiry (ms), claimed
-<prefix>:{N}:infdue                ZSET  member -> due time (ms), claimed
+<prefix>:{N}:c:<series>:<window>           chunk: 16-byte header + 16-byte records
+<prefix>:{N}:due                           ZSET  member -> due time (ms), not yet claimed
+<prefix>:{N}:inf                           ZSET  member -> lease expiry (ms), claimed
+<prefix>:{N}:infdue                        ZSET  member -> due time (ms), claimed
+<prefix>:{N}:clock                         last fragment issued in the shard
 <prefix>:{N}:q:<series>:<window>:<digest>  quarantined chunk (undecodable)
-<prefix>:{N}:qidx                  ZSET  quarantine key -> expiry time (ms)
-<prefix>:meta                      HASH  layout parameters (shards, chunk range)
+<prefix>:{N}:qidx                          ZSET  quarantine key -> expiry time (ms)
+<prefix>:meta                              HASH  layout parameters (shards, chunk range)
 ```
 
-The chunk header is the creation time of the chunk in microseconds as
-16 ASCII digits, taken from the Redis server clock. It identifies this
-incarnation of the window (its *fragment*). Records are a big-endian
+The chunk header is the chunk's *fragment*: 16 ASCII digits that identify
+this incarnation of the window and order it after every earlier
+incarnation. It comes from a hybrid clock per shard: the Redis server time
+in microseconds, or one more than the last fragment issued in the shard
+(`<prefix>:{N}:clock`) when the server clock is behind it. Fragments
+therefore keep increasing when the Redis clock steps backwards (an NTP step,
+or a failover to a node with a slower clock); after a restore from an
+older snapshot, which rewinds the shard clock, the server time has normally
+moved past the fragments issued before. Records are a big-endian
 timestamp (ms) and IEEE-754 value, appended in arrival order, so an append
 never reads the chunk. A chunk is limited to 32 MiB (about two million
 samples); samples beyond that are rejected (`outcome="chunk_full"`) rather
@@ -96,7 +103,8 @@ datagrams are dropped and counted (`outcome="dropped"`).
 
 One Lua script call per shard and batch (`internal/hot/scripts.go`):
 
-1. Read the server time with `TIME`.
+1. Read the server time with `TIME` and compute the fragment for chunks
+   created by this call.
 2. For every chunk in the batch: if the window is due, or the chunk is
    currently claimed by a flusher, reject its samples (`too_old`); if the
    chunk would exceed its size limit, reject them (`chunk_full`).
@@ -174,7 +182,7 @@ left data in Redis forever.
 | Undecodable chunk | Moved to a quarantine key (fenced, see below), logged and counted; it does not block flushing. |
 | Very large chunk | Persisted in parts of 100,000 samples, below Cassandra's mutation limit. |
 | Sample for a closed window | Rejected and counted (`outcome="too_old"`); remote write returns 400. |
-| Redis clock moves backwards | A claimed chunk still rejects appends (the in-flight check). A chunk re-created after completion is a new fragment and is stored as a separate version; reads merge versions. |
+| Redis clock moves backwards | A claimed chunk still rejects appends (the in-flight check). A chunk re-created after completion gets a larger fragment from the shard clock and is stored as a separate version that takes precedence; reads merge versions. |
 | Index write fails | The batch fails with 503 before any sample is stored; the client retries. |
 
 ### Quarantined chunks
@@ -222,11 +230,30 @@ of length-prefixed Prometheus XOR chunks of sorted, de-duplicated samples
 Rows carry `USING TTL` from `storage.retention`, and TWCS drops whole
 SSTables when they expire.
 
+`total` is the number of samples appended to the incarnation in Redis,
+including samples that were overwritten by a later sample with the same
+timestamp: an incarnation only grows, so a larger `total` is a later state
+of it.
+
 Reads for `[mint, maxt]` query the day partitions of
 `[mint - chunk_range, maxt]` with a clustering range on `start_ms`,
 concatenate the parts of each version and merge versions in clustering
-order, so later incarnations and more complete versions win on equal
-timestamps.
+order. Where versions disagree on the value at a timestamp, the version
+that sorts last wins:
+
+1. the larger `fragment`: a later incarnation of the window;
+2. then the larger `total`: a later state of the same incarnation, for
+   example the complete chunk rather than what an older snapshot held;
+3. then the larger `digest` as a signed 64-bit value. Versions with equal
+   `fragment` and `total` but different content can only come from diverging
+   histories of one incarnation (a restore or a failover to a lagging
+   replica, followed by different writes to the same window). Which one is
+   newer cannot be known; the digest makes the choice deterministic and the
+   same for every reader, but arbitrary.
+
+All of this matters only when a client writes different values for the same
+timestamp of a series and, around the same time, Redis fails over, is
+restored or its clock steps.
 
 ## Series index (Cassandra)
 

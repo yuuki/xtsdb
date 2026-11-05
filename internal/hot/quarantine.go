@@ -21,7 +21,8 @@ type QuarantinedChunk struct {
 	Start  int64 // window start in milliseconds
 	Bytes  int64
 	// Header is the first 16 bytes as stored. In a healthy chunk it is the
-	// creation time of the chunk in microseconds.
+	// fragment: the time the chunk was created in microseconds, from the
+	// shard's hybrid clock.
 	Header string
 	// Expires is when Redis deletes the chunk; zero if it is kept until it
 	// is deleted explicitly.

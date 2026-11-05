@@ -19,6 +19,9 @@ var tables = []string{
 	// version (fragment, total, digest) stored in one or more parts. More
 	// versions appear only when a window is persisted again with different
 	// content, for example after Redis was restored from an older snapshot.
+	// The clustering order is the precedence of versions on reads: later
+	// fragments, then more records (total), then the digest as a signed
+	// 64-bit value.
 	`CREATE TABLE IF NOT EXISTS chunks (
 		series_id bigint,
 		day       int,
