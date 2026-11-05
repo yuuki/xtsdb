@@ -20,6 +20,7 @@ import (
 
 	"github.com/klauspost/compress/s2"
 	"github.com/klauspost/compress/snappy"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/prompb"
 	writev2 "github.com/prometheus/prometheus/prompb/io/prometheus/write/v2"
@@ -442,21 +443,80 @@ func TestRemoteWriteLimits(t *testing.T) {
 	}
 }
 
-func TestRemoteWriteRejectsHistogramsButKeepsFloats(t *testing.T) {
+func testHistogram(i int) *histogram.Histogram {
+	return &histogram.Histogram{
+		Schema:          0,
+		Count:           uint64(3 + i),
+		Sum:             float64(i),
+		ZeroThreshold:   0.001,
+		ZeroCount:       1,
+		PositiveSpans:   []histogram.Span{{Offset: 0, Length: 2}},
+		PositiveBuckets: []int64{1, int64(i)}, // deltas: 1, 1+i
+	}
+}
+
+// Native histograms are stored next to float samples, in both protocol
+// versions; invalid ones are rejected.
+func TestRemoteWriteHistograms(t *testing.T) {
 	w, hot, _ := newTestWriter(t)
 	h := RemoteWriteHandler(w, testRWOptions, slog.New(slog.DiscardHandler))
 	now := time.Now().UnixMilli()
-	req := &prompb.WriteRequest{Timeseries: []prompb.TimeSeries{
+
+	v1 := &prompb.WriteRequest{Timeseries: []prompb.TimeSeries{
 		{Labels: []prompb.Label{{Name: "__name__", Value: "f"}}, Samples: []prompb.Sample{{Timestamp: now, Value: 1}}},
-		{Labels: []prompb.Label{{Name: "__name__", Value: "h"}}, Histograms: []prompb.Histogram{{Timestamp: now}}},
+		{Labels: []prompb.Label{{Name: "__name__", Value: "h1"}}, Histograms: []prompb.Histogram{
+			prompb.FromIntHistogram(now, testHistogram(1)),
+			prompb.FromFloatHistogram(now+1000, testHistogram(2).ToFloat(nil)),
+		}},
 	}}
-	body, _ := req.Marshal()
-	rec := post(t, h, "", body)
-	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "histogram") {
-		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	body, _ := v1.Marshal()
+	if rec := post(t, h, "", body); rec.Code != http.StatusNoContent {
+		t.Fatalf("v1: status %d: %s", rec.Code, rec.Body)
 	}
-	if got := readAll(t, hot, labels.FromStrings("__name__", "f")); len(got) != 1 {
-		t.Fatal("float samples of the same request must be stored")
+	got := readAll(t, hot, labels.FromStrings("__name__", "h1"))
+	if len(got) != 2 || got[0].H == nil || !got[0].H.Equals(testHistogram(1).ToFloat(nil)) || got[1].H.Count != 5 {
+		t.Fatalf("v1 histograms stored as %v", got)
+	}
+	if got := readAll(t, hot, labels.FromStrings("__name__", "f")); len(got) != 1 || got[0].H != nil {
+		t.Fatalf("float samples stored as %v", got)
+	}
+
+	st := writev2.NewSymbolTable()
+	custom := &histogram.FloatHistogram{
+		Schema: histogram.CustomBucketsSchema, Count: 3, Sum: 2,
+		PositiveSpans: []histogram.Span{{Offset: 0, Length: 2}}, PositiveBuckets: []float64{1, 2},
+		CustomValues: []float64{0.5, 1},
+	}
+	v2 := &writev2.Request{Timeseries: []writev2.TimeSeries{{
+		LabelsRefs: st.SymbolizeLabels(labels.FromStrings("__name__", "h2"), nil),
+		Samples:    []writev2.Sample{{Timestamp: now, Value: 7}},
+		Histograms: []writev2.Histogram{
+			writev2.FromIntHistogram(0, now+1000, testHistogram(3)),
+			writev2.FromFloatHistogram(0, now+2000, custom),
+		},
+	}}, Symbols: st.Symbols()}
+	body, _ = v2.Marshal()
+	rec := post(t, h, "application/x-protobuf;proto=io.prometheus.write.v2.Request", body)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("v2: status %d: %s", rec.Code, rec.Body)
+	}
+	if s, hs := rec.Header().Get(headerSamplesWritten), rec.Header().Get(headerHistogramsWritten); s != "1" || hs != "2" {
+		t.Fatalf("written headers: samples %q, histograms %q", s, hs)
+	}
+	got = readAll(t, hot, labels.FromStrings("__name__", "h2"))
+	if len(got) != 3 || got[0].V != 7 || got[2].H == nil || !got[2].H.Equals(custom) {
+		t.Fatalf("v2 samples stored as %v", got)
+	}
+
+	// A histogram whose count does not match its buckets is rejected.
+	bad := testHistogram(4)
+	bad.Count = 1
+	v1 = &prompb.WriteRequest{Timeseries: []prompb.TimeSeries{
+		{Labels: []prompb.Label{{Name: "__name__", Value: "bad"}}, Histograms: []prompb.Histogram{prompb.FromIntHistogram(now, bad)}},
+	}}
+	body, _ = v1.Marshal()
+	if rec := post(t, h, "", body); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "histogram") {
+		t.Fatalf("invalid histogram: status %d: %s", rec.Code, rec.Body)
 	}
 }
 

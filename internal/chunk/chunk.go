@@ -1,9 +1,12 @@
 // Package chunk implements the sample encodings used by the two tiers.
 //
-// The hot tier stores a chunk as a fixed header followed by raw 16-byte
-// records appended in arrival order, which lets Redis append without reading.
+// The hot tier stores a chunk as a fixed header followed by raw records
+// appended in arrival order, which lets Redis append without reading. A
+// float sample is one 16-byte record; a native histogram is a 16-byte record
+// followed by its encoding, padded to a multiple of 16 bytes.
 // The cold tier stores sorted, de-duplicated samples compressed with the
-// Gorilla XOR encoding from the Prometheus TSDB.
+// Gorilla XOR encoding from the Prometheus TSDB, and native histograms with
+// its float histogram encoding.
 package chunk
 
 import (
@@ -14,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 
+	writev2 "github.com/prometheus/prometheus/prompb/io/prometheus/write/v2"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 
 	"github.com/yuuki/xtsdb/internal/model"
@@ -25,37 +29,77 @@ import (
 // the incarnations of a window.
 const HeaderLen = 16
 
-// RecordLen is the size of one raw sample record.
+// RecordLen is the size of one raw float record, and the unit in which hot
+// chunks grow.
 const RecordLen = 16
 
 // ErrCorrupt is returned for undecodable chunk data.
 var ErrCorrupt = errors.New("corrupt chunk")
 
-// AppendRaw appends samples in the hot-tier record format to dst.
+// histogramMark marks a histogram record in the value field of a raw record.
+// The value field then holds histogramMark | payload length, which is a NaN
+// that float records never contain (see CanonicalValue).
+const (
+	histogramMark     = 0x7ff4_0000_0000_0000
+	histogramMarkMask = 0xffff_0000_0000_0000
+	maxPayload        = 0xffff_ffff
+)
+
+// CanonicalValue returns v, except that NaNs whose bits could be mistaken
+// for a histogram record become the canonical NaN. PromQL does not tell
+// NaNs apart, except the stale marker, which is kept.
+func CanonicalValue(v float64) float64 {
+	if math.Float64bits(v)&histogramMarkMask == histogramMark {
+		return math.NaN()
+	}
+	return v
+}
+
+// AppendRaw appends samples in the hot-tier record format to dst. A float
+// sample takes 16 bytes: its timestamp and value. A histogram takes 16 bytes
+// (its timestamp, and the length of its encoding marked as a histogram) plus
+// its encoding, padded to a multiple of 16 bytes.
 func AppendRaw(dst []byte, samples []model.Sample) []byte {
 	for _, s := range samples {
 		dst = binary.BigEndian.AppendUint64(dst, uint64(s.T))
-		dst = binary.BigEndian.AppendUint64(dst, math.Float64bits(s.V))
+		if s.H == nil {
+			dst = binary.BigEndian.AppendUint64(dst, math.Float64bits(CanonicalValue(s.V)))
+			continue
+		}
+		h := writev2.FromFloatHistogram(0, s.T, s.H)
+		h.Timestamp = 0 // already in the record
+		payload, err := h.Marshal()
+		if err != nil || len(payload) > maxPayload {
+			// Marshalling a valid histogram cannot fail; never write a
+			// record that cannot be read back.
+			panic(fmt.Sprintf("encode histogram: %v (%d bytes)", err, len(payload)))
+		}
+		dst = binary.BigEndian.AppendUint64(dst, histogramMark|uint64(len(payload)))
+		dst = append(dst, payload...)
+		if pad := len(payload) % RecordLen; pad != 0 {
+			dst = append(dst, make([]byte, RecordLen-pad)...)
+		}
 	}
 	return dst
 }
 
-// DecodeHot decodes a hot chunk value. It returns the fragment and the
-// samples sorted by time with duplicates resolved in favour of the latest
-// write.
-func DecodeHot(b []byte) (fragment int64, samples []model.Sample, err error) {
+// DecodeHot decodes a hot chunk value. It returns the fragment, the samples
+// sorted by time with duplicates resolved in favour of the latest write, and
+// the number of records the chunk holds (including overwritten samples).
+func DecodeHot(b []byte) (fragment int64, samples []model.Sample, records int, err error) {
 	if len(b) < HeaderLen || (len(b)-HeaderLen)%RecordLen != 0 {
-		return 0, nil, fmt.Errorf("%w: length %d", ErrCorrupt, len(b))
+		return 0, nil, 0, fmt.Errorf("%w: length %d", ErrCorrupt, len(b))
 	}
 	fragment, err = strconv.ParseInt(string(b[:HeaderLen]), 10, 64)
 	if err != nil {
-		return 0, nil, fmt.Errorf("%w: header: %w", ErrCorrupt, err)
+		return 0, nil, 0, fmt.Errorf("%w: header: %w", ErrCorrupt, err)
 	}
 	samples, err = DecodeRaw(b[HeaderLen:])
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, 0, err
 	}
-	return fragment, Normalize(samples), nil
+	records = len(samples)
+	return fragment, Normalize(samples), records, nil
 }
 
 // DecodeRaw decodes raw records without sorting them.
@@ -63,13 +107,26 @@ func DecodeRaw(b []byte) ([]model.Sample, error) {
 	if len(b)%RecordLen != 0 {
 		return nil, fmt.Errorf("%w: length %d", ErrCorrupt, len(b))
 	}
-	out := make([]model.Sample, len(b)/RecordLen)
-	for i := range out {
-		r := b[i*RecordLen:]
-		out[i] = model.Sample{
-			T: int64(binary.BigEndian.Uint64(r[0:8])),
-			V: math.Float64frombits(binary.BigEndian.Uint64(r[8:16])),
+	out := make([]model.Sample, 0, len(b)/RecordLen)
+	for len(b) > 0 {
+		t := int64(binary.BigEndian.Uint64(b[0:8]))
+		word := binary.BigEndian.Uint64(b[8:16])
+		b = b[RecordLen:]
+		if word&histogramMarkMask != histogramMark {
+			out = append(out, model.Sample{T: t, V: math.Float64frombits(word)})
+			continue
 		}
+		n := int(word &^ histogramMarkMask)
+		padded := (n + RecordLen - 1) / RecordLen * RecordLen
+		if n > maxPayload || padded > len(b) {
+			return nil, fmt.Errorf("%w: histogram record of %d bytes exceeds the chunk", ErrCorrupt, n)
+		}
+		var h writev2.Histogram
+		if err := h.Unmarshal(b[:n]); err != nil {
+			return nil, fmt.Errorf("%w: histogram: %w", ErrCorrupt, err)
+		}
+		out = append(out, model.Sample{T: t, H: h.ToFloatHistogram()})
+		b = b[padded:]
 	}
 	return out, nil
 }
@@ -152,28 +209,115 @@ func cmpInt64(a, b int64) int {
 // Encoding identifies the cold-tier blob format.
 type Encoding uint8
 
-// EncodingXOR is a sequence of length-prefixed Prometheus XOR chunks.
-const EncodingXOR Encoding = 1
+const (
+	// EncodingXOR is a sequence of length-prefixed Prometheus XOR chunks. It
+	// is used for windows that hold only float samples.
+	EncodingXOR Encoding = 1
+	// EncodingTyped is a sequence of segments, each a Prometheus chunk
+	// encoding byte (XOR or float histogram), the uvarint length of the
+	// chunk and the chunk. It is used for windows with native histograms.
+	EncodingTyped Encoding = 2
+)
 
-// maxSamplesPerXOR stays well below the 16-bit sample counter of an XOR chunk.
-const maxSamplesPerXOR = 16384
+// maxSamplesPerChunk stays well below the 16-bit sample counter of a
+// Prometheus chunk.
+const maxSamplesPerChunk = 16384
 
-// EncodeXOR compresses sorted, de-duplicated samples.
-func EncodeXOR(samples []model.Sample) ([]byte, error) {
+// Encode compresses sorted, de-duplicated samples.
+func Encode(samples []model.Sample) (Encoding, []byte, error) {
+	if !slices.ContainsFunc(samples, model.Sample.IsHistogram) {
+		b, err := EncodeXOR(samples)
+		return EncodingXOR, b, err
+	}
 	var out []byte
-	for start := 0; start < len(samples); start += maxSamplesPerXOR {
-		end := min(start+maxSamplesPerXOR, len(samples))
+	for i := 0; i < len(samples); {
+		j := i + 1
+		for j < len(samples) && samples[j].IsHistogram() == samples[i].IsHistogram() {
+			j++
+		}
+		var (
+			chunks []chunkenc.Chunk
+			err    error
+		)
+		if samples[i].IsHistogram() {
+			chunks, err = histogramChunks(samples[i:j])
+		} else {
+			chunks, err = xorChunks(samples[i:j])
+		}
+		if err != nil {
+			return 0, nil, err
+		}
+		for _, c := range chunks {
+			out = append(out, byte(c.Encoding()))
+			out = binary.AppendUvarint(out, uint64(len(c.Bytes())))
+			out = append(out, c.Bytes()...)
+		}
+		i = j
+	}
+	return EncodingTyped, out, nil
+}
+
+func xorChunks(samples []model.Sample) ([]chunkenc.Chunk, error) {
+	var out []chunkenc.Chunk
+	for start := 0; start < len(samples); start += maxSamplesPerChunk {
 		c := chunkenc.NewXORChunk()
 		app, err := c.Appender()
 		if err != nil {
 			return nil, err
 		}
-		for _, s := range samples[start:end] {
+		for _, s := range samples[start:min(start+maxSamplesPerChunk, len(samples))] {
 			app.Append(0, s.T, s.V)
 		}
-		b := c.Bytes()
-		out = binary.AppendUvarint(out, uint64(len(b)))
-		out = append(out, b...)
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+// histogramChunks encodes float histograms. The appender cuts a new chunk
+// on a counter reset or an incompatible bucket layout, and re-encodes the
+// current one when buckets are added.
+func histogramChunks(samples []model.Sample) ([]chunkenc.Chunk, error) {
+	var (
+		out []chunkenc.Chunk
+		cur chunkenc.Chunk = chunkenc.NewFloatHistogramChunk()
+	)
+	app, err := cur.Appender()
+	if err != nil {
+		return nil, err
+	}
+	for _, s := range samples {
+		if cur.NumSamples() >= maxSamplesPerChunk {
+			out = append(out, cur)
+			cur = chunkenc.NewFloatHistogramChunk()
+			if app, err = cur.Appender(); err != nil {
+				return nil, err
+			}
+		}
+		next, recoded, nextApp, err := app.AppendFloatHistogram(nil, 0, s.T, s.H, false)
+		if err != nil {
+			return nil, fmt.Errorf("encode histogram at %d: %w", s.T, err)
+		}
+		if next != nil {
+			if !recoded {
+				out = append(out, cur)
+			}
+			cur = next
+		}
+		app = nextApp
+	}
+	return append(out, cur), nil
+}
+
+// EncodeXOR compresses sorted, de-duplicated float samples.
+func EncodeXOR(samples []model.Sample) ([]byte, error) {
+	chunks, err := xorChunks(samples)
+	if err != nil {
+		return nil, err
+	}
+	var out []byte
+	for _, c := range chunks {
+		out = binary.AppendUvarint(out, uint64(len(c.Bytes())))
+		out = append(out, c.Bytes()...)
 	}
 	return out, nil
 }
@@ -188,21 +332,60 @@ func DecodeXOR(b []byte) ([]model.Sample, error) {
 			return nil, fmt.Errorf("%w: bad segment length", ErrCorrupt)
 		}
 		b = b[sz:]
-		c, err := chunkenc.FromData(chunkenc.EncXOR, b[:n])
-		if err != nil {
-			return nil, fmt.Errorf("%w: %w", ErrCorrupt, err)
+		var err error
+		if out, it, err = decodeChunk(out, it, chunkenc.EncXOR, b[:n]); err != nil {
+			return nil, err
 		}
 		b = b[n:]
-		it = c.Iterator(it)
-		for it.Next() == chunkenc.ValFloat {
-			t, v := it.At()
-			out = append(out, model.Sample{T: t, V: v})
-		}
-		if err := it.Err(); err != nil {
-			return nil, fmt.Errorf("%w: %w", ErrCorrupt, err)
-		}
 	}
 	return out, nil
+}
+
+// decodeTyped decompresses a blob produced by Encode with EncodingTyped.
+func decodeTyped(b []byte) ([]model.Sample, error) {
+	var out []model.Sample
+	var it chunkenc.Iterator
+	for len(b) > 0 {
+		enc := chunkenc.Encoding(b[0])
+		if enc != chunkenc.EncXOR && enc != chunkenc.EncFloatHistogram {
+			return nil, fmt.Errorf("%w: unexpected chunk encoding %v", ErrCorrupt, enc)
+		}
+		n, sz := binary.Uvarint(b[1:])
+		if sz <= 0 || uint64(len(b)-1-sz) < n {
+			return nil, fmt.Errorf("%w: bad segment length", ErrCorrupt)
+		}
+		b = b[1+sz:]
+		var err error
+		if out, it, err = decodeChunk(out, it, enc, b[:n]); err != nil {
+			return nil, err
+		}
+		b = b[n:]
+	}
+	return out, nil
+}
+
+func decodeChunk(out []model.Sample, it chunkenc.Iterator, enc chunkenc.Encoding, b []byte) ([]model.Sample, chunkenc.Iterator, error) {
+	c, err := chunkenc.FromData(enc, b)
+	if err != nil {
+		return nil, it, fmt.Errorf("%w: %w", ErrCorrupt, err)
+	}
+	it = c.Iterator(it)
+	for vt := it.Next(); vt != chunkenc.ValNone; vt = it.Next() {
+		switch vt {
+		case chunkenc.ValFloat:
+			t, v := it.At()
+			out = append(out, model.Sample{T: t, V: v})
+		case chunkenc.ValFloatHistogram:
+			t, h := it.AtFloatHistogram(nil)
+			out = append(out, model.Sample{T: t, H: h})
+		default:
+			return nil, it, fmt.Errorf("%w: unexpected value type %v", ErrCorrupt, vt)
+		}
+	}
+	if err := it.Err(); err != nil {
+		return nil, it, fmt.Errorf("%w: %w", ErrCorrupt, err)
+	}
+	return out, it, nil
 }
 
 // Decode decodes a cold-tier blob of the given encoding.
@@ -210,6 +393,8 @@ func Decode(enc Encoding, b []byte) ([]model.Sample, error) {
 	switch enc {
 	case EncodingXOR:
 		return DecodeXOR(b)
+	case EncodingTyped:
+		return decodeTyped(b)
 	default:
 		return nil, fmt.Errorf("%w: unknown encoding %d", ErrCorrupt, enc)
 	}

@@ -78,6 +78,9 @@ func (h *Hot) Append(_ context.Context, batch []storage.SeriesSamples) (storage.
 			}
 			c.raw = append(c.raw, s)
 			res.Accepted++
+			if s.IsHistogram() {
+				res.AcceptedHistograms++
+			}
 		}
 	}
 	return res, nil

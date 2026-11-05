@@ -274,18 +274,20 @@ func (s *Store) Ping(ctx context.Context) error { return s.client.Ping(ctx).Err(
 func (s *Store) Close() error { return s.client.Close() }
 
 type pendingChunk struct {
-	id      model.SeriesID
-	start   int64
-	member  string
-	due     int64
-	data    []byte
-	samples int
+	id         model.SeriesID
+	start      int64
+	member     string
+	due        int64
+	data       []byte
+	samples    int
+	histograms int
 }
 
 type scriptCall struct {
-	keys    []string
-	args    []any
-	samples []int // samples per chunk, to count rejections
+	keys       []string
+	args       []any
+	samples    []int // samples per chunk, to count rejections
+	histograms []int // histograms per chunk
 }
 
 // Append stores samples in their chunk windows.
@@ -308,6 +310,9 @@ func (s *Store) Append(ctx context.Context, batch []storage.SeriesSamples) (stor
 			}
 			c.data = chunk.AppendRaw(c.data, []model.Sample{smp})
 			c.samples++
+			if smp.IsHistogram() {
+				c.histograms++
+			}
 		}
 	}
 
@@ -332,6 +337,7 @@ func (s *Store) Append(ctx context.Context, batch []storage.SeriesSamples) (stor
 				call.keys = append(call.keys, s.chunkKey(shard, m), s.windowsKey(shard, c.id))
 				call.args = append(call.args, m, c.start, c.due, c.data)
 				call.samples = append(call.samples, c.samples)
+				call.histograms = append(call.histograms, c.histograms)
 			}
 			calls = append(calls, call)
 			members = members[n:]
@@ -348,24 +354,29 @@ func (s *Store) Append(ctx context.Context, batch []storage.SeriesSamples) (stor
 		if err != nil || len(reply) != 2 {
 			return storage.AppendResult{}, fmt.Errorf("append: unexpected reply %v: %w", reply, err)
 		}
+		accepted := make([]bool, len(call.samples))
+		for i := range accepted {
+			accepted[i] = true
+		}
 		count := func(v any) int {
 			idxs, _ := v.([]any)
 			n := 0
 			for _, x := range idxs {
-				if idx, ok := x.(int64); ok && idx >= 0 && int(idx) < len(call.samples) {
+				if idx, ok := x.(int64); ok && idx >= 0 && int(idx) < len(call.samples) && accepted[idx] {
 					n += call.samples[idx]
+					accepted[idx] = false
 				}
 			}
 			return n
 		}
-		total := 0
-		for _, n := range call.samples {
-			total += n
+		res.TooOld += count(reply[0])
+		res.ChunkFull += count(reply[1])
+		for i, ok := range accepted {
+			if ok {
+				res.Accepted += call.samples[i]
+				res.AcceptedHistograms += call.histograms[i]
+			}
 		}
-		tooOld, full := count(reply[0]), count(reply[1])
-		res.TooOld += tooOld
-		res.ChunkFull += full
-		res.Accepted += total - tooOld - full
 	}
 	return res, nil
 }
@@ -450,7 +461,7 @@ func (s *Store) Load(ctx context.Context, refs []storage.ChunkRef) (storage.Load
 		if err != nil {
 			return storage.LoadResult{}, fmt.Errorf("load chunk: %w", err)
 		}
-		frag, samples, err := chunk.DecodeHot(b)
+		frag, samples, records, err := chunk.DecodeHot(b)
 		if err != nil {
 			if s.quarantine(ctx, refs[i], b, err) {
 				res.Quarantined++
@@ -461,7 +472,7 @@ func (s *Store) Load(ctx context.Context, refs []storage.ChunkRef) (storage.Load
 			Ref:      refs[i],
 			Fragment: frag,
 			Size:     len(b),
-			Records:  (len(b) - chunk.HeaderLen) / chunk.RecordLen,
+			Records:  records,
 			Samples:  samples,
 		})
 	}
@@ -598,7 +609,7 @@ func (s *Store) Read(ctx context.Context, ids []model.SeriesID, mint, maxt int64
 		if err != nil {
 			return nil, fmt.Errorf("read chunk: %w", err)
 		}
-		_, samples, err := chunk.DecodeHot(b)
+		_, samples, _, err := chunk.DecodeHot(b)
 		if err != nil {
 			s.logger.Warn("skipping undecodable chunk", "key", lookups[i].key, "err", err)
 			continue

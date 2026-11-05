@@ -253,9 +253,13 @@ func (f *Flusher) flushBatch(ctx context.Context, refs []storage.ChunkRef) int {
 	return finished + len(done)
 }
 
-// samplesPerPart bounds the size of one cold-tier row (well below the
-// Cassandra mutation size limit even for incompressible values).
-const samplesPerPart = 100_000
+// samplesPerPart and bytesPerPart bound the size of one cold-tier row, well
+// below the Cassandra mutation size limit even for incompressible values and
+// large native histograms.
+const (
+	samplesPerPart = 100_000
+	bytesPerPart   = 4 << 20
+)
 
 func (f *Flusher) persist(ctx context.Context, c storage.HotChunk) error {
 	n, err := WriteCold(ctx, f.cold, c.Ref.Series, c.Ref.Start, c.Fragment, c.Records, c.Samples)
@@ -268,10 +272,10 @@ func (f *Flusher) persist(ctx context.Context, c storage.HotChunk) error {
 }
 
 // WriteCold writes one version of a chunk window to the cold tier, in parts
-// of at most 100,000 samples, and returns the number of compressed bytes
-// written. samples must be sorted and de-duplicated; total is the number of
-// records of the version (see storage.ColdChunk). Writing the same version
-// again writes the same rows.
+// of at most 100,000 samples and 4 MiB, and returns the number of compressed
+// bytes written. samples must be sorted and de-duplicated; total is the
+// number of records of the version (see storage.ColdChunk). Writing the same
+// version again writes the same rows: parts are cut deterministically.
 func WriteCold(ctx context.Context, cold storage.ColdStore, series model.SeriesID, start, fragment int64,
 	total int, samples []model.Sample) (int, error) {
 	if len(samples) == 0 {
@@ -279,12 +283,18 @@ func WriteCold(ctx context.Context, cold storage.ColdStore, series model.SeriesI
 	}
 	digest := xxhash.Sum64(chunk.AppendRaw(nil, samples))
 	written := 0
-	for part, i := 0, 0; i < len(samples); part, i = part+1, i+samplesPerPart {
-		p := samples[i:min(i+samplesPerPart, len(samples))]
-		data, err := chunk.EncodeXOR(p)
+	for part, i := 0, 0; i < len(samples); part++ {
+		n := min(samplesPerPart, len(samples)-i)
+		enc, data, err := chunk.Encode(samples[i : i+n])
+		for err == nil && len(data) > bytesPerPart && n > 1 {
+			n /= 2
+			enc, data, err = chunk.Encode(samples[i : i+n])
+		}
 		if err != nil {
 			return written, err
 		}
+		p := samples[i : i+n]
+		i += n
 		err = cold.WriteChunk(ctx, storage.ColdChunk{
 			Series:   series,
 			Start:    start,
@@ -294,7 +304,7 @@ func WriteCold(ctx context.Context, cold storage.ColdStore, series model.SeriesI
 			Part:     part,
 			MaxT:     p[len(p)-1].T,
 			Count:    len(p),
-			Encoding: chunk.EncodingXOR,
+			Encoding: enc,
 			Data:     data,
 		})
 		if err != nil {

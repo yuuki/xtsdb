@@ -29,10 +29,13 @@ type Series struct {
 
 // Result summarizes a write.
 type Result struct {
-	Accepted int
-	TooOld   int // window already closed
-	TooNew   int // beyond max_sample_future
-	Invalid  int // samples of series with invalid labels
+	Accepted int // samples stored, floats and histograms
+	// AcceptedHistograms is how many of the accepted samples are native
+	// histograms.
+	AcceptedHistograms int
+	TooOld             int // window already closed
+	TooNew             int // beyond max_sample_future
+	Invalid            int // samples of series with invalid labels, and invalid histograms
 	// Collision counts samples of series whose ID is already used by a
 	// different label set.
 	Collision int
@@ -46,6 +49,7 @@ func (r Result) Rejected() int { return r.TooOld + r.TooNew + r.Invalid + r.Coll
 // Merge adds the counts of o to r.
 func (r *Result) Merge(o Result) {
 	r.Accepted += o.Accepted
+	r.AcceptedHistograms += o.AcceptedHistograms
 	r.TooOld += o.TooOld
 	r.TooNew += o.TooNew
 	r.Invalid += o.Invalid
@@ -198,6 +202,15 @@ func (w *Writer) Write(ctx context.Context, batch []Series) (Result, error) {
 		samples := s.Samples[:0:0]
 		minS, maxS := int64(0), int64(0)
 		for _, smp := range s.Samples {
+			if smp.H != nil {
+				if err := smp.H.Validate(); err != nil {
+					res.Invalid++
+					if res.FirstInvalid == nil {
+						res.FirstInvalid = fmt.Errorf("histogram of %s at %d: %w", lset, smp.T, err)
+					}
+					continue
+				}
+			}
 			if smp.T > maxT {
 				res.TooNew++
 				continue
@@ -303,6 +316,7 @@ func (w *Writer) Write(ctx context.Context, batch []Series) (Result, error) {
 			return res, fmt.Errorf("%w: hot tier: %w", ErrStorage, err)
 		}
 		res.Accepted += ar.Accepted
+		res.AcceptedHistograms += ar.AcceptedHistograms
 		res.TooOld += ar.TooOld
 	}
 

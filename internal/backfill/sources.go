@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/textparse"
 	promstorage "github.com/prometheus/prometheus/storage"
@@ -77,8 +78,8 @@ func BlockID(dir string) (string, error) {
 }
 
 // ImportBlock imports the float samples of every series of a Prometheus
-// TSDB block, up to concurrency series at a time. Deleted samples
-// (tombstones) are left out; native histograms are counted and skipped.
+// TSDB block, up to concurrency series at a time, native histograms
+// included. Deleted samples (tombstones) are left out.
 //
 // The block is read with the index, chunks and tombstones packages of the
 // Prometheus TSDB rather than the tsdb package, which would link in the
@@ -132,13 +133,21 @@ func (im *Importer) ImportBlock(ctx context.Context, dir string, concurrency int
 				it = iterable.Iterator(it)
 			}
 			for vt := it.Next(); vt != chunkenc.ValNone; vt = it.Next() {
-				if vt != chunkenc.ValFloat {
-					im.Stats.Histograms.Add(1)
-					continue
+				var s model.Sample
+				switch vt {
+				case chunkenc.ValFloat:
+					s.T, s.V = it.At()
+				case chunkenc.ValHistogram:
+					var h *histogram.Histogram
+					s.T, h = it.AtHistogram(nil)
+					s.H = h.ToFloat(nil)
+				case chunkenc.ValFloatHistogram:
+					s.T, s.H = it.AtFloatHistogram(nil)
+				default:
+					return labels.EmptyLabels(), nil, fmt.Errorf("unexpected value type %v", vt)
 				}
-				t, v := it.At()
-				if !slices.ContainsFunc(deleted, func(d tombstones.Interval) bool { return d.InBounds(t) }) {
-					samples = append(samples, model.Sample{T: t, V: v})
+				if !slices.ContainsFunc(deleted, func(d tombstones.Interval) bool { return d.InBounds(s.T) }) {
+					samples = append(samples, s)
 				}
 			}
 			if err := it.Err(); err != nil {
@@ -172,8 +181,7 @@ const DefaultMaxBuffered = 10_000_000
 // timestamp, the input of `promtool tsdb create-blocks-from openmetrics`.
 // Samples are collected per series and imported when maxBuffered samples
 // have been read, and at the end; a window split this way is stored as
-// several versions, which reads merge. Native histograms are not part of the
-// text format; _created series are skipped.
+// several versions, which reads merge. _created series are skipped.
 func (im *Importer) ImportOpenMetrics(ctx context.Context, data []byte, concurrency, maxBuffered int) error {
 	if maxBuffered <= 0 {
 		maxBuffered = DefaultMaxBuffered
@@ -208,13 +216,8 @@ func (im *Importer) ImportOpenMetrics(ctx context.Context, data []byte, concurre
 		if err != nil {
 			return fmt.Errorf("parse OpenMetrics: %w", err)
 		}
-		switch entry {
-		case textparse.EntryHistogram:
-			im.Stats.Histograms.Add(1)
-			continue
-		case textparse.EntrySeries:
-		default:
-			continue
+		if entry != textparse.EntrySeries {
+			continue // OpenMetrics 1.0 text has no native histograms
 		}
 		raw, ts, v := p.Series()
 		if ts == nil {

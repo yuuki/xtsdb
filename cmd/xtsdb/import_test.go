@@ -75,7 +75,7 @@ storage:
 		}
 		return out.String()
 	}
-	if out := run1(files[0]); !strings.Contains(out, "imported 2160 samples of 1 series") {
+	if out := run1(files[0]); !strings.Contains(out, "imported 2160 samples (0 native histograms) of 1 series") {
 		t.Fatalf("unexpected output %q", out)
 	}
 	// The first file is skipped, the second one is imported.

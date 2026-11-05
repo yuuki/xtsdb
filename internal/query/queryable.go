@@ -552,11 +552,30 @@ type errIterator struct {
 
 func (e errIterator) Err() error { return e.err }
 
-// sampleList adapts sorted float samples to the Prometheus iterator.
+// sampleList adapts sorted samples to the Prometheus iterator.
 type sampleList []model.Sample
 
-func (l sampleList) Get(i int) chunks.Sample { return fsample{t: l[i].T, v: l[i].V} }
-func (l sampleList) Len() int                { return len(l) }
+func (l sampleList) Get(i int) chunks.Sample {
+	if l[i].H != nil {
+		return fhsample{t: l[i].T, h: l[i].H}
+	}
+	return fsample{t: l[i].T, v: l[i].V}
+}
+func (l sampleList) Len() int { return len(l) }
+
+// fhsample is a native histogram sample.
+type fhsample struct {
+	t int64
+	h *histogram.FloatHistogram
+}
+
+func (s fhsample) T() int64                      { return s.t }
+func (s fhsample) ST() int64                     { return 0 }
+func (s fhsample) F() float64                    { return 0 }
+func (s fhsample) H() *histogram.Histogram       { return nil }
+func (s fhsample) FH() *histogram.FloatHistogram { return s.h }
+func (s fhsample) Type() chunkenc.ValueType      { return chunkenc.ValFloatHistogram }
+func (s fhsample) Copy() chunks.Sample           { return fhsample{t: s.t, h: s.h.Copy()} }
 
 type fsample struct {
 	t int64

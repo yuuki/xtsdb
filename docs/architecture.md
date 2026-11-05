@@ -74,9 +74,21 @@ in microseconds, or one more than the last fragment issued in the shard
 therefore keep increasing when the Redis clock steps backwards (an NTP step,
 or a failover to a node with a slower clock); after a restore from an
 older snapshot, which rewinds the shard clock, the server time has normally
-moved past the fragments issued before. Records are a big-endian
-timestamp (ms) and IEEE-754 value, appended in arrival order, so an append
-never reads the chunk. A chunk is limited to 32 MiB (about two million
+moved past the fragments issued before. Records are appended in arrival
+order, so an append never reads the chunk:
+
+- a float sample is 16 bytes: a big-endian timestamp (ms) and IEEE-754
+  value;
+- a native histogram is 16 bytes, its timestamp and `0x7ff4 << 48 | length`,
+  followed by the histogram as a Remote Write 2.0 protobuf `Histogram`,
+  padded to a multiple of 16 bytes. That value word is a NaN that float
+  records never hold: incoming NaNs with the same top 16 bits are stored as
+  the standard NaN, which PromQL does not tell apart (the stale marker is a
+  different NaN and is kept). Chunks therefore stay a multiple of 16 bytes,
+  and a series may change between floats and histograms.
+
+Integer histograms are stored as float histograms, which represent them
+exactly; remote write validates them as integer histograms first. A chunk is limited to 32 MiB (about two million
 samples); samples beyond that are rejected (`outcome="chunk_full"`) rather
 than creating a chunk that cannot be flushed.
 
@@ -232,9 +244,14 @@ CREATE TABLE chunks (
 
 `day` is the UTC day of the window start, which bounds partition size.
 `(fragment, total, digest)` identify a version of a window, `part` splits
-large versions into rows of at most 100,000 samples. The blob is a sequence
-of length-prefixed Prometheus XOR chunks of sorted, de-duplicated samples
+large versions into rows of at most 100,000 samples and 4 MiB. The blob of a
+window with float samples only (`encoding` 1) is a sequence of
+length-prefixed Prometheus XOR chunks of sorted, de-duplicated samples
 (Gorilla encoding; typically 1–2 bytes per sample compared to 16 in Redis).
+A window with native histograms (`encoding` 2) is a sequence of segments,
+each a Prometheus chunk encoding byte (XOR or float histogram), the chunk's
+length and the chunk, in time order; a new histogram chunk starts at a
+counter reset or an incompatible bucket layout, as in the Prometheus TSDB.
 A row expires `storage.retention` after its last sample (`USING TTL`), and
 TWCS drops whole SSTables when they expire. Index entries of a day expire two
 days after the samples of that day; series rows two days after they were

@@ -18,7 +18,8 @@ use each store for what it is good at, and scale each tier independently.
   with an at-least-once protocol based on leases and content-idempotent
   writes, keep working when Redis is full or Cassandra is slow, and stay
   visible to queries throughout. No Redis keyspace notifications are used.
-- **Prometheus compatible.** Remote Write 1.0 and 2.0 for ingestion; PromQL
+- **Prometheus compatible.** Remote Write 1.0 and 2.0 for ingestion, with
+  native histograms (exponential and custom buckets); PromQL
   through `/api/v1/query`, `/api/v1/query_range`, `/api/v1/series`,
   `/api/v1/labels` and `/api/v1/label/<name>/values`, evaluated by the
   Prometheus 3 engine. UTF-8 metric names such as `{"servers.web01.cpu"}`
@@ -27,7 +28,8 @@ use each store for what it is good at, and scale each tier independently.
   (`cpu.user;host=web01 12.5 1700000000`).
 - **Series index** in Cassandra, partitioned by day, so label matchers
   (`=`, `!=`, `=~`, `!~`) work on any time range.
-- **Gorilla compression** in the persistent tier (Prometheus XOR chunks).
+- **Gorilla compression** in the persistent tier (Prometheus XOR and float
+  histogram chunks).
 - **Redis 7.0+ standalone, Sentinel or Cluster; Valkey 7.2+** as a drop-in
   replacement. Every Redis script touches a single cluster slot.
 - **One binary, four roles** (`ingester`, `flusher`, `querier`, or `all`)
@@ -94,7 +96,12 @@ Stop and remove everything with `docker compose down -v`.
 remote_write:
   - url: http://xtsdb:9201/api/v1/write
     protobuf_message: io.prometheus.write.v2.Request
+    send_native_histograms: true   # Prometheus sends them by default with 2.0
 ```
+
+Native histograms are stored as float histograms, which represent integer
+histograms exactly, and are returned by PromQL like in Prometheus.
+Exemplars and metadata are accepted and dropped.
 
 **Graphite** plaintext on port 2003 (TCP and UDP):
 `<path>[;tag=value...] <value> [<unix timestamp>]`. The path becomes
@@ -139,7 +146,7 @@ xtsdb import -config.file=xtsdb.yaml -format=openmetrics history.om
   exist for a timestamp, the ingested one wins. Imports fill gaps.
 - Samples older than `storage.retention` are skipped, and imported samples
   expire `storage.retention` after their timestamp, like ingested ones.
-- Native histograms are counted and skipped. A series whose ID collides
+- Native histograms are imported. A series whose ID collides
   with another series is skipped and logged.
 - Only Cassandra is needed; the import checks that `storage.chunk_range` and
   `storage.index_buckets` match the values the data was written with.
@@ -173,7 +180,8 @@ stateless and can be scaled horizontally:
   flushed yet; xtsdb logs a warning at startup otherwise.
 - Enable AOF (`appendonly yes`) and replicas: the hot tier holds the most
   recent `chunk_range` + `grace_period` of data.
-- Memory needed is roughly 16 bytes per sample held in Redis, plus a small
+- Memory needed is roughly 16 bytes per float sample held in Redis (native
+  histograms take more, depending on their buckets), plus a small
   sorted set per series with chunks in Redis (its window index).
 - Redis 7.0 or later (Valkey 7.2 or later) is required. No
   keyspace-notification or other special configuration is needed.
@@ -237,7 +245,7 @@ Watch in particular:
 | `xtsdb_hot_pending_chunks`, `xtsdb_hot_inflight_chunks` | Chunks held in Redis. |
 | `xtsdb_flusher_chunks_total{outcome="error"}` | Failed flushes; they are retried after the lease. |
 | `xtsdb_hot_quarantined_chunks`, `xtsdb_flusher_chunks_total{outcome="quarantined"}` | Undecodable chunks moved out of the way. Should stay at zero; inspect them with `xtsdb quarantine list`. |
-| `xtsdb_ingester_samples_total{outcome=...}` | Accepted samples and rejections: `too_old`, `too_new`, `invalid`, `chunk_full`, `collision`, `unsupported` (histograms), `throttled`, `error`. |
+| `xtsdb_ingester_samples_total{outcome=...}` | Accepted samples and rejections: `too_old`, `too_new`, `invalid` (labels or histograms), `chunk_full`, `collision`, `throttled`, `error`. |
 | `xtsdb_ingester_series_collisions_total` | Series refused because another label set already uses their 64-bit ID. Both label sets are logged. |
 | `xtsdb_graphite_lines_total{outcome="dropped"}`, `xtsdb_graphite_connections_total{outcome="rejected"}` | Graphite overload. |
 
@@ -280,9 +288,9 @@ Cassandra 5.0.9, Prometheus 3.15.1 and Grafana 13.3.0.
 
 ## Limitations
 
-- Native histograms and exemplars are not supported yet. Requests that
-  carry histograms store their float samples and answer 400, so Prometheus
-  reports the dropped histograms instead of silently losing them.
+- Exemplars are not stored, and `/api/v1/query_exemplars` returns nothing.
+- Float NaN values other than the stale marker are stored as the standard
+  NaN (PromQL does not distinguish them).
 - No multi-tenancy, remote read, downsampling or recording rules.
   Authentication distinguishes writers from readers, not tenants.
 - Samples older than their closed chunk window are rejected by remote write

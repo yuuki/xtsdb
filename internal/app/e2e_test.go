@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/snappy"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/redis/go-redis/v9"
 
@@ -90,12 +91,19 @@ func TestEndToEnd(t *testing.T) {
 	t.Cleanup(func() { _ = stop() })
 	base := "http://" + a.Server.Addr().String()
 
-	// Remote write: two samples of one series.
+	// Remote write: two samples of one series, and two native histograms.
 	now := time.Now()
 	ts := now.Add(-500 * time.Millisecond).UnixMilli()
+	hist := func(n uint64) *histogram.Histogram {
+		return &histogram.Histogram{Schema: 0, Count: n, Sum: float64(n), PositiveSpans: []histogram.Span{{Length: 1}},
+			PositiveBuckets: []int64{int64(n)}}
+	}
 	wr := &prompb.WriteRequest{Timeseries: []prompb.TimeSeries{{
 		Labels:  []prompb.Label{{Name: "__name__", Value: "e2e_up"}, {Name: "job", Value: "e2e"}},
 		Samples: []prompb.Sample{{Timestamp: ts - 100, Value: 1}, {Timestamp: ts, Value: 2}},
+	}, {
+		Labels:     []prompb.Label{{Name: "__name__", Value: "e2e_latency"}, {Name: "job", Value: "e2e"}},
+		Histograms: []prompb.Histogram{prompb.FromIntHistogram(ts-100, hist(3)), prompb.FromIntHistogram(ts, hist(5))},
 	}}}
 	body, _ := wr.Marshal()
 	resp, err := http.Post(base+"/api/v1/write", "application/x-protobuf", bytes.NewReader(snappy.Encode(nil, body)))
@@ -151,6 +159,16 @@ func TestEndToEnd(t *testing.T) {
 	if n := countSamples(`e2e_up{job="e2e"}[1m]`); n != 2 {
 		t.Fatalf("hot tier: got %d samples, want 2", n)
 	}
+	histogramCount := func() string {
+		r := query(`histogram_count(e2e_latency)`)
+		if len(r) != 1 {
+			return fmt.Sprint(r)
+		}
+		return r[0].(map[string]any)["value"].([]any)[1].(string)
+	}
+	if c := histogramCount(); c != "5" {
+		t.Fatalf("hot tier: histogram_count = %s, want 5", c)
+	}
 
 	// The windows close a few seconds later; the flusher must move them.
 	waitFor(t, "flush to cassandra", func() bool {
@@ -162,6 +180,12 @@ func TestEndToEnd(t *testing.T) {
 	}
 	if r := query(`{"servers.web01.load"}[1m]`); len(r) != 1 {
 		t.Fatalf("cold tier: graphite series missing: %v", r)
+	}
+	if c := histogramCount(); c != "5" {
+		t.Fatalf("cold tier: histogram_count = %s, want 5", c)
+	}
+	if r := query(`e2e_latency[1m]`); len(r) != 1 || len(r[0].(map[string]any)["histograms"].([]any)) != 2 {
+		t.Fatalf("cold tier: histograms %v", r)
 	}
 
 	// Metadata API and metrics.

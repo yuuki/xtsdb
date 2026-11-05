@@ -23,9 +23,12 @@ type SeriesSamples struct {
 // rejected because their chunk window had already closed or their chunk
 // reached the maximum size.
 type AppendResult struct {
-	Accepted  int
-	TooOld    int
-	ChunkFull int
+	Accepted int
+	// AcceptedHistograms is how many of the accepted samples are native
+	// histograms.
+	AcceptedHistograms int
+	TooOld             int
+	ChunkFull          int
 }
 
 // ChunkRef identifies a chunk of the hot tier.

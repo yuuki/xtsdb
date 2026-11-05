@@ -10,14 +10,22 @@ import (
 
 	"github.com/cespare/xxhash/v2"
 	pmodel "github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 )
 
-// Sample is a single float sample. T is a Unix timestamp in milliseconds.
+// Sample is a single sample. T is a Unix timestamp in milliseconds. A
+// sample is either a float (V) or, when H is set, a native histogram;
+// integer histograms are held as float histograms, which represent them
+// exactly.
 type Sample struct {
 	T int64
 	V float64
+	H *histogram.FloatHistogram
 }
+
+// IsHistogram reports whether the sample is a native histogram.
+func (s Sample) IsHistogram() bool { return s.H != nil }
 
 // MetricName is the label that holds the metric name.
 const MetricName = pmodel.MetricNameLabel

@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 
 	"github.com/yuuki/xtsdb/internal/chunk"
@@ -89,14 +90,14 @@ func (f *fixture) add(t *testing.T, lset labels.Labels, samples ...model.Sample)
 // persist writes samples directly to the cold tier.
 func (f *fixture) persist(t *testing.T, id model.SeriesID, samples ...model.Sample) {
 	t.Helper()
-	data, err := chunk.EncodeXOR(samples)
+	enc, data, err := chunk.Encode(samples)
 	if err != nil {
 		t.Fatal(err)
 	}
 	start := layout.WindowStart(id, samples[0].T)
 	if err := f.cold.WriteChunk(context.Background(), storage.ColdChunk{
 		Series: id, Start: start, Fragment: 1, MaxT: samples[len(samples)-1].T,
-		Count: len(samples), Encoding: chunk.EncodingXOR, Data: data,
+		Count: len(samples), Encoding: enc, Data: data,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -570,5 +571,52 @@ func TestHotLookbackFollowsUnflushedChunks(t *testing.T) {
 	}
 	if len(got[id]) != 1 {
 		t.Fatal("a chunk still in the hot tier must stay visible beyond hot_lookback")
+	}
+}
+
+// Native histograms are returned by PromQL from both tiers.
+func TestNativeHistograms(t *testing.T) {
+	f := newFixture(t)
+	lset := labels.FromStrings("__name__", "request_duration_seconds", "job", "api")
+	hist := func(i int) *histogram.FloatHistogram {
+		return &histogram.FloatHistogram{
+			Schema: 0, Count: float64(10 * i), Sum: float64(5 * i), ZeroThreshold: 0.001,
+			PositiveSpans:   []histogram.Span{{Offset: 0, Length: 2}},
+			PositiveBuckets: []float64{float64(4 * i), float64(6 * i)}, // (0.5,1] and (1,2]
+		}
+	}
+	var hot, cold []model.Sample
+	for i := 1; i <= 10; i++ {
+		s := model.Sample{T: ms(time.Duration(i-10) * time.Minute), H: hist(i)}
+		if i <= 5 {
+			cold = append(cold, s)
+		} else {
+			hot = append(hot, s)
+		}
+	}
+	id := f.add(t, lset, hot...)
+	f.persist(t, id, cold...)
+
+	code, body := f.get(t, "/api/v1/query", url.Values{"query": {`histogram_count(request_duration_seconds)`}, "time": {fmt.Sprint(now.Unix())}})
+	if code != http.StatusOK {
+		t.Fatalf("status %d: %v", code, body)
+	}
+	if v := body["data"].(map[string]any)["result"].([]any)[0].(map[string]any)["value"].([]any)[1]; v != "100" {
+		t.Fatalf("histogram_count = %v, want 100", v)
+	}
+	// The rate spans both tiers: 10 observations per minute.
+	code, body = f.get(t, "/api/v1/query", url.Values{"query": {`histogram_count(rate(request_duration_seconds[10m]))`}, "time": {fmt.Sprint(now.Unix())}})
+	if code != http.StatusOK {
+		t.Fatalf("status %d: %v", code, body)
+	}
+	v, _ := strconv.ParseFloat(body["data"].(map[string]any)["result"].([]any)[0].(map[string]any)["value"].([]any)[1].(string), 64)
+	if math.Abs(v-10.0/60) > 1e-9 {
+		t.Fatalf("rate = %v, want 10/60", v)
+	}
+	// Raw histograms are rendered in the "histogram" field.
+	code, body = f.get(t, "/api/v1/query", url.Values{"query": {`request_duration_seconds`}, "time": {fmt.Sprint(now.Unix())}})
+	res := body["data"].(map[string]any)["result"].([]any)[0].(map[string]any)
+	if _, ok := res["histogram"]; code != http.StatusOK || !ok {
+		t.Fatalf("raw histogram not rendered: %d %v", code, res)
 	}
 }

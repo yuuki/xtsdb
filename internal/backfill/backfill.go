@@ -54,15 +54,15 @@ type Stats struct {
 	TooNew     atomic.Int64 // samples too far in the future, skipped
 	Invalid    atomic.Int64 // samples of series with invalid labels, skipped
 	Collisions atomic.Int64 // samples of series whose ID collides, skipped
-	Histograms atomic.Int64 // native histogram samples, not supported, skipped
+	Histograms atomic.Int64 // native histogram samples imported (part of Samples)
 }
 
 // String summarizes the stats.
 func (s *Stats) String() string {
-	return fmt.Sprintf("imported %d samples of %d series in %d chunks (%d bytes); skipped %d too old, %d too new, "+
-		"%d of invalid series, %d of colliding series, %d native histogram samples",
-		s.Samples.Load(), s.Series.Load(), s.Chunks.Load(), s.Bytes.Load(), s.TooOld.Load(), s.TooNew.Load(),
-		s.Invalid.Load(), s.Collisions.Load(), s.Histograms.Load())
+	return fmt.Sprintf("imported %d samples (%d native histograms) of %d series in %d chunks (%d bytes); "+
+		"skipped %d too old, %d too new, %d invalid, %d of colliding series",
+		s.Samples.Load(), s.Histograms.Load(), s.Series.Load(), s.Chunks.Load(), s.Bytes.Load(),
+		s.TooOld.Load(), s.TooNew.Load(), s.Invalid.Load(), s.Collisions.Load())
 }
 
 // indexKey identifies an index entry that was already written in this run.
@@ -123,6 +123,8 @@ func (im *Importer) Import(ctx context.Context, lset labels.Labels, samples []mo
 	kept := samples[:0]
 	for _, s := range samples {
 		switch {
+		case s.H != nil && s.H.Validate() != nil:
+			im.Stats.Invalid.Add(1)
 		case s.T < minT:
 			im.Stats.TooOld.Add(1)
 		case s.T > maxT:
@@ -166,6 +168,11 @@ func (im *Importer) Import(ctx context.Context, lset labels.Labels, samples []mo
 	}
 	im.Stats.Series.Add(1)
 	im.Stats.Samples.Add(int64(len(samples)))
+	for _, s := range samples {
+		if s.IsHistogram() {
+			im.Stats.Histograms.Add(1)
+		}
+	}
 	return nil
 }
 
