@@ -140,7 +140,8 @@ stateless and can be scaled horizontally:
   flushed yet; xtsdb logs a warning at startup otherwise.
 - Enable AOF (`appendonly yes`) and replicas: the hot tier holds the most
   recent `chunk_range` + `grace_period` of data.
-- Memory needed is roughly 16 bytes per sample held in Redis.
+- Memory needed is roughly 16 bytes per sample held in Redis, plus a small
+  sorted set per series with chunks in Redis (its window index).
 - Redis 7.0 or later (Valkey 7.2 or later) is required. No
   keyspace-notification or other special configuration is needed.
 

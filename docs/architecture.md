@@ -60,6 +60,7 @@ A window is *due* at `start + chunk_range + grace_period`.
 <prefix>:{N}:inf                           ZSET  member -> lease expiry (ms), claimed
 <prefix>:{N}:infdue                        ZSET  member -> due time (ms), claimed
 <prefix>:{N}:clock                         last fragment issued in the shard
+<prefix>:{N}:w:<series>                    ZSET  window start -> window start, chunks of the series
 <prefix>:{N}:q:<series>:<window>:<digest>  quarantined chunk (undecodable)
 <prefix>:{N}:qidx                          ZSET  quarantine key -> expiry time (ms)
 <prefix>:meta                              HASH  layout parameters (shards, chunk range)
@@ -337,6 +338,22 @@ same argument to hold.
 Redis is read for at least `querier.hot_lookback` and, using the oldest due
 time in the `due` and `infdue` sets (refreshed every 10 seconds), back to the
 oldest chunk Redis still holds, so data stays visible while flushing lags.
+
+**Window index.** Every series has a sorted set of the windows it holds in
+Redis (`<prefix>:{N}:w:<series>`). The append script adds a window when it
+creates its chunk; `complete` and `quarantine` remove it in the same atomic
+step that deletes or renames the chunk. A read first fetches the windows of
+every series in the range (`ZRANGEBYSCORE`, one command per series) and then
+only the chunks that exist (one `GET` per chunk), in pipelines. The cost of
+a read is therefore one command per series plus one per chunk, independent
+of the length of the range and of `chunk_range`; enumerating every possible
+window instead would cost `(range / chunk_range) + 1` commands per series,
+for example 361 with a 6 hour range and a one minute `chunk_range`, and more
+while flushing lags. Chunks written by builds that predate the window index
+are registered once, from the `due` and `inf` sets, when xtsdb starts and
+`<prefix>:meta` has no `window_index` field. Chunks created by such builds
+while they still run (during a rolling upgrade) are not indexed: upgrade
+the ingesters first, or all processes at once.
 
 ## Changes from 0.x
 

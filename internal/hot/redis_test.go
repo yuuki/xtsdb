@@ -21,7 +21,7 @@ import (
 // Integration tests run against a real server. Set XTSDB_TEST_REDIS_ADDRS
 // to a comma separated list of addresses (several addresses or
 // XTSDB_TEST_REDIS_CLUSTER=1 select cluster mode).
-func newTestStore(t *testing.T, layout model.Layout, lease time.Duration) (*Store, redis.UniversalClient) {
+func newTestStore(t testing.TB, layout model.Layout, lease time.Duration) (*Store, redis.UniversalClient) {
 	t.Helper()
 	addrs := os.Getenv("XTSDB_TEST_REDIS_ADDRS")
 	if addrs == "" {
@@ -47,7 +47,7 @@ func newTestStore(t *testing.T, layout model.Layout, lease time.Duration) (*Stor
 	return s, client
 }
 
-func deleteKeys(t *testing.T, client redis.UniversalClient, prefix string) {
+func deleteKeys(t testing.TB, client redis.UniversalClient, prefix string) {
 	ctx := context.Background()
 	del := func(ctx context.Context, c *redis.Client) error {
 		iter := c.Scan(ctx, 0, prefix+":*", 1000).Iterator()

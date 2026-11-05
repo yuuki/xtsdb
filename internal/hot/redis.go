@@ -8,6 +8,7 @@
 //	<prefix>:{N}:inf                  sorted set: chunk member -> lease expiry
 //	<prefix>:{N}:infdue               sorted set: in-flight member -> due time
 //	<prefix>:{N}:clock                last fragment issued in the shard
+//	<prefix>:{N}:w:<series>           sorted set: window starts of the series' chunks
 //	<prefix>:{N}:q:<series>:<window>:<digest>  quarantined (undecodable) chunk
 //	<prefix>:{N}:qidx                 sorted set: quarantine key -> expiry time
 //	<prefix>:meta                     hash: layout parameters
@@ -131,6 +132,9 @@ func New(ctx context.Context, client redis.UniversalClient, opts Options) (*Stor
 	if err := s.checkLayout(ctx); err != nil {
 		return nil, err
 	}
+	if err := s.buildWindowIndex(ctx); err != nil {
+		return nil, err
+	}
 	s.warnOnEviction(ctx)
 	return s, nil
 }
@@ -160,6 +164,50 @@ func (s *Store) checkLayout(ctx context.Context) error {
 	return nil
 }
 
+// windowIndexField marks in <prefix>:meta that every chunk is registered in
+// the window index of its series.
+const windowIndexField = "window_index"
+
+// buildWindowIndex registers the chunks of earlier versions, which did not
+// maintain window indexes, once. Every chunk is a member of the due set or
+// of the in-flight set of its shard.
+func (s *Store) buildWindowIndex(ctx context.Context) error {
+	key := s.prefix + ":meta"
+	done, err := s.client.HExists(ctx, key, windowIndexField).Result()
+	if err != nil {
+		return fmt.Errorf("redis meta: %w", err)
+	}
+	if done {
+		return nil
+	}
+	n := 0
+	for shard := range s.layout.Shards {
+		var members []string
+		for _, set := range []string{s.dueKey(shard), s.inflightKey(shard)} {
+			m, err := s.client.ZRange(ctx, set, 0, -1).Result()
+			if err != nil {
+				return fmt.Errorf("build window index: %w", err)
+			}
+			members = append(members, m...)
+		}
+		if err := s.pipelined(ctx, len(members), func(pipe redis.Pipeliner, i int) {
+			if id, start, err := parseMember(members[i]); err == nil {
+				pipe.ZAdd(ctx, s.windowsKey(shard, id), redis.Z{Score: float64(start), Member: start})
+			}
+		}); err != nil {
+			return fmt.Errorf("build window index: %w", err)
+		}
+		n += len(members)
+	}
+	if err := s.client.HSet(ctx, key, windowIndexField, "1").Err(); err != nil {
+		return fmt.Errorf("redis meta: %w", err)
+	}
+	if n > 0 {
+		s.logger.Info("registered existing chunks in the window index", "chunks", n)
+	}
+	return nil
+}
+
 // warnOnEviction logs a warning if Redis may evict keys, which would lose
 // samples that have not been flushed yet.
 func (s *Store) warnOnEviction(ctx context.Context) {
@@ -180,6 +228,12 @@ func (s *Store) inflightDueKey(shard int) string { return s.tag(shard) + ":infdu
 func (s *Store) clockKey(shard int) string       { return s.tag(shard) + ":clock" }
 func (s *Store) chunkKey(shard int, member string) string {
 	return s.tag(shard) + ":c:" + member
+}
+
+// windowsKey is the window index of a series: the starts of the windows it
+// has chunks for, so that reads touch only chunks that exist.
+func (s *Store) windowsKey(shard int, id model.SeriesID) string {
+	return s.tag(shard) + ":w:" + id.String()
 }
 
 // quarantineKey names a quarantined chunk after its content, so that two
@@ -220,6 +274,8 @@ func (s *Store) Ping(ctx context.Context) error { return s.client.Ping(ctx).Err(
 func (s *Store) Close() error { return s.client.Close() }
 
 type pendingChunk struct {
+	id      model.SeriesID
+	start   int64
 	member  string
 	due     int64
 	data    []byte
@@ -247,7 +303,7 @@ func (s *Store) Append(ctx context.Context, batch []storage.SeriesSamples) (stor
 			m := member(ss.ID, start)
 			c := chunks[m]
 			if c == nil {
-				c = &pendingChunk{member: m, due: s.layout.Due(start)}
+				c = &pendingChunk{id: ss.ID, start: start, member: m, due: s.layout.Due(start)}
 				chunks[m] = c
 			}
 			c.data = chunk.AppendRaw(c.data, []model.Sample{smp})
@@ -265,16 +321,16 @@ func (s *Store) Append(ctx context.Context, batch []storage.SeriesSamples) (stor
 		for len(members) > 0 {
 			n := min(len(members), maxChunksPerCall)
 			call := scriptCall{
-				keys:    make([]string, 0, n+3),
-				args:    make([]any, 0, 3*n+1),
+				keys:    make([]string, 0, 2*n+3),
+				args:    make([]any, 0, 4*n+1),
 				samples: make([]int, 0, n),
 			}
 			call.keys = append(call.keys, s.dueKey(shard), s.inflightKey(shard), s.clockKey(shard))
 			call.args = append(call.args, s.maxChunkBytes)
 			for _, m := range members[:n] {
 				c := chunks[m]
-				call.keys = append(call.keys, s.chunkKey(shard, m))
-				call.args = append(call.args, m, c.due, c.data)
+				call.keys = append(call.keys, s.chunkKey(shard, m), s.windowsKey(shard, c.id))
+				call.args = append(call.args, m, c.start, c.due, c.data)
 				call.samples = append(call.samples, c.samples)
 			}
 			calls = append(calls, call)
@@ -420,8 +476,9 @@ func (s *Store) quarantine(ctx context.Context, ref storage.ChunkRef, content []
 	qkey := s.quarantineKey(ref.Shard, m, content)
 	head := content[:min(len(content), chunk.HeaderLen)]
 	res, err := quarantineScript.Run(ctx, s.client,
-		[]string{s.inflightKey(ref.Shard), s.inflightDueKey(ref.Shard), s.chunkKey(ref.Shard, m), qkey, s.quarantineIndexKey(ref.Shard)},
-		m, head, len(content), s.quarantineTTL.Milliseconds(),
+		[]string{s.inflightKey(ref.Shard), s.inflightDueKey(ref.Shard), s.chunkKey(ref.Shard, m), qkey,
+			s.quarantineIndexKey(ref.Shard), s.windowsKey(ref.Shard, ref.Series)},
+		m, head, len(content), s.quarantineTTL.Milliseconds(), ref.Start,
 	).Int()
 	switch {
 	case err != nil:
@@ -476,8 +533,8 @@ func (s *Store) finish(ctx context.Context, items []finishItem) error {
 			call := scriptCall{keys: []string{s.inflightKey(shard), s.inflightDueKey(shard)}}
 			for _, it := range its[:n] {
 				m := member(it.ref.Series, it.ref.Start)
-				call.keys = append(call.keys, s.chunkKey(shard, m))
-				call.args = append(call.args, m, it.header, it.size)
+				call.keys = append(call.keys, s.chunkKey(shard, m), s.windowsKey(shard, it.ref.Series))
+				call.args = append(call.args, m, it.ref.Start, it.header, it.size)
 			}
 			calls = append(calls, call)
 			its = its[n:]
@@ -489,16 +546,41 @@ func (s *Store) finish(ctx context.Context, items []finishItem) error {
 
 // Read returns the samples of the given series within [mint, maxt] that are
 // currently held in Redis.
+//
+// It first reads the window index of every series, then only the chunks
+// that exist, so that it issues one command per series plus one per chunk,
+// whatever the length of [mint, maxt] and the chunk range.
 func (s *Store) Read(ctx context.Context, ids []model.SeriesID, mint, maxt int64) (map[model.SeriesID][]model.Sample, error) {
+	if maxt < mint {
+		return map[model.SeriesID][]model.Sample{}, nil
+	}
+	windows := make([]*redis.StringSliceCmd, len(ids))
+	if err := s.pipelined(ctx, len(ids), func(pipe redis.Pipeliner, i int) {
+		id := ids[i]
+		windows[i] = pipe.ZRangeByScore(ctx, s.windowsKey(s.layout.Shard(id), id), &redis.ZRangeBy{
+			Min: strconv.FormatInt(s.layout.WindowStart(id, mint), 10),
+			Max: strconv.FormatInt(s.layout.WindowStart(id, maxt), 10),
+		})
+	}); err != nil {
+		return nil, err
+	}
 	type lookup struct {
 		id  model.SeriesID
 		key string
 	}
 	var lookups []lookup
-	for _, id := range ids {
+	for i, id := range ids {
+		if err := windows[i].Err(); err != nil && !errors.Is(err, redis.Nil) {
+			return nil, fmt.Errorf("read window index: %w", err)
+		}
 		shard := s.layout.Shard(id)
-		for _, w := range s.layout.Windows(id, mint, maxt) {
-			lookups = append(lookups, lookup{id: id, key: s.chunkKey(shard, member(id, w))})
+		for _, w := range windows[i].Val() {
+			start, err := strconv.ParseInt(w, 10, 64)
+			if err != nil {
+				s.logger.Warn("skipping invalid window index entry", "series", id, "entry", w)
+				continue
+			}
+			lookups = append(lookups, lookup{id: id, key: s.chunkKey(shard, member(id, start))})
 		}
 	}
 	cmds := make([]*redis.StringCmd, len(lookups))
@@ -511,7 +593,7 @@ func (s *Store) Read(ctx context.Context, ids []model.SeriesID, mint, maxt int64
 	for i, cmd := range cmds {
 		b, err := cmd.Bytes()
 		if errors.Is(err, redis.Nil) {
-			continue
+			continue // completed since the window index was read
 		}
 		if err != nil {
 			return nil, fmt.Errorf("read chunk: %w", err)
