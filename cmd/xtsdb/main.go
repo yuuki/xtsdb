@@ -32,11 +32,24 @@ Commands:
   flusher    Move closed chunks from Redis to Cassandra
   querier    Serve the Prometheus-compatible query API
   migrate    Create or update the Cassandra schema and exit
+  import     Import historical data (Prometheus TSDB blocks, OpenMetrics)
   quarantine Inspect or delete undecodable chunks kept in Redis
   config     Print the effective configuration and exit
   version    Print version information and exit
 
 Run 'xtsdb <command> -h' for the flags of a command.
+`
+
+const importUsage = `Usage: xtsdb import [flags] <path>...
+
+Imports historical samples directly into Cassandra, bypassing Redis.
+With -format=tsdb, each path is a Prometheus data directory or a block
+directory; with -format=openmetrics, each path is an OpenMetrics text file
+in which every sample has a timestamp ("-" reads standard input). Importing
+the same data again is safe; -state-file skips the blocks and files that
+were imported completely.
+
+Flags:
 `
 
 const quarantineUsage = `Usage:
@@ -85,13 +98,29 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if sub == "delete" {
 		all = fs.Bool("all", false, "Delete every quarantined chunk.")
 	}
+	var imp importOptions
+	if cmd == "import" {
+		fs.StringVar(&imp.format, "format", "tsdb", "Input format: tsdb (Prometheus TSDB blocks) or openmetrics.")
+		fs.StringVar(&imp.stateFile, "state-file", "", "File recording the blocks and files imported completely; they are skipped when the import is run again.")
+		fs.IntVar(&imp.concurrency, "concurrency", 16, "Series imported at a time.")
+		fs.IntVar(&imp.maxBuffered, "max-buffered-samples", 10_000_000,
+			"OpenMetrics: samples held in memory before they are imported (about 16 bytes each).")
+		fs.Usage = func() {
+			fmt.Fprint(stderr, importUsage)
+			fs.PrintDefaults()
+		}
+	}
 	if err := fs.Parse(rest); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
 		return 2
 	}
-	if fs.NArg() > 0 && sub != "delete" {
+	if cmd == "import" && fs.NArg() == 0 {
+		fs.Usage()
+		return 2
+	}
+	if fs.NArg() > 0 && sub != "delete" && cmd != "import" {
 		fmt.Fprintf(stderr, "error: unexpected argument %q (flags must come after the command, e.g. xtsdb %s -config.file=...)\n", fs.Arg(0), name)
 		return 2
 	}
@@ -140,6 +169,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "migrate":
 		if err := cassandra.Migrate(ctx, cfg.Cassandra, logger); err != nil {
 			logger.Error("migration failed", "err", err)
+			return 1
+		}
+		return 0
+	case "import":
+		if err := runImport(ctx, cfg, logger, imp, fs.Args(), stdout); err != nil {
+			logger.Error("import failed", "err", err)
 			return 1
 		}
 		return 0

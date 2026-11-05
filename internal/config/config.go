@@ -384,8 +384,8 @@ func (c *Config) Validate() error {
 	check(c.Storage.IndexBuckets >= 1 && c.Storage.IndexBuckets <= 256, "storage.index_buckets must be in [1, 256]")
 	// Index entries live two days longer than samples, within Cassandra's
 	// 20 year TTL limit.
-	check(c.Storage.Retention.D() >= 0 && c.Storage.Retention.D() <= 20*365*24*time.Hour-48*time.Hour,
-		"storage.retention must be between 0 (forever) and 20y minus 2d")
+	check(c.Storage.Retention.D() == 0 || (c.Storage.Retention.D() >= 24*time.Hour && c.Storage.Retention.D() <= 20*365*24*time.Hour-48*time.Hour),
+		"storage.retention must be 0 (forever) or between 1d and 20y minus 2d")
 	check(c.Ingester.MaxRequestBodySize > 0 && c.Ingester.MaxRequestBodySize <= 1<<30,
 		"ingester.max_request_body_size must be in (0, 1GiB]")
 	check(c.Ingester.MaxDecompressedSize >= c.Ingester.MaxRequestBodySize && c.Ingester.MaxDecompressedSize <= 1<<30,

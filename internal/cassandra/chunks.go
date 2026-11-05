@@ -26,13 +26,27 @@ func TTLSeconds(retention time.Duration) int {
 	return int(min(retention, maxTTL) / time.Second)
 }
 
+// ttlUntil returns the TTL of a row that must be kept until keepUntil, and
+// false if that time has passed. retention 0 keeps rows forever.
+func ttlUntil(retention time.Duration, keepUntil, now time.Time) (int, bool) {
+	if retention <= 0 {
+		return 0, true
+	}
+	left := keepUntil.Sub(now)
+	if left < time.Second {
+		return 0, false
+	}
+	return TTLSeconds(left), true
+}
+
 // ChunkStore is a storage.ColdStore backed by Cassandra.
 type ChunkStore struct {
 	session         *gocql.Session
-	ttl             int
+	retention       time.Duration
 	chunkRange      int64
 	readConcurrency int
 	logger          *slog.Logger
+	now             func() time.Time
 }
 
 var _ storage.ColdStore = (*ChunkStore)(nil)
@@ -46,20 +60,29 @@ func NewChunkStore(s *gocql.Session, retention time.Duration, chunkRange int64, 
 	}
 	return &ChunkStore{
 		session:         s,
-		ttl:             TTLSeconds(retention),
+		retention:       retention,
 		chunkRange:      chunkRange,
 		readConcurrency: readConcurrency,
 		logger:          logger,
+		now:             time.Now,
 	}
 }
 
 // WriteChunk stores a chunk. The primary key makes the write idempotent.
+//
+// The chunk expires storage.retention after its last sample, so that
+// imported history is not kept longer than recent data. A chunk that is
+// already older than that is not written.
 func (c *ChunkStore) WriteChunk(ctx context.Context, ch storage.ColdChunk) error {
+	ttl, ok := ttlUntil(c.retention, time.UnixMilli(ch.MaxT).Add(c.retention), c.now())
+	if !ok {
+		return nil
+	}
 	err := c.session.Query(`INSERT INTO chunks
 		(series_id, day, start_ms, fragment, total, digest, part, max_t, samples, encoding, data)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL ?`,
 		int64(ch.Series), model.Day(ch.Start), ch.Start, ch.Fragment, ch.Total, int64(ch.Digest), ch.Part,
-		ch.MaxT, ch.Count, int8(ch.Encoding), ch.Data, c.ttl,
+		ch.MaxT, ch.Count, int8(ch.Encoding), ch.Data, ttl,
 	).Idempotent(true).ExecContext(ctx)
 	if err != nil {
 		return fmt.Errorf("write chunk %s@%d: %w", ch.Series, ch.Start, err)

@@ -20,6 +20,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/yuuki/xtsdb/internal/chunk"
+	"github.com/yuuki/xtsdb/internal/model"
 	"github.com/yuuki/xtsdb/internal/storage"
 )
 
@@ -257,35 +258,51 @@ func (f *Flusher) flushBatch(ctx context.Context, refs []storage.ChunkRef) int {
 const samplesPerPart = 100_000
 
 func (f *Flusher) persist(ctx context.Context, c storage.HotChunk) error {
-	if len(c.Samples) == 0 {
-		return nil
+	n, err := WriteCold(ctx, f.cold, c.Ref.Series, c.Ref.Start, c.Fragment, c.Records, c.Samples)
+	f.bytes.Add(float64(n))
+	if err != nil {
+		return err
 	}
-	digest := xxhash.Sum64(chunk.AppendRaw(nil, c.Samples))
-	for part, i := 0, 0; i < len(c.Samples); part, i = part+1, i+samplesPerPart {
-		samples := c.Samples[i:min(i+samplesPerPart, len(c.Samples))]
-		data, err := chunk.EncodeXOR(samples)
+	f.samples.Add(float64(len(c.Samples)))
+	return nil
+}
+
+// WriteCold writes one version of a chunk window to the cold tier, in parts
+// of at most 100,000 samples, and returns the number of compressed bytes
+// written. samples must be sorted and de-duplicated; total is the number of
+// records of the version (see storage.ColdChunk). Writing the same version
+// again writes the same rows.
+func WriteCold(ctx context.Context, cold storage.ColdStore, series model.SeriesID, start, fragment int64,
+	total int, samples []model.Sample) (int, error) {
+	if len(samples) == 0 {
+		return 0, nil
+	}
+	digest := xxhash.Sum64(chunk.AppendRaw(nil, samples))
+	written := 0
+	for part, i := 0, 0; i < len(samples); part, i = part+1, i+samplesPerPart {
+		p := samples[i:min(i+samplesPerPart, len(samples))]
+		data, err := chunk.EncodeXOR(p)
 		if err != nil {
-			return err
+			return written, err
 		}
-		err = f.cold.WriteChunk(ctx, storage.ColdChunk{
-			Series:   c.Ref.Series,
-			Start:    c.Ref.Start,
-			Fragment: c.Fragment,
-			Total:    c.Records,
+		err = cold.WriteChunk(ctx, storage.ColdChunk{
+			Series:   series,
+			Start:    start,
+			Fragment: fragment,
+			Total:    total,
 			Digest:   digest,
 			Part:     part,
-			MaxT:     samples[len(samples)-1].T,
-			Count:    len(samples),
+			MaxT:     p[len(p)-1].T,
+			Count:    len(p),
 			Encoding: chunk.EncodingXOR,
 			Data:     data,
 		})
 		if err != nil {
-			return err
+			return written, err
 		}
-		f.bytes.Add(float64(len(data)))
+		written += len(data)
 	}
-	f.samples.Add(float64(len(c.Samples)))
-	return nil
+	return written, nil
 }
 
 // reportBacklog periodically exports how much work is waiting.

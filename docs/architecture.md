@@ -235,8 +235,11 @@ CREATE TABLE chunks (
 large versions into rows of at most 100,000 samples. The blob is a sequence
 of length-prefixed Prometheus XOR chunks of sorted, de-duplicated samples
 (Gorilla encoding; typically 1–2 bytes per sample compared to 16 in Redis).
-Rows carry `USING TTL` from `storage.retention`, and TWCS drops whole
-SSTables when they expire.
+A row expires `storage.retention` after its last sample (`USING TTL`), and
+TWCS drops whole SSTables when they expire. Index entries of a day expire two
+days after the samples of that day; series rows two days after they were
+last written. Data that is already older than the retention is not written,
+which matters for imports.
 
 `total` is the number of samples appended to the incarnation in Redis,
 including samples that were overwritten by a later sample with the same
@@ -262,6 +265,24 @@ that sorts last wins:
 All of this matters only when a client writes different values for the same
 timestamp of a series and, around the same time, Redis fails over, is
 restored or its clock steps.
+
+## Imports
+
+`xtsdb import` reads Prometheus TSDB blocks (with the index, chunks and
+tombstones readers of the Prometheus TSDB; deleted samples are left out) or
+OpenMetrics text, and writes every series the way the ingester and the
+flusher together would: index entries first, for every day the series has
+samples on (with the same collision detection), then one version per chunk
+window, cut on the same window boundaries.
+
+Imported versions have fragment 0. Every fragment issued by the hot tier is
+a timestamp in microseconds, so imported versions sort before ingested ones
+and lose wherever both have a sample at the same timestamp: an import fills
+gaps but never overrides data xtsdb received itself. The fragment being
+constant also makes imports idempotent: importing the same samples again
+writes the same primary keys. A window cut in several parts (two blocks
+that both cover it, or OpenMetrics input imported in slices to bound memory)
+is stored as several versions, which reads merge.
 
 ## Series index (Cassandra)
 

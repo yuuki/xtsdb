@@ -103,7 +103,9 @@ remote_write:
 
 Samples are accepted until their chunk window closes. Older samples are
 rejected (remote write answers `400` with a description), which bounds
-backfill to `chunk_range` + `grace_period`. Remote write requests are limited
+backfill through remote write to `chunk_range` + `grace_period`; use
+`xtsdb import` for older data (see [Importing history](#importing-history)).
+Remote write requests are limited
 in size and number of elements, and at most
 `ingester.max_inflight_requests` are processed at once (others get 503 and
 are retried by Prometheus); see [examples/xtsdb.yaml](examples/xtsdb.yaml).
@@ -111,6 +113,37 @@ are retried by Prometheus); see [examples/xtsdb.yaml](examples/xtsdb.yaml).
 Graphite lines are written at most one second after they arrive. Graphite
 cannot report errors to its clients, so rejected and dropped lines are only
 visible in the metrics below and in the logs.
+
+## Importing history
+
+`xtsdb import` writes historical samples directly into Cassandra, as the
+flusher would, and indexes them for every day they cover. Use it to migrate
+from Prometheus, to re-ingest data lost in an outage longer than the grace
+period, or to load data exported from 0.x.
+
+```bash
+# Prometheus TSDB blocks: a data directory or a single block. Take a
+# snapshot (POST /api/v1/admin/tsdb/snapshot) or stop Prometheus first, so
+# that its head is written as a block.
+xtsdb import -config.file=xtsdb.yaml -state-file=import.state /prometheus/snapshots/20261105T161114Z-756e151f4435217b
+
+# OpenMetrics text in which every sample has a timestamp, the input format of
+# `promtool tsdb create-blocks-from openmetrics` ("-" reads standard input).
+xtsdb import -config.file=xtsdb.yaml -format=openmetrics history.om
+```
+
+- Importing the same data again writes the same rows, so an interrupted
+  import can simply be run again; with `-state-file`, blocks and files that
+  were imported completely are skipped.
+- Imported samples never override samples xtsdb ingested itself: where both
+  exist for a timestamp, the ingested one wins. Imports fill gaps.
+- Samples older than `storage.retention` are skipped, and imported samples
+  expire `storage.retention` after their timestamp, like ingested ones.
+- Native histograms are counted and skipped. A series whose ID collides
+  with another series is skipped and logged.
+- Only Cassandra is needed; the import checks that `storage.chunk_range` and
+  `storage.index_buckets` match the values the data was written with.
+  `-concurrency` (16) sets how many series are written at a time.
 
 ## Querying
 
@@ -152,7 +185,8 @@ stateless and can be scaled horizontally:
   `QUORUM`): reads must see what flushers wrote, otherwise queries can miss
   data while it moves between tiers.
 - Samples and index entries expire through TTLs set from
-  `storage.retention`; chunk and postings tables use
+  `storage.retention` (counted from the time of the data, so `retention` must
+  be 0 or at least a day); chunk and postings tables use
   `TimeWindowCompactionStrategy`.
 
 **Security.** By default xtsdb's own listeners are neither encrypted nor
@@ -251,8 +285,8 @@ Cassandra 5.0.9, Prometheus 3.15.1 and Grafana 13.3.0.
   reports the dropped histograms instead of silently losing them.
 - No multi-tenancy, remote read, downsampling or recording rules.
   Authentication distinguishes writers from readers, not tenants.
-- Samples older than their closed chunk window are rejected, so large
-  backfills are not possible.
+- Samples older than their closed chunk window are rejected by remote write
+  and Graphite; history is loaded with `xtsdb import`.
 - A series can hold at most about two million samples per chunk window in
   Redis (32 MiB); more are rejected as `chunk_full`.
 - Queries reach back at most `storage.retention`, or

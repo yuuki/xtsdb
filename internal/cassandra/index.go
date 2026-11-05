@@ -18,8 +18,10 @@ import (
 )
 
 // Index is a storage.IndexWriter and storage.IndexReader backed by
-// Cassandra. Index entries live one day longer than samples so that a
-// series stays discoverable for as long as any of its samples exist.
+// Cassandra. The entries of a day expire two days after the samples of that
+// day, so that a series stays discoverable for as long as any of its samples
+// exist; entries of days whose samples have already expired are not
+// written. Series rows expire two days after their last write.
 //
 // Postings and label values are spread over a fixed number of buckets per
 // day and label (storage.index_buckets), so that a label pair shared by
@@ -28,10 +30,14 @@ import (
 // parallel.
 type Index struct {
 	session         *gocql.Session
-	ttl             int
+	retention       time.Duration
 	readConcurrency int
 	buckets         int
+	now             func() time.Time
 }
+
+// indexSlack is how much longer index entries live than samples.
+const indexSlack = 48 * time.Hour
 
 var (
 	_ storage.IndexWriter = (*Index)(nil)
@@ -41,11 +47,23 @@ var (
 // NewIndex creates an Index with the given number of buckets, which must
 // match the one the index was written with (see CheckLayout).
 func NewIndex(s *gocql.Session, retention time.Duration, readConcurrency, buckets int) *Index {
-	ttl := 0
-	if retention > 0 {
-		ttl = TTLSeconds(retention + 48*time.Hour)
+	return &Index{session: s, retention: retention, readConcurrency: readConcurrency, buckets: max(buckets, 1), now: time.Now}
+}
+
+// dayTTL returns the TTL of the entries of a day, and false if the samples
+// of that day have expired.
+func (x *Index) dayTTL(day int32) (int, bool) {
+	end := time.UnixMilli((int64(day) + 1) * model.DayMillis)
+	return ttlUntil(x.retention, end.Add(x.retention+indexSlack), x.now())
+}
+
+// seriesTTL is the TTL of a series row, refreshed every day the series is
+// written.
+func (x *Index) seriesTTL() int {
+	if x.retention <= 0 {
+		return 0
 	}
-	return &Index{session: s, ttl: ttl, readConcurrency: readConcurrency, buckets: max(buckets, 1)}
+	return TTLSeconds(x.retention + indexSlack)
 }
 
 // postingsBucket and valueBucket place index entries in buckets. They are
@@ -66,29 +84,33 @@ func valueBucket(value string, buckets int) int16 {
 // postings are written and a *storage.SeriesCollisionError is returned.
 // The ingester does this once per series and day.
 func (x *Index) WriteSeries(ctx context.Context, day int32, id model.SeriesID, lset labels.Labels) error {
+	ttl, ok := x.dayTTL(day)
+	if !ok {
+		return nil
+	}
 	m := lset.Map()
 	var existing map[string]string
 	applied, err := x.session.Query(`UPDATE series USING TTL ? SET labels = ? WHERE series_id = ? IF labels IN (?, null)`,
-		x.ttl, m, int64(id), m).Idempotent(true).ScanCASContext(ctx, &existing)
+		x.seriesTTL(), m, int64(id), m).Idempotent(true).ScanCASContext(ctx, &existing)
 	if err != nil {
 		return fmt.Errorf("index series %s: %w", id, err)
 	}
 	if !applied {
 		return &storage.SeriesCollisionError{ID: id, Labels: lset, Existing: labels.FromMap(existing)}
 	}
-	if err := x.writePostings(ctx, day, id, lset); err != nil {
+	if err := x.writePostings(ctx, day, id, lset, ttl); err != nil {
 		return fmt.Errorf("index series %s: %w", id, err)
 	}
 	return nil
 }
 
-func (x *Index) writePostings(ctx context.Context, day int32, id model.SeriesID, lset labels.Labels) error {
+func (x *Index) writePostings(ctx context.Context, day int32, id model.SeriesID, lset labels.Labels, ttl int) error {
 	g, ctx := errgroup.WithContext(ctx)
 	bucket := postingsBucket(id, x.buckets)
 	lset.Range(func(l labels.Label) {
 		g.Go(func() error {
 			return x.session.Query(`INSERT INTO postings (day, name, value, bucket, series_id) VALUES (?, ?, ?, ?, ?) USING TTL ?`,
-				day, l.Name, l.Value, bucket, int64(id), x.ttl).Idempotent(true).ExecContext(ctx)
+				day, l.Name, l.Value, bucket, int64(id), ttl).Idempotent(true).ExecContext(ctx)
 		})
 	})
 	return g.Wait()
@@ -96,8 +118,12 @@ func (x *Index) writePostings(ctx context.Context, day int32, id model.SeriesID,
 
 // WriteLabelValue records that a label value exists on a day.
 func (x *Index) WriteLabelValue(ctx context.Context, day int32, name, value string) error {
+	ttl, ok := x.dayTTL(day)
+	if !ok {
+		return nil
+	}
 	err := x.session.Query(`INSERT INTO label_values (day, name, bucket, value) VALUES (?, ?, ?, ?) USING TTL ?`,
-		day, name, valueBucket(value, x.buckets), value, x.ttl).Idempotent(true).ExecContext(ctx)
+		day, name, valueBucket(value, x.buckets), value, ttl).Idempotent(true).ExecContext(ctx)
 	if err != nil {
 		return fmt.Errorf("index label value: %w", err)
 	}
@@ -106,8 +132,12 @@ func (x *Index) WriteLabelValue(ctx context.Context, day int32, name, value stri
 
 // WriteLabelName records that a label name exists on a day.
 func (x *Index) WriteLabelName(ctx context.Context, day int32, name string) error {
+	ttl, ok := x.dayTTL(day)
+	if !ok {
+		return nil
+	}
 	err := x.session.Query(`INSERT INTO label_names (day, name) VALUES (?, ?) USING TTL ?`,
-		day, name, x.ttl).Idempotent(true).ExecContext(ctx)
+		day, name, ttl).Idempotent(true).ExecContext(ctx)
 	if err != nil {
 		return fmt.Errorf("index label name: %w", err)
 	}

@@ -64,7 +64,7 @@ func encode(t *testing.T, samples []model.Sample) []byte {
 func TestChunkStore(t *testing.T) {
 	s := newTestSession(t)
 	const hour = int64(time.Hour / time.Millisecond)
-	store := NewChunkStore(s, 24*time.Hour, hour, 8, nil)
+	store := NewChunkStore(s, 0, hour, 8, nil)
 	ctx := context.Background()
 
 	id := model.SeriesID(0x8000000000000001) // exercises negative bigint
@@ -109,7 +109,7 @@ func TestChunkStore(t *testing.T) {
 func TestChunkVersionsAndParts(t *testing.T) {
 	s := newTestSession(t)
 	const hour = int64(time.Hour / time.Millisecond)
-	store := NewChunkStore(s, 24*time.Hour, hour, 8, nil)
+	store := NewChunkStore(s, 0, hour, 8, nil)
 	ctx := context.Background()
 	id := model.SeriesID(77)
 	start := int64(20_000) * model.DayMillis
@@ -143,7 +143,7 @@ func TestChunkVersionsAndParts(t *testing.T) {
 func TestChunkVersionPrecedence(t *testing.T) {
 	s := newTestSession(t)
 	const hour = int64(time.Hour / time.Millisecond)
-	store := NewChunkStore(s, 24*time.Hour, hour, 8, nil)
+	store := NewChunkStore(s, 0, hour, 8, nil)
 	ctx := context.Background()
 	start := int64(20_000) * model.DayMillis
 	write := func(id model.SeriesID, frag int64, total int, digest uint64, v float64) {
@@ -188,7 +188,7 @@ func TestChunkVersionPrecedence(t *testing.T) {
 
 func TestIndex(t *testing.T) {
 	s := newTestSession(t)
-	x := NewIndex(s, 24*time.Hour, 8, 4)
+	x := NewIndex(s, 0, 8, 4)
 	ctx := context.Background()
 	const day = int32(20_000)
 
@@ -257,7 +257,7 @@ func TestBucketsGolden(t *testing.T) {
 func TestIndexBuckets(t *testing.T) {
 	s := newTestSession(t)
 	const buckets = 4
-	x := NewIndex(s, 24*time.Hour, 8, buckets)
+	x := NewIndex(s, 0, 8, buckets)
 	ctx := context.Background()
 	const day = int32(20_000)
 	var want []model.SeriesID
@@ -300,14 +300,17 @@ func TestIndexBuckets(t *testing.T) {
 func TestCheckLayout(t *testing.T) {
 	s := newTestSession(t)
 	ctx := context.Background()
-	if err := CheckLayout(ctx, s, 16); err != nil {
+	if err := CheckLayout(ctx, s, 16, time.Hour); err != nil {
 		t.Fatal(err)
 	}
-	if err := CheckLayout(ctx, s, 16); err != nil {
+	if err := CheckLayout(ctx, s, 16, time.Hour); err != nil {
 		t.Fatalf("same layout: %v", err)
 	}
-	if err := CheckLayout(ctx, s, 8); err == nil || !strings.Contains(err.Error(), "index_buckets") {
+	if err := CheckLayout(ctx, s, 8, time.Hour); err == nil || !strings.Contains(err.Error(), "index_buckets") {
 		t.Fatalf("expected an index_buckets mismatch, got %v", err)
+	}
+	if err := CheckLayout(ctx, s, 16, time.Minute); err == nil || !strings.Contains(err.Error(), "chunk_range") {
+		t.Fatalf("expected a chunk_range mismatch, got %v", err)
 	}
 }
 
@@ -353,7 +356,7 @@ func TestPostingsStress(t *testing.T) {
 		series  = 1_000_000
 		buckets = 16
 	)
-	x := NewIndex(s, 24*time.Hour, 64, buckets)
+	x := NewIndex(s, 0, 64, buckets)
 	ctx := context.Background()
 	const day = int32(20_000)
 	lset := labels.FromStrings("__name__", "container_cpu_usage_seconds_total")
@@ -362,7 +365,7 @@ func TestPostingsStress(t *testing.T) {
 	g.SetLimit(512)
 	for i := range series {
 		g.Go(func() error {
-			return x.writePostings(gctx, day, model.SeriesID(rand.Uint64()|uint64(i)<<44), lset)
+			return x.writePostings(gctx, day, model.SeriesID(rand.Uint64()|uint64(i)<<44), lset, 3600)
 		})
 	}
 	if err := g.Wait(); err != nil {
@@ -398,7 +401,7 @@ func TestIndexDetectsCollisions(t *testing.T) {
 	s := newTestSession(t)
 	x := NewIndex(s, 24*time.Hour, 8, 4)
 	ctx := context.Background()
-	const day = int32(20_000)
+	day := model.Day(time.Now().UnixMilli())
 	id := model.SeriesID(0x8000000000000042)
 	a := labels.FromStrings("__name__", "up", "job", "api")
 	b := labels.FromStrings("__name__", "up", "job", "db")
@@ -426,6 +429,52 @@ func TestIndexDetectsCollisions(t *testing.T) {
 	var ttl int
 	if err := s.Query(`SELECT TTL(labels) FROM series WHERE series_id = ?`, int64(id)).Scan(&ttl); err != nil || ttl <= 0 {
 		t.Fatalf("series row must carry a TTL: %d %v", ttl, err)
+	}
+}
+
+// Rows expire storage.retention after the time of their data, not after
+// they were written, so that imported history expires like recent data.
+func TestTTLFollowsDataTime(t *testing.T) {
+	s := newTestSession(t)
+	ctx := context.Background()
+	const hour = int64(time.Hour / time.Millisecond)
+	now := time.Now()
+	store := NewChunkStore(s, 24*time.Hour, hour, 8, nil)
+	write := func(id model.SeriesID, maxT int64) {
+		t.Helper()
+		start := maxT - 1000
+		err := store.WriteChunk(ctx, storage.ColdChunk{Series: id, Start: start, MaxT: maxT, Count: 1,
+			Encoding: chunk.EncodingXOR, Data: encode(t, []model.Sample{{T: maxT, V: 1}})})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(1, now.Add(-23*time.Hour).UnixMilli())
+	write(2, now.Add(-25*time.Hour).UnixMilli())
+	var ttl int
+	if err := s.Query(`SELECT TTL(data) FROM chunks WHERE series_id = 1 ALLOW FILTERING`).Scan(&ttl); err != nil {
+		t.Fatal(err)
+	}
+	if ttl <= 0 || ttl > 3600 {
+		t.Fatalf("a chunk 23h old with 24h retention must expire within an hour, TTL %d", ttl)
+	}
+	var n int
+	if err := s.Query(`SELECT COUNT(*) FROM chunks WHERE series_id = 2 ALLOW FILTERING`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("a chunk older than the retention must not be written: %d %v", n, err)
+	}
+
+	x := NewIndex(s, 24*time.Hour, 8, 1)
+	today := model.Day(now.UnixMilli())
+	for _, day := range []int32{today, today - 3, today - 4} {
+		if err := x.WriteLabelName(ctx, day, "job"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for day, want := range map[int32]bool{today: true, today - 3: true, today - 4: false} {
+		names, err := x.LabelNames(ctx, day)
+		if err != nil || (len(names) == 1) != want {
+			t.Errorf("day %d: names %v (%v), want present=%v", today-day, names, err, want)
+		}
 	}
 }
 

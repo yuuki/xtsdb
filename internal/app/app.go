@@ -97,7 +97,7 @@ func New(ctx context.Context, target Target, cfg *config.Config, logger *slog.Lo
 	}
 	retention := cfg.Storage.Retention.D()
 	cold := cassandra.NewChunkStore(a.session, retention, layout.ChunkRange, cfg.Querier.ReadConcurrency, logger)
-	if err := cassandra.CheckLayout(ctx, a.session, cfg.Storage.IndexBuckets); err != nil {
+	if err := cassandra.CheckLayout(ctx, a.session, cfg.Storage.IndexBuckets, cfg.Storage.ChunkRange.D()); err != nil {
 		return nil, err
 	}
 	index := cassandra.NewIndex(a.session, retention, cfg.Querier.ReadConcurrency, cfg.Storage.IndexBuckets)

@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 
@@ -153,20 +154,26 @@ func checkBucketedTables(ctx context.Context, s *gocql.Session, keyspace string)
 	return nil
 }
 
-// CheckLayout records the index layout on first use and refuses to run
-// with a different one: changing the number of buckets would make existing
-// index entries unreachable.
-func CheckLayout(ctx context.Context, s *gocql.Session, indexBuckets int) error {
-	want := strconv.Itoa(indexBuckets)
-	existing := make(map[string]any)
-	applied, err := s.Query(`INSERT INTO meta (name, value) VALUES ('index_buckets', ?) IF NOT EXISTS`, want).
-		MapScanCASContext(ctx, existing)
-	if err != nil {
-		return fmt.Errorf("cassandra meta: %w (run xtsdb migrate)", err)
+// CheckLayout records the layout of the Cassandra data on first use and
+// refuses to run with a different one: changing the number of index buckets
+// would make index entries unreachable, and changing the chunk range would
+// make reads miss chunks that start before the queried range.
+func CheckLayout(ctx context.Context, s *gocql.Session, indexBuckets int, chunkRange time.Duration) error {
+	fields := []struct{ name, value, option string }{
+		{"index_buckets", strconv.Itoa(indexBuckets), "storage.index_buckets"},
+		{"chunk_range_ms", strconv.FormatInt(chunkRange.Milliseconds(), 10), "storage.chunk_range"},
 	}
-	if got, _ := existing["value"].(string); !applied && got != want {
-		return fmt.Errorf("storage.index_buckets is %s but the index in Cassandra was written with %s; "+
-			"changing it is not supported", want, got)
+	for _, f := range fields {
+		existing := make(map[string]any)
+		applied, err := s.Query(`INSERT INTO meta (name, value) VALUES (?, ?) IF NOT EXISTS`, f.name, f.value).
+			MapScanCASContext(ctx, existing)
+		if err != nil {
+			return fmt.Errorf("cassandra meta: %w (run xtsdb migrate)", err)
+		}
+		if got, _ := existing["value"].(string); !applied && got != f.value {
+			return fmt.Errorf("%s is %s but the data in Cassandra was written with %s (%s); "+
+				"changing it is not supported", f.option, f.value, got, f.name)
+		}
 	}
 	return nil
 }
