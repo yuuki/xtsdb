@@ -3,15 +3,20 @@ package ingest
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/klauspost/compress/s2"
 	"github.com/klauspost/compress/snappy"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/prompb"
@@ -29,6 +34,7 @@ func newTestWriter(t *testing.T) (*Writer, *storagetest.Hot, *storagetest.Index)
 	index := storagetest.NewIndex()
 	w, err := NewWriter(hot, index, WriterOptions{
 		MaxSampleFuture:       10 * time.Minute,
+		MaxSampleAge:          time.Duration(testLayout.ChunkRange+testLayout.Grace)*time.Millisecond + time.Minute,
 		IndexCacheSize:        1000,
 		IndexWriteConcurrency: 4,
 	})
@@ -41,7 +47,7 @@ func newTestWriter(t *testing.T) (*Writer, *storagetest.Hot, *storagetest.Index)
 func readAll(t *testing.T, hot *storagetest.Hot, lset labels.Labels) []model.Sample {
 	t.Helper()
 	id := model.ID(lset)
-	got, err := hot.Read(context.Background(), []model.SeriesID{id}, 0, time.Now().Add(time.Hour).UnixMilli())
+	got, err := hot.Read(context.Background(), []model.SeriesID{id}, time.Now().Add(-6*time.Hour).UnixMilli(), time.Now().Add(time.Hour).UnixMilli())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +154,7 @@ func TestParseGraphiteLine(t *testing.T) {
 
 func TestGraphiteServer(t *testing.T) {
 	w, hot, _ := newTestWriter(t)
-	g := NewGraphiteServer("127.0.0.1:0", w, nil, slog.New(slog.DiscardHandler))
+	g := NewGraphiteServer("127.0.0.1:0", 16, w, nil, slog.New(slog.DiscardHandler))
 	if err := g.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -175,6 +181,13 @@ func TestGraphiteServer(t *testing.T) {
 	t.Fatal("graphite samples were not stored")
 }
 
+var testRWOptions = RemoteWriteOptions{
+	MaxBodySize:         1 << 20,
+	MaxDecompressedSize: 4 << 20,
+	MaxInflight:         4,
+	Limits:              Limits{MaxSeries: 1000, MaxSamples: 10_000},
+}
+
 func post(t *testing.T, h http.Handler, contentType string, body []byte) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/write", bytes.NewReader(snappy.Encode(nil, body)))
@@ -189,7 +202,7 @@ func post(t *testing.T, h http.Handler, contentType string, body []byte) *httpte
 
 func TestRemoteWriteV1(t *testing.T) {
 	w, hot, _ := newTestWriter(t)
-	h := RemoteWriteHandler(w, 1<<20, slog.New(slog.DiscardHandler))
+	h := RemoteWriteHandler(w, testRWOptions, slog.New(slog.DiscardHandler))
 	now := time.Now().UnixMilli()
 	req := &prompb.WriteRequest{Timeseries: []prompb.TimeSeries{{
 		Labels:  []prompb.Label{{Name: "job", Value: "x"}, {Name: "__name__", Value: "up"}},
@@ -220,7 +233,7 @@ func TestRemoteWriteV1(t *testing.T) {
 
 func TestRemoteWriteV2(t *testing.T) {
 	w, hot, index := newTestWriter(t)
-	h := RemoteWriteHandler(w, 1<<20, slog.New(slog.DiscardHandler))
+	h := RemoteWriteHandler(w, testRWOptions, slog.New(slog.DiscardHandler))
 	st := writev2.NewSymbolTable()
 	lset := labels.FromStrings("__name__", "http_requests_total", "code", "200")
 	now := time.Now().UnixMilli()
@@ -253,5 +266,192 @@ func TestRemoteWriteV2(t *testing.T) {
 	body, _ = req.Marshal()
 	if rec := post(t, h, "application/x-protobuf;proto=io.prometheus.write.v2.Request", body); rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status %d, want 503 so that the sender retries", rec.Code)
+	}
+}
+
+func TestWriterRejectsExtremeTimestampsBeforeIndexing(t *testing.T) {
+	w, hot, index := newTestWriter(t)
+	now := time.Now().UnixMilli()
+	res, err := w.Write(context.Background(), []Series{
+		{Labels: labels.FromStrings("__name__", "a"), Samples: []model.Sample{{T: math.MinInt64, V: 1}, {T: now, V: 1}}},
+		{Labels: labels.FromStrings("__name__", "b"), Samples: []model.Sample{{T: 1000, V: 1}, {T: now, V: 1}}},
+		{Labels: labels.FromStrings("__name__", "c"), Samples: []model.Sample{{T: math.MaxInt64, V: 1}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Accepted != 2 || res.TooOld != 2 || res.TooNew != 1 {
+		t.Fatalf("unexpected result %+v", res)
+	}
+	// Two series on one (or two, around midnight) days: never thousands.
+	if index.Writes > 2*5 {
+		t.Fatalf("too-old samples caused %d index writes", index.Writes)
+	}
+	if hot.Len() != 2 {
+		t.Fatalf("hot chunks = %d", hot.Len())
+	}
+}
+
+func TestRemoteWriteLimits(t *testing.T) {
+	w, _, _ := newTestWriter(t)
+	h := RemoteWriteHandler(w, testRWOptions, slog.New(slog.DiscardHandler))
+
+	// Decompresses beyond max_decompressed_size.
+	if rec := post(t, h, "", make([]byte, 5<<20)); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized payload: status %d", rec.Code)
+	}
+	// Many empty time series: tiny on the wire, huge once decoded.
+	bomb := bytes.Repeat([]byte{0x0a, 0x00}, 2000)
+	if rec := post(t, h, "", bomb); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("series bomb: status %d: %s", rec.Code, rec.Body)
+	}
+	// Many empty samples inside one series.
+	inner := bytes.Repeat([]byte{0x12, 0x00}, 20_000)
+	one := append([]byte{0x0a}, binary.AppendUvarint(nil, uint64(len(inner)))...)
+	if rec := post(t, h, "", append(one, inner...)); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("sample bomb: status %d: %s", rec.Code, rec.Body)
+	}
+	// The S2 "repeat offset" extension gives near-unbounded compression
+	// ratios; the strict Snappy decoder rejects it before anything is
+	// allocated.
+	s2bomb := s2.EncodeBest(nil, bytes.Repeat([]byte{0x0a, 0x00}, 1<<20))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/write", bytes.NewReader(s2bomb))
+	req.Header.Set("Content-Encoding", "snappy")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "snappy") {
+		t.Fatalf("s2 bomb (%d bytes): status %d: %s", len(s2bomb), rec.Code, rec.Body)
+	}
+}
+
+func TestRemoteWriteRejectsHistogramsButKeepsFloats(t *testing.T) {
+	w, hot, _ := newTestWriter(t)
+	h := RemoteWriteHandler(w, testRWOptions, slog.New(slog.DiscardHandler))
+	now := time.Now().UnixMilli()
+	req := &prompb.WriteRequest{Timeseries: []prompb.TimeSeries{
+		{Labels: []prompb.Label{{Name: "__name__", Value: "f"}}, Samples: []prompb.Sample{{Timestamp: now, Value: 1}}},
+		{Labels: []prompb.Label{{Name: "__name__", Value: "h"}}, Histograms: []prompb.Histogram{{Timestamp: now}}},
+	}}
+	body, _ := req.Marshal()
+	rec := post(t, h, "", body)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "histogram") {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	if got := readAll(t, hot, labels.FromStrings("__name__", "f")); len(got) != 1 {
+		t.Fatal("float samples of the same request must be stored")
+	}
+}
+
+func TestParseGraphiteRejectsHugeTimestamps(t *testing.T) {
+	for _, ts := range []string{"1e300", "-1e300", "Inf", "1e12"} {
+		if _, _, err := ParseGraphiteLine("a 1 "+ts, time.Now()); err == nil {
+			t.Errorf("timestamp %s must be rejected", ts)
+		}
+	}
+}
+
+func startGraphite(t *testing.T, maxConns int) (*GraphiteServer, *storagetest.Hot) {
+	t.Helper()
+	w, hot, _ := newTestWriter(t)
+	g := NewGraphiteServer("127.0.0.1:0", maxConns, w, nil, slog.New(slog.DiscardHandler))
+	if err := g.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { g.Stop(context.Background()) })
+	return g, hot
+}
+
+func countStored(t *testing.T, hot *storagetest.Hot, name string) int {
+	return len(readAll(t, hot, labels.FromStrings("__name__", name)))
+}
+
+func TestGraphiteFlushesWhileDataKeepsFlowing(t *testing.T) {
+	g, hot := startGraphite(t, 16)
+	conn, err := net.Dial("tcp", g.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	base := time.Now().Unix() - 100
+	// A line every 200ms: the connection never goes quiet for a full second.
+	for i := range 12 {
+		fmt.Fprintf(conn, "steady %d %d\n", i, base+int64(i))
+		time.Sleep(200 * time.Millisecond)
+	}
+	if n := countStored(t, hot, "steady"); n < 6 {
+		t.Fatalf("only %d of 12 lines stored while the connection is open", n)
+	}
+}
+
+func TestGraphiteConnectionLimit(t *testing.T) {
+	g, _ := startGraphite(t, 2)
+	var open []net.Conn
+	for range 2 {
+		c, err := net.Dial("tcp", g.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		open = append(open, c)
+	}
+	time.Sleep(100 * time.Millisecond)
+	extra, err := net.Dial("tcp", g.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer extra.Close()
+	_ = extra.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := extra.Read(make([]byte, 1)); err == nil || isTimeout(err) {
+		t.Fatalf("connection beyond the limit must be closed, got %v", err)
+	}
+	_ = open
+}
+
+func TestGraphiteUDP(t *testing.T) {
+	g, hot := startGraphite(t, 16)
+	conn, err := net.Dial("udp", g.UDPAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	ts := time.Now().Unix()
+	const n = 2000
+	for i := range n {
+		fmt.Fprintf(conn, "udp.metric;i=%d %d %d\n", i, i, ts)
+	}
+	stored := func() int {
+		c := 0
+		for i := range n {
+			c += len(readAll(t, hot, labels.FromStrings("__name__", "udp.metric", "i", strconv.Itoa(i))))
+		}
+		return c
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && stored() < n {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if c := stored(); c < n*95/100 { // UDP may drop a few in the kernel
+		t.Fatalf("stored %d of %d UDP lines", c, n)
+	}
+}
+
+func TestGraphiteStopIsPromptAndFlushes(t *testing.T) {
+	g, hot := startGraphite(t, 16)
+	conn, err := net.Dial("tcp", g.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	fmt.Fprintf(conn, "pending 1 %d\n", time.Now().Unix())
+	time.Sleep(50 * time.Millisecond) // the line is read but not yet flushed
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	g.Stop(ctx) // the client keeps its connection open
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("Stop took %v with an idle client connected", d)
+	}
+	if countStored(t, hot, "pending") != 1 {
+		t.Fatal("buffered line was not written on shutdown")
 	}
 }

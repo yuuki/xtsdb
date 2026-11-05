@@ -25,9 +25,11 @@ type APIOptions struct {
 	LookbackDelta time.Duration
 	Timeout       time.Duration
 	MaxSamples    int
-	Registerer    prometheus.Registerer
-	Logger        *slog.Logger
-	BuildInfo     map[string]string
+	// MaxConcurrentQueries bounds queries evaluated at once; others wait.
+	MaxConcurrentQueries int
+	Registerer           prometheus.Registerer
+	Logger               *slog.Logger
+	BuildInfo            map[string]string
 }
 
 // API serves a Prometheus-compatible HTTP API, so that Grafana and other
@@ -38,6 +40,7 @@ type API struct {
 	parser parser.Parser
 	opts   APIOptions
 	now    func() time.Time
+	gate   chan struct{}
 }
 
 // maxPointsPerSeries mirrors the Prometheus range query resolution limit.
@@ -64,7 +67,24 @@ func NewAPI(q *Queryable, opts APIOptions) *API {
 		NoStepSubqueryIntervalFn: func(int64) int64 { return time.Minute.Milliseconds() },
 		Parser:                   p,
 	})
-	return &API{q: q, engine: engine, parser: p, opts: opts, now: time.Now}
+	if opts.MaxConcurrentQueries <= 0 {
+		opts.MaxConcurrentQueries = 20
+	}
+	return &API{q: q, engine: engine, parser: p, opts: opts, now: time.Now, gate: make(chan struct{}, opts.MaxConcurrentQueries)}
+}
+
+// acquire waits for a query slot. Every endpoint that reads storage holds
+// one, and is bounded by the query timeout.
+func (a *API) acquire(r *http.Request) (context.Context, func(), *apiError) {
+	ctx, cancel := context.WithTimeout(r.Context(), a.opts.Timeout)
+	select {
+	case a.gate <- struct{}{}:
+		return ctx, func() { <-a.gate; cancel() }, nil
+	case <-ctx.Done():
+		cancel()
+		return nil, nil, &apiError{typ: "timeout", code: http.StatusServiceUnavailable,
+			err: errors.New("timed out waiting for a free query slot")}
+	}
 }
 
 // Register adds the API routes to mux.
@@ -177,17 +197,20 @@ func (a *API) queryRange(r *http.Request) apiResult {
 }
 
 func (a *API) withTimeout(r *http.Request) (context.Context, context.CancelFunc, *apiError) {
-	ctx := r.Context()
+	ctx, release, aerr := a.acquire(r)
+	if aerr != nil {
+		return nil, nil, aerr
+	}
 	if s := r.FormValue("timeout"); s != "" {
 		d, err := parseDuration(s)
 		if err != nil {
+			release()
 			return nil, nil, badData(fmt.Errorf("invalid parameter \"timeout\": %w", err))
 		}
 		c, cancel := context.WithTimeout(ctx, d)
-		return c, cancel, nil
+		return c, func() { cancel(); release() }, nil
 	}
-	c, cancel := context.WithCancel(ctx)
-	return c, cancel, nil
+	return ctx, release, nil
 }
 
 func (a *API) exec(ctx context.Context, qry promql.Query, qs string) apiResult {
@@ -217,6 +240,8 @@ func classify(err error) *apiError {
 		return &apiError{typ: "canceled", code: 499, err: err}
 	case errors.Is(err, ErrNoPositiveMatcher):
 		return badData(err)
+	case errors.Is(err, ErrUnavailable):
+		return &apiError{typ: "unavailable", code: http.StatusServiceUnavailable, err: err}
 	case errors.Is(err, ErrTooManySeries), errors.As(err, &tooMany):
 		return &apiError{typ: "execution", code: http.StatusUnprocessableEntity, err: err}
 	}
@@ -288,14 +313,21 @@ func (a *API) series(r *http.Request) apiResult {
 	if aerr != nil {
 		return apiResult{err: aerr}
 	}
+	ctx, release, aerr := a.acquire(r)
+	if aerr != nil {
+		return apiResult{err: aerr}
+	}
+	defer release()
 	seen := make(map[string]struct{})
 	out := []labels.Labels{}
 	var warnings []string
+	truncated := false
 	for _, ms := range sets {
-		refs, err := a.q.Series(r.Context(), mint, maxt, ms...)
+		refs, trunc, err := a.q.Series(ctx, mint, maxt, limit, ms...)
 		if err != nil {
 			return apiResult{err: classify(err)}
 		}
+		truncated = truncated || trunc
 		for _, ref := range refs {
 			key := ref.lset.String()
 			if _, ok := seen[key]; ok {
@@ -304,17 +336,22 @@ func (a *API) series(r *http.Request) apiResult {
 			seen[key] = struct{}{}
 			out = append(out, ref.lset)
 		}
+		if maxSeries := a.q.opts.MaxSeriesPerQuery; limit <= 0 && maxSeries > 0 && len(out) > maxSeries {
+			return apiResult{err: classify(fmt.Errorf("%w: more than %d", ErrTooManySeries, maxSeries))}
+		}
 	}
 	slices.SortFunc(out, labels.Compare)
 	if limit > 0 && len(out) > limit {
-		out = out[:limit]
+		out, truncated = out[:limit], true
+	}
+	if truncated {
 		warnings = append(warnings, "results truncated due to limit")
 	}
 	return apiResult{data: out, warnings: warnings}
 }
 
 func (a *API) labelNames(r *http.Request) apiResult {
-	return a.labelStrings(r, func(ctx context.Context, mint, maxt int64, limit int, ms []*labels.Matcher) ([]string, error) {
+	return a.labelStrings(r, func(ctx context.Context, mint, maxt int64, limit int, ms []*labels.Matcher) ([]string, bool, error) {
 		return a.q.LabelNames(ctx, mint, maxt, limit, ms...)
 	})
 }
@@ -324,12 +361,12 @@ func (a *API) labelValues(r *http.Request) apiResult {
 	if name == "" {
 		return apiResult{err: badData(errors.New("invalid label name"))}
 	}
-	return a.labelStrings(r, func(ctx context.Context, mint, maxt int64, limit int, ms []*labels.Matcher) ([]string, error) {
+	return a.labelStrings(r, func(ctx context.Context, mint, maxt int64, limit int, ms []*labels.Matcher) ([]string, bool, error) {
 		return a.q.LabelValues(ctx, mint, maxt, name, limit, ms...)
 	})
 }
 
-func (a *API) labelStrings(r *http.Request, get func(context.Context, int64, int64, int, []*labels.Matcher) ([]string, error)) apiResult {
+func (a *API) labelStrings(r *http.Request, get func(context.Context, int64, int64, int, []*labels.Matcher) ([]string, bool, error)) apiResult {
 	mint, maxt, aerr := a.timeRange(r)
 	if aerr != nil {
 		return apiResult{err: aerr}
@@ -345,9 +382,14 @@ func (a *API) labelStrings(r *http.Request, get func(context.Context, int64, int
 	if len(sets) == 0 {
 		sets = [][]*labels.Matcher{nil}
 	}
+	ctx, release, aerr := a.acquire(r)
+	if aerr != nil {
+		return apiResult{err: aerr}
+	}
+	defer release()
 	set := make(map[string]struct{})
 	for _, ms := range sets {
-		vals, err := get(r.Context(), mint, maxt, 0, ms)
+		vals, _, err := get(ctx, mint, maxt, 0, ms)
 		if err != nil {
 			return apiResult{err: classify(err)}
 		}
@@ -355,7 +397,12 @@ func (a *API) labelStrings(r *http.Request, get func(context.Context, int64, int
 			set[v] = struct{}{}
 		}
 	}
-	return apiResult{data: sortedLimit(set, limit)}
+	out, truncated := sortedLimit(set, limit)
+	res := apiResult{data: out}
+	if truncated {
+		res.warnings = []string{"results truncated due to limit"}
+	}
+	return res
 }
 
 type response struct {
@@ -388,22 +435,41 @@ func writeResult(w http.ResponseWriter, logger *slog.Logger, res apiResult) {
 	_, _ = w.Write(b)
 }
 
+// Prometheus clients send these for "no bound" (time.Unix(math.MinInt64/1000+62135596801, 0)
+// and its maximum counterpart, formatted as RFC 3339).
+var (
+	minTimeFormatted = time.Unix(math.MinInt64/1000+62135596801, 0).UTC().Format(time.RFC3339Nano)
+	maxTimeFormatted = time.Unix(math.MaxInt64/1000-62135596801, 999999999).UTC().Format(time.RFC3339Nano)
+)
+
+// maxSeconds keeps timestamps representable in int64 milliseconds.
+const maxSeconds = float64(math.MaxInt64/1000) / 2
+
 // parseTime accepts Unix timestamps in seconds (with optional fraction) and
-// RFC 3339 times, like Prometheus.
+// RFC 3339 times, like Prometheus. Out-of-range values are clamped; queries
+// are bounded by retention anyway.
 func parseTime(s string) (time.Time, error) {
 	if s == "" {
 		return time.Time{}, errors.New("missing value")
 	}
+	switch s {
+	case minTimeFormatted:
+		return time.UnixMilli(-int64(maxSeconds) * 1000).UTC(), nil
+	case maxTimeFormatted:
+		return time.UnixMilli(int64(maxSeconds) * 1000).UTC(), nil
+	}
 	if t, err := strconv.ParseFloat(s, 64); err == nil {
-		if math.IsNaN(t) || math.IsInf(t, 0) || math.Abs(t) > 1e11 {
-			return time.Time{}, fmt.Errorf("timestamp %q out of range", s)
+		if math.IsNaN(t) {
+			return time.Time{}, fmt.Errorf("cannot parse %q to a valid timestamp", s)
 		}
+		t = max(-maxSeconds, min(maxSeconds, t))
 		sec, frac := math.Modf(t)
 		frac = math.Round(frac*1000) / 1000
 		return time.Unix(int64(sec), int64(frac*float64(time.Second))).UTC(), nil
 	}
 	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
-		return t, nil
+		ms := max(-int64(maxSeconds)*1000, min(int64(maxSeconds)*1000, t.UnixMilli()))
+		return time.UnixMilli(ms).UTC(), nil
 	}
 	return time.Time{}, fmt.Errorf("cannot parse %q to a valid timestamp", s)
 }

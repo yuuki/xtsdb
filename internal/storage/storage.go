@@ -18,10 +18,12 @@ type SeriesSamples struct {
 }
 
 // AppendResult reports how many samples were stored and how many were
-// rejected because their chunk window had already closed.
+// rejected because their chunk window had already closed or their chunk
+// reached the maximum size.
 type AppendResult struct {
-	Accepted int
-	TooOld   int
+	Accepted  int
+	TooOld    int
+	ChunkFull int
 }
 
 // ChunkRef identifies a chunk of the hot tier.
@@ -35,6 +37,7 @@ type ChunkRef struct {
 type HotChunk struct {
 	Ref      ChunkRef
 	Fragment int64 // identifies this incarnation of the chunk
+	Size     int   // encoded size when loaded; used to detect later appends
 	Samples  []model.Sample
 }
 
@@ -42,7 +45,8 @@ type HotChunk struct {
 type Backlog struct {
 	PendingChunks  int64 // chunks not yet claimed, open or closed
 	InflightChunks int64 // chunks claimed by a flusher
-	OldestDue      int64 // earliest due time of a pending chunk in ms; 0 if none
+	OldestDue      int64 // earliest due time of any chunk in ms; 0 if none
+	OldestStart    int64 // window start of that chunk in ms; 0 if none
 }
 
 // HotStore is the in-memory tier. Samples are appended to per-series time
@@ -52,10 +56,14 @@ type Backlog struct {
 type HotStore interface {
 	Append(ctx context.Context, batch []SeriesSamples) (AppendResult, error)
 	Claim(ctx context.Context, shard, limit int) ([]ChunkRef, error)
-	// Load returns the chunks that still exist. Chunks completed by another
-	// flusher in the meantime are omitted.
-	Load(ctx context.Context, refs []ChunkRef) ([]HotChunk, error)
+	// Load returns the claimed chunks that still exist, and the refs of
+	// those that do not (completed by another flusher in the meantime).
+	Load(ctx context.Context, refs []ChunkRef) (chunks []HotChunk, missing []ChunkRef, err error)
+	// Complete deletes persisted chunks. A chunk that changed since it was
+	// loaded is kept and re-processed after its lease expires.
 	Complete(ctx context.Context, chunks []HotChunk) error
+	// Release drops the in-flight entries of chunks that no longer exist.
+	Release(ctx context.Context, refs []ChunkRef) error
 	Read(ctx context.Context, ids []model.SeriesID, mint, maxt int64) (map[model.SeriesID][]model.Sample, error)
 	Backlog(ctx context.Context) (Backlog, error)
 	Shards() int
@@ -63,19 +71,28 @@ type HotStore interface {
 	Close() error
 }
 
-// ColdChunk is a compressed chunk in the persistent tier.
+// ColdChunk is one part of a compressed chunk in the persistent tier.
+//
+// A hot chunk is persisted as one or more parts. (Fragment, Total, Digest)
+// identify the version of the chunk that was persisted: if the same window
+// is persisted again with different content (for example after Redis was
+// restored from an older snapshot), it is stored as a separate version
+// instead of overwriting a more complete one. Reads merge all versions.
 type ColdChunk struct {
 	Series   model.SeriesID
 	Start    int64
 	Fragment int64
+	Total    int    // samples in the whole chunk
+	Digest   uint64 // hash of the whole chunk's samples
+	Part     int
 	MaxT     int64
-	Count    int
+	Count    int // samples in this part
 	Encoding chunk.Encoding
 	Data     []byte
 }
 
 // ColdStore is the persistent tier. Writes must be idempotent: writing the
-// same (Series, Start, Fragment) twice stores it once.
+// same (Series, Start, Fragment, Total, Digest, Part) twice stores it once.
 type ColdStore interface {
 	WriteChunk(ctx context.Context, c ColdChunk) error
 	Read(ctx context.Context, ids []model.SeriesID, mint, maxt int64) (map[model.SeriesID][]model.Sample, error)

@@ -6,6 +6,7 @@
 //	<prefix>:{N}:c:<series>:<window>  chunk: 16-byte header + raw samples
 //	<prefix>:{N}:due                  sorted set: chunk member -> due time
 //	<prefix>:{N}:inf                  sorted set: chunk member -> lease expiry
+//	<prefix>:{N}:infdue               sorted set: in-flight member -> due time
 //	<prefix>:{N}:q:<series>:<window>  quarantined (undecodable) chunk
 //	<prefix>:meta                     hash: layout parameters
 package hot
@@ -34,11 +35,25 @@ const (
 	maxPipelineCmds  = 1024
 )
 
+// SetLogger routes the Redis client library's own log lines to slog.
+func SetLogger(l *slog.Logger) {
+	redis.SetLogger(redisLogger{l.With("component", "redis")})
+}
+
+type redisLogger struct{ l *slog.Logger }
+
+func (r redisLogger) Printf(ctx context.Context, format string, v ...any) {
+	r.l.WarnContext(ctx, fmt.Sprintf(format, v...))
+}
+
 // NewClient creates a Redis client from configuration.
 func NewClient(cfg config.RedisConfig) (redis.UniversalClient, error) {
 	tlsCfg, err := cfg.TLS.Build()
 	if err != nil {
 		return nil, fmt.Errorf("redis tls: %w", err)
+	}
+	if slices.Contains(cfg.Addrs, "") {
+		return nil, errors.New("redis.addrs contains an empty address")
 	}
 	if (cfg.ClusterMode || len(cfg.Addrs) > 1) && cfg.MasterName == "" && cfg.DB != 0 {
 		return nil, errors.New("redis.db must be 0 in cluster mode")
@@ -59,21 +74,28 @@ func NewClient(cfg config.RedisConfig) (redis.UniversalClient, error) {
 	}), nil
 }
 
+// DefaultMaxChunkBytes bounds the size of one chunk (about 2 million
+// samples). It keeps every chunk well below the Redis string limit and
+// fast to load; samples beyond it are rejected.
+const DefaultMaxChunkBytes = 32 << 20
+
 // Options configures a Store.
 type Options struct {
-	Prefix string
-	Layout model.Layout
-	Lease  time.Duration
-	Logger *slog.Logger
+	Prefix        string
+	Layout        model.Layout
+	Lease         time.Duration
+	MaxChunkBytes int // DefaultMaxChunkBytes if zero
+	Logger        *slog.Logger
 }
 
 // Store is a storage.HotStore backed by Redis.
 type Store struct {
-	client redis.UniversalClient
-	prefix string
-	layout model.Layout
-	lease  time.Duration
-	logger *slog.Logger
+	client        redis.UniversalClient
+	prefix        string
+	layout        model.Layout
+	lease         time.Duration
+	maxChunkBytes int
+	logger        *slog.Logger
 }
 
 var _ storage.HotStore = (*Store)(nil)
@@ -84,12 +106,16 @@ func New(ctx context.Context, client redis.UniversalClient, opts Options) (*Stor
 	if opts.Logger == nil {
 		opts.Logger = slog.New(slog.DiscardHandler)
 	}
+	if opts.MaxChunkBytes <= 0 {
+		opts.MaxChunkBytes = DefaultMaxChunkBytes
+	}
 	s := &Store{
-		client: client,
-		prefix: opts.Prefix,
-		layout: opts.Layout,
-		lease:  opts.Lease,
-		logger: opts.Logger,
+		client:        client,
+		prefix:        opts.Prefix,
+		layout:        opts.Layout,
+		lease:         opts.Lease,
+		maxChunkBytes: opts.MaxChunkBytes,
+		logger:        opts.Logger,
 	}
 	if err := client.Ping(ctx).Err(); err != nil {
 		return nil, fmt.Errorf("redis ping: %w", err)
@@ -101,19 +127,27 @@ func New(ctx context.Context, client redis.UniversalClient, opts Options) (*Stor
 	return s, nil
 }
 
+// checkLayout records the layout on first use and refuses to run with a
+// different one: changing the shard count or the chunk range would make
+// existing chunks unreachable.
 func (s *Store) checkLayout(ctx context.Context) error {
 	key := s.prefix + ":meta"
-	shards := strconv.Itoa(s.layout.Shards)
-	if err := s.client.HSetNX(ctx, key, "shards", shards).Err(); err != nil {
-		return fmt.Errorf("redis meta: %w", err)
+	fields := []struct{ name, value, option string }{
+		{"shards", strconv.Itoa(s.layout.Shards), "storage.shards"},
+		{"chunk_range_ms", strconv.FormatInt(s.layout.ChunkRange, 10), "storage.chunk_range"},
 	}
-	got, err := s.client.HGet(ctx, key, "shards").Result()
-	if err != nil {
-		return fmt.Errorf("redis meta: %w", err)
-	}
-	if got != shards {
-		return fmt.Errorf("storage.shards is %s but the data in Redis was written with %s shards; "+
-			"changing the number of shards is not supported", shards, got)
+	for _, f := range fields {
+		if err := s.client.HSetNX(ctx, key, f.name, f.value).Err(); err != nil {
+			return fmt.Errorf("redis meta: %w", err)
+		}
+		got, err := s.client.HGet(ctx, key, f.name).Result()
+		if err != nil {
+			return fmt.Errorf("redis meta: %w", err)
+		}
+		if got != f.value {
+			return fmt.Errorf("%s is %s but the data in Redis was written with %s (%s); "+
+				"changing it is not supported", f.option, f.value, got, f.name)
+		}
 	}
 	return nil
 }
@@ -132,8 +166,9 @@ func (s *Store) warnOnEviction(ctx context.Context) {
 
 func (s *Store) tag(shard int) string { return s.prefix + ":{" + strconv.Itoa(shard) + "}" }
 
-func (s *Store) dueKey(shard int) string      { return s.tag(shard) + ":due" }
-func (s *Store) inflightKey(shard int) string { return s.tag(shard) + ":inf" }
+func (s *Store) dueKey(shard int) string         { return s.tag(shard) + ":due" }
+func (s *Store) inflightKey(shard int) string    { return s.tag(shard) + ":inf" }
+func (s *Store) inflightDueKey(shard int) string { return s.tag(shard) + ":infdue" }
 func (s *Store) chunkKey(shard int, member string) string {
 	return s.tag(shard) + ":c:" + member
 }
@@ -218,10 +253,11 @@ func (s *Store) Append(ctx context.Context, batch []storage.SeriesSamples) (stor
 			n := min(len(members), maxChunksPerCall)
 			call := scriptCall{
 				keys:    make([]string, 0, n+2),
-				args:    make([]any, 0, 3*n),
+				args:    make([]any, 0, 3*n+1),
 				samples: make([]int, 0, n),
 			}
 			call.keys = append(call.keys, s.dueKey(shard), s.inflightKey(shard))
+			call.args = append(call.args, s.maxChunkBytes)
 			for _, m := range members[:n] {
 				c := chunks[m]
 				call.keys = append(call.keys, s.chunkKey(shard, m))
@@ -239,22 +275,28 @@ func (s *Store) Append(ctx context.Context, batch []storage.SeriesSamples) (stor
 	}
 	var res storage.AppendResult
 	for i, call := range calls {
-		rejected, err := results[i].Int64Slice()
-		if err != nil {
-			return storage.AppendResult{}, fmt.Errorf("append: unexpected reply: %w", err)
+		reply, err := results[i].Slice()
+		if err != nil || len(reply) != 2 {
+			return storage.AppendResult{}, fmt.Errorf("append: unexpected reply %v: %w", reply, err)
+		}
+		count := func(v any) int {
+			idxs, _ := v.([]any)
+			n := 0
+			for _, x := range idxs {
+				if idx, ok := x.(int64); ok && idx >= 0 && int(idx) < len(call.samples) {
+					n += call.samples[idx]
+				}
+			}
+			return n
 		}
 		total := 0
 		for _, n := range call.samples {
 			total += n
 		}
-		tooOld := 0
-		for _, idx := range rejected {
-			if idx >= 0 && int(idx) < len(call.samples) {
-				tooOld += call.samples[idx]
-			}
-		}
+		tooOld, full := count(reply[0]), count(reply[1])
 		res.TooOld += tooOld
-		res.Accepted += total - tooOld
+		res.ChunkFull += full
+		res.Accepted += total - tooOld - full
 	}
 	return res, nil
 }
@@ -301,7 +343,7 @@ func (s *Store) runScripts(ctx context.Context, script *redis.Script, calls []sc
 // Claim leases up to limit closed chunks of a shard.
 func (s *Store) Claim(ctx context.Context, shard, limit int) ([]storage.ChunkRef, error) {
 	members, err := claimScript.Run(ctx, s.client,
-		[]string{s.dueKey(shard), s.inflightKey(shard)},
+		[]string{s.dueKey(shard), s.inflightKey(shard), s.inflightDueKey(shard)},
 		limit, s.lease.Milliseconds(),
 	).StringSlice()
 	if err != nil {
@@ -313,6 +355,7 @@ func (s *Store) Claim(ctx context.Context, shard, limit int) ([]storage.ChunkRef
 		if err != nil {
 			s.logger.Error("dropping invalid in-flight member", "shard", shard, "member", m, "err", err)
 			_ = s.client.ZRem(ctx, s.inflightKey(shard), m).Err()
+			_ = s.client.ZRem(ctx, s.inflightDueKey(shard), m).Err()
 			continue
 		}
 		refs = append(refs, storage.ChunkRef{Shard: shard, Series: id, Start: start})
@@ -321,37 +364,41 @@ func (s *Store) Claim(ctx context.Context, shard, limit int) ([]storage.ChunkRef
 }
 
 // Load reads claimed chunks. Undecodable chunks are quarantined and skipped.
-func (s *Store) Load(ctx context.Context, refs []storage.ChunkRef) ([]storage.HotChunk, error) {
+func (s *Store) Load(ctx context.Context, refs []storage.ChunkRef) ([]storage.HotChunk, []storage.ChunkRef, error) {
 	cmds := make([]*redis.StringCmd, len(refs))
 	if err := s.pipelined(ctx, len(refs), func(pipe redis.Pipeliner, i int) {
 		cmds[i] = pipe.Get(ctx, s.chunkKey(refs[i].Shard, member(refs[i].Series, refs[i].Start)))
 	}); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	out := make([]storage.HotChunk, 0, len(refs))
+	var (
+		out     = make([]storage.HotChunk, 0, len(refs))
+		missing []storage.ChunkRef
+	)
 	for i, cmd := range cmds {
 		b, err := cmd.Bytes()
 		if errors.Is(err, redis.Nil) {
-			continue // already completed by another flusher
+			missing = append(missing, refs[i])
+			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("load chunk: %w", err)
+			return nil, nil, fmt.Errorf("load chunk: %w", err)
 		}
 		frag, samples, err := chunk.DecodeHot(b)
 		if err != nil {
 			s.quarantine(ctx, refs[i], err)
 			continue
 		}
-		out = append(out, storage.HotChunk{Ref: refs[i], Fragment: frag, Samples: samples})
+		out = append(out, storage.HotChunk{Ref: refs[i], Fragment: frag, Size: len(b), Samples: samples})
 	}
-	return out, nil
+	return out, missing, nil
 }
 
 func (s *Store) quarantine(ctx context.Context, ref storage.ChunkRef, cause error) {
 	m := member(ref.Series, ref.Start)
 	s.logger.Error("quarantining undecodable chunk", "shard", ref.Shard, "member", m, "err", cause)
 	err := quarantineScript.Run(ctx, s.client,
-		[]string{s.inflightKey(ref.Shard), s.chunkKey(ref.Shard, m), s.quarantineKey(ref.Shard, m)},
+		[]string{s.inflightKey(ref.Shard), s.inflightDueKey(ref.Shard), s.chunkKey(ref.Shard, m), s.quarantineKey(ref.Shard, m)},
 		m,
 	).Err()
 	if err != nil {
@@ -359,24 +406,48 @@ func (s *Store) quarantine(ctx context.Context, ref storage.ChunkRef, cause erro
 	}
 }
 
-// Complete deletes chunks that have been persisted.
+// Complete deletes chunks that have been persisted, unless they changed
+// since they were loaded.
 func (s *Store) Complete(ctx context.Context, chunks []storage.HotChunk) error {
-	byShard := make(map[int][]storage.HotChunk)
-	for _, c := range chunks {
-		byShard[c.Ref.Shard] = append(byShard[c.Ref.Shard], c)
+	items := make([]finishItem, len(chunks))
+	for i, c := range chunks {
+		items[i] = finishItem{ref: c.Ref, header: fmt.Sprintf("%016d", c.Fragment), size: c.Size}
+	}
+	return s.finish(ctx, items)
+}
+
+// Release drops the in-flight entries of chunks that no longer exist.
+func (s *Store) Release(ctx context.Context, refs []storage.ChunkRef) error {
+	items := make([]finishItem, len(refs))
+	for i, r := range refs {
+		items[i] = finishItem{ref: r}
+	}
+	return s.finish(ctx, items)
+}
+
+type finishItem struct {
+	ref    storage.ChunkRef
+	header string // empty: release a missing chunk
+	size   int
+}
+
+func (s *Store) finish(ctx context.Context, items []finishItem) error {
+	byShard := make(map[int][]finishItem)
+	for _, it := range items {
+		byShard[it.ref.Shard] = append(byShard[it.ref.Shard], it)
 	}
 	var calls []scriptCall
-	for shard, cs := range byShard {
-		for len(cs) > 0 {
-			n := min(len(cs), maxChunksPerCall)
-			call := scriptCall{keys: []string{s.inflightKey(shard)}}
-			for _, c := range cs[:n] {
-				m := member(c.Ref.Series, c.Ref.Start)
+	for shard, its := range byShard {
+		for len(its) > 0 {
+			n := min(len(its), maxChunksPerCall)
+			call := scriptCall{keys: []string{s.inflightKey(shard), s.inflightDueKey(shard)}}
+			for _, it := range its[:n] {
+				m := member(it.ref.Series, it.ref.Start)
 				call.keys = append(call.keys, s.chunkKey(shard, m))
-				call.args = append(call.args, m, fmt.Sprintf("%016d", c.Fragment))
+				call.args = append(call.args, m, it.header, it.size)
 			}
 			calls = append(calls, call)
-			cs = cs[n:]
+			its = its[n:]
 		}
 	}
 	_, err := s.runScripts(ctx, completeScript, calls)
@@ -443,16 +514,18 @@ func (s *Store) pipelined(ctx context.Context, n int, add func(pipe redis.Pipeli
 }
 
 // Backlog reports the number of pending and in-flight chunks and the
-// earliest due time across all shards.
+// oldest chunk across all shards.
 func (s *Store) Backlog(ctx context.Context) (storage.Backlog, error) {
 	n := s.layout.Shards
 	due := make([]*redis.IntCmd, n)
 	inf := make([]*redis.IntCmd, n)
-	oldest := make([]*redis.ZSliceCmd, n)
+	oldestDue := make([]*redis.ZSliceCmd, n)
+	oldestInf := make([]*redis.ZSliceCmd, n)
 	err := s.pipelined(ctx, n, func(pipe redis.Pipeliner, i int) {
 		due[i] = pipe.ZCard(ctx, s.dueKey(i))
 		inf[i] = pipe.ZCard(ctx, s.inflightKey(i))
-		oldest[i] = pipe.ZRangeWithScores(ctx, s.dueKey(i), 0, 0)
+		oldestDue[i] = pipe.ZRangeWithScores(ctx, s.dueKey(i), 0, 0)
+		oldestInf[i] = pipe.ZRangeWithScores(ctx, s.inflightDueKey(i), 0, 0)
 	})
 	if err != nil {
 		return storage.Backlog{}, err
@@ -461,11 +534,16 @@ func (s *Store) Backlog(ctx context.Context) (storage.Backlog, error) {
 	for i := range n {
 		b.PendingChunks += due[i].Val()
 		b.InflightChunks += inf[i].Val()
-		if zs := oldest[i].Val(); len(zs) > 0 {
-			if t := int64(zs[0].Score); b.OldestDue == 0 || t < b.OldestDue {
-				b.OldestDue = t
+		for _, zs := range [][]redis.Z{oldestDue[i].Val(), oldestInf[i].Val()} {
+			if len(zs) > 0 {
+				if t := int64(zs[0].Score); b.OldestDue == 0 || t < b.OldestDue {
+					b.OldestDue = t
+				}
 			}
 		}
+	}
+	if b.OldestDue != 0 {
+		b.OldestStart = b.OldestDue - s.layout.ChunkRange - s.layout.Grace
 	}
 	return b, nil
 }

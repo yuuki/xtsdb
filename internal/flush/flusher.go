@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"golang.org/x/sync/errgroup"
@@ -89,7 +90,7 @@ func New(hot storage.HotStore, cold storage.ColdStore, opts Options) *Flusher {
 		}),
 		lagSeconds: reg.NewGauge(prometheus.GaugeOpts{
 			Name: "xtsdb_flusher_lag_seconds",
-			Help: "How long the oldest closed chunk has been waiting to be flushed.",
+			Help: "How long the oldest closed chunk (pending or in flight) has been waiting to be flushed.",
 		}),
 	}
 }
@@ -132,7 +133,9 @@ dispatch:
 	return nil
 }
 
-// flushShard drains the closed chunks of a shard.
+// flushShard drains the closed chunks of a shard. It stops when the shard
+// is empty or when a batch makes no progress, so that a worker never spins
+// on chunks it cannot persist.
 func (f *Flusher) flushShard(ctx context.Context, shard int) {
 	for ctx.Err() == nil {
 		refs, err := f.hot.Claim(ctx, shard, f.opts.BatchSize)
@@ -145,8 +148,7 @@ func (f *Flusher) flushShard(ctx context.Context, shard int) {
 		if len(refs) == 0 {
 			return
 		}
-		f.flushBatch(ctx, refs)
-		if len(refs) < f.opts.BatchSize {
+		if done := f.flushBatch(ctx, refs); done == 0 || len(refs) < f.opts.BatchSize {
 			return
 		}
 	}
@@ -160,27 +162,56 @@ func (f *Flusher) FlushOnce(ctx context.Context) {
 	}
 }
 
-func (f *Flusher) flushBatch(ctx context.Context, refs []storage.ChunkRef) {
-	start := time.Now()
-	// Let a started batch finish during shutdown, but never past its lease.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), f.opts.Lease)
-	defer cancel()
+// completeTimeout bounds the final Redis call of a batch. It is independent
+// of the lease: chunks that were persisted must be completed even if the
+// batch took longer than the lease.
+const completeTimeout = 30 * time.Second
 
-	chunks, err := f.hot.Load(ctx, refs)
+// flushBatch persists and completes claimed chunks and returns how many
+// were finished.
+func (f *Flusher) flushBatch(ctx context.Context, refs []storage.ChunkRef) int {
+	start := time.Now()
+	// A started batch is finished during shutdown; leases protect the rest.
+	work := context.WithoutCancel(ctx)
+	leaseEnd := start.Add(f.opts.Lease)
+
+	loadCtx, cancel := context.WithTimeout(work, f.opts.Lease)
+	chunks, missing, err := f.hot.Load(loadCtx, refs)
+	cancel()
 	if err != nil {
 		f.log.Error("load failed", "chunks", len(refs), "err", err)
 		f.chunks.WithLabelValues("error").Add(float64(len(refs)))
-		return
+		return 0
 	}
+	finished := 0
+	if len(missing) > 0 {
+		rctx, cancel := context.WithTimeout(work, completeTimeout)
+		if err := f.hot.Release(rctx, missing); err != nil {
+			f.log.Error("release failed", "chunks", len(missing), "err", err)
+		} else {
+			finished += len(missing)
+		}
+		cancel()
+	}
+
 	var (
-		mu   sync.Mutex
-		done = make([]storage.HotChunk, 0, len(chunks))
+		mu      sync.Mutex
+		done    = make([]storage.HotChunk, 0, len(chunks))
+		skipped int
 	)
-	g, gctx := errgroup.WithContext(ctx)
+	g := new(errgroup.Group)
 	g.SetLimit(16)
 	for _, c := range chunks {
+		// Once the lease has expired other flushers may take these chunks
+		// over; do not start more work on them.
+		if time.Now().After(leaseEnd) {
+			skipped++
+			continue
+		}
 		g.Go(func() error {
-			if err := f.persist(gctx, c); err != nil {
+			pctx, cancel := context.WithTimeout(work, f.opts.Lease)
+			defer cancel()
+			if err := f.persist(pctx, c); err != nil {
 				f.log.Warn("persisting chunk failed; it will be retried after the lease expires",
 					"series", c.Ref.Series, "start", c.Ref.Start, "err", err)
 				f.chunks.WithLabelValues("error").Inc()
@@ -193,41 +224,58 @@ func (f *Flusher) flushBatch(ctx context.Context, refs []storage.ChunkRef) {
 		})
 	}
 	_ = g.Wait()
-	if len(done) == 0 {
-		return
+	if skipped > 0 {
+		f.log.Warn("batch exceeded its lease; remaining chunks are left for re-claim", "skipped", skipped)
 	}
-	if err := f.hot.Complete(ctx, done); err != nil {
+	if len(done) == 0 {
+		return finished
+	}
+	cctx, cancel := context.WithTimeout(work, completeTimeout)
+	defer cancel()
+	if err := f.hot.Complete(cctx, done); err != nil {
 		// The chunks are persisted; they will be written again (idempotently)
 		// after the lease expires.
 		f.log.Error("complete failed", "chunks", len(done), "err", err)
-		return
+		return finished
 	}
 	f.chunks.WithLabelValues("flushed").Add(float64(len(done)))
 	f.batchTime.Observe(time.Since(start).Seconds())
+	return finished + len(done)
 }
+
+// samplesPerPart bounds the size of one cold-tier row (well below the
+// Cassandra mutation size limit even for incompressible values).
+const samplesPerPart = 100_000
 
 func (f *Flusher) persist(ctx context.Context, c storage.HotChunk) error {
 	if len(c.Samples) == 0 {
 		return nil
 	}
-	data, err := chunk.EncodeXOR(c.Samples)
-	if err != nil {
-		return err
-	}
-	err = f.cold.WriteChunk(ctx, storage.ColdChunk{
-		Series:   c.Ref.Series,
-		Start:    c.Ref.Start,
-		Fragment: c.Fragment,
-		MaxT:     c.Samples[len(c.Samples)-1].T,
-		Count:    len(c.Samples),
-		Encoding: chunk.EncodingXOR,
-		Data:     data,
-	})
-	if err != nil {
-		return err
+	digest := xxhash.Sum64(chunk.AppendRaw(nil, c.Samples))
+	for part, i := 0, 0; i < len(c.Samples); part, i = part+1, i+samplesPerPart {
+		samples := c.Samples[i:min(i+samplesPerPart, len(c.Samples))]
+		data, err := chunk.EncodeXOR(samples)
+		if err != nil {
+			return err
+		}
+		err = f.cold.WriteChunk(ctx, storage.ColdChunk{
+			Series:   c.Ref.Series,
+			Start:    c.Ref.Start,
+			Fragment: c.Fragment,
+			Total:    len(c.Samples),
+			Digest:   digest,
+			Part:     part,
+			MaxT:     samples[len(samples)-1].T,
+			Count:    len(samples),
+			Encoding: chunk.EncodingXOR,
+			Data:     data,
+		})
+		if err != nil {
+			return err
+		}
+		f.bytes.Add(float64(len(data)))
 	}
 	f.samples.Add(float64(len(c.Samples)))
-	f.bytes.Add(float64(len(data)))
 	return nil
 }
 

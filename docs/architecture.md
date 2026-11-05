@@ -50,17 +50,46 @@ A window is *due* at `start + chunk_range + grace_period`.
 
 ```
 <prefix>:{N}:c:<series>:<window>   chunk: 16-byte header + 16-byte records
-<prefix>:{N}:due                   ZSET  member -> due time (ms)
-<prefix>:{N}:inf                   ZSET  member -> lease expiry (ms)
+<prefix>:{N}:due                   ZSET  member -> due time (ms), not yet claimed
+<prefix>:{N}:inf                   ZSET  member -> lease expiry (ms), claimed
+<prefix>:{N}:infdue                ZSET  member -> due time (ms), claimed
 <prefix>:{N}:q:<series>:<window>   quarantined chunk (undecodable)
-<prefix>:meta                      HASH  layout parameters (shards)
+<prefix>:meta                      HASH  layout parameters (shards, chunk range)
 ```
 
 The chunk header is the creation time of the chunk in microseconds as
 16 ASCII digits, taken from the Redis server clock. It identifies this
 incarnation of the window (its *fragment*). Records are a big-endian
 timestamp (ms) and IEEE-754 value, appended in arrival order, so an append
-never reads the chunk.
+never reads the chunk. A chunk is limited to 32 MiB (about two million
+samples); samples beyond that are rejected (`outcome="chunk_full"`) rather
+than creating a chunk that cannot be flushed.
+
+xtsdb refuses to start if `storage.shards` or `storage.chunk_range` differ
+from the values recorded in `<prefix>:meta`, because either change would make
+existing chunks unreachable.
+
+### Ingestion
+
+Before anything is stored, the ingester:
+
+- bounds remote write requests: compressed and decompressed size, strict
+  Snappy (no S2 extensions), and the number of series, samples, labels and
+  other elements, counted on the wire before protobuf decoding (decoding
+  inflates empty elements up to 64 times); concurrent requests beyond
+  `ingester.max_inflight_requests` get 503;
+- drops samples older than `chunk_range + grace_period` (+1 minute of clock
+  skew) or further than `max_sample_future` in the future, so that
+  out-of-range timestamps never reach the index;
+- writes the index, so that a stored sample always belongs to a
+  discoverable series.
+
+Graphite TCP lines wait at most one second in a batch, whether or not more
+data arrives. Connections are capped (`graphite_max_connections`), idle
+connections are closed after five minutes, and accept errors such as
+`EMFILE` are retried with back-off. UDP datagrams are copied off the socket
+by one goroutine and parsed by a worker pool; when the workers fall behind,
+datagrams are dropped and counted (`outcome="dropped"`).
 
 ### Append (ingester)
 
@@ -68,14 +97,15 @@ One Lua script call per shard and batch (`internal/hot/scripts.go`):
 
 1. Read the server time with `TIME`.
 2. For every chunk in the batch: if the window is due, or the chunk is
-   currently claimed by a flusher, reject its samples.
+   currently claimed by a flusher, reject its samples (`too_old`); if the
+   chunk would exceed its size limit, reject them (`chunk_full`).
 3. Otherwise create the chunk with its header if needed, register it in
    `due` with its due time, and `APPEND` the records.
 
-The ingester writes the index before appending, so a stored sample always
-belongs to a discoverable series. Scripts are run with `EVALSHA` in
-pipelines and transparently fall back to `EVAL` when a node lost its script
-cache (restart, failover, `SCRIPT FLUSH`, new cluster node).
+Scripts are run with `EVALSHA` in pipelines and transparently fall back to
+`EVAL` when a node lost its script cache (restart, failover, `SCRIPT
+FLUSH`, new cluster node). The append script has no flags, so Redis refuses
+it as a whole when it is out of memory (the client gets 503 and retries).
 
 ### Hand-off protocol (flusher)
 
@@ -85,11 +115,11 @@ sequenceDiagram
     participant R as Redis (shard N)
     participant C as Cassandra
     F->>R: claim(limit, lease)
-    Note over R: expired leases first, then due chunks:<br/>move member from due to inf with now+lease
+    Note over R: expired leases first, then due chunks:<br/>move member from due to inf (now+lease) and infdue (due)
     R-->>F: members
     F->>R: GET chunks
-    F->>C: INSERT chunk (series, day, start, fragment) USING TTL
-    F->>R: complete: DEL chunk if header == fragment, ZREM inf
+    F->>C: INSERT parts (series, day, start, fragment, total, digest, part) USING TTL
+    F->>R: complete: DEL chunk if header and length are unchanged
 ```
 
 Invariants:
@@ -98,14 +128,27 @@ Invariants:
   Redis node clock inside atomic scripts, so once `claim` can see a chunk,
   no append to it can succeed. 0.x had a window between `GET` and `UNLINK`
   in which appended samples were deleted.
-- **Delete after persist.** A chunk is deleted only after the Cassandra
-  write succeeded.
-- **Leases, not ownership.** A claimed chunk whose flusher dies is handed
-  out again when its lease expires. Writes are idempotent because the
-  Cassandra primary key is `(series, day, start, fragment)`.
-- **Fenced completion.** `complete` deletes a chunk only if its header still
-  matches the fragment that was persisted, so a flusher whose lease expired
-  cannot delete a newer incarnation of the same window.
+- **Delete after persist.** A chunk is deleted only after all its parts were
+  written to Cassandra.
+- **Leases, not ownership.** A claimed chunk whose flusher dies or is too
+  slow is handed out again when its lease expires.
+- **Idempotent by content.** The Cassandra key includes the chunk's sample
+  count and a hash of its samples. Writing the same chunk twice stores it
+  once; writing a different version of the same window (for example after
+  Redis was restored from an older snapshot) stores a second version
+  instead of overwriting a more complete one. Reads merge all versions.
+- **Fenced completion.** `complete` deletes a chunk only if its header and
+  its length are still those that were persisted. A flusher whose lease
+  expired cannot delete a newer incarnation, and samples appended after the
+  chunk was loaded (possible only after a failover to a lagging replica)
+  are not deleted: the chunk is re-processed after its lease.
+- **No leaks.** In-flight entries whose chunk no longer exists are released.
+- **Flushing works when Redis is full.** claim, complete and quarantine are
+  flagged `allow-oom`; with `noeviction`, flushing is the only way memory is
+  freed, so it must not be refused.
+- **Progress under slow storage.** A batch stops starting new writes once
+  its lease has expired, completes what it persisted with its own timeout,
+  and a flusher moves on when a batch made no progress.
 
 No Redis keyspace notifications are used. 0.x relied on them; they are
 node-local, delivered at most once and require special server
@@ -117,33 +160,41 @@ left data in Redis forever.
 | Failure | Outcome |
 |---------|---------|
 | Flusher crashes after claim | Lease expires, another flusher claims and persists the chunk. |
-| Cassandra unavailable | Persist fails, chunk stays in Redis, retried after the lease. `xtsdb_flusher_lag_seconds` grows. |
+| Cassandra unavailable or slow | Persist fails or is skipped, the chunk stays in Redis and is retried after the lease. `xtsdb_flusher_lag_seconds` grows (it covers claimed chunks too), and queries still read the chunk from Redis. |
 | Two flushers persist the same chunk | Same primary key, written once. The second `complete` is a no-op. |
-| Redis restart / failover / `SCRIPT FLUSH` | Scripts are reloaded automatically. Data loss is bounded by the Redis persistence and replication settings. |
+| Redis out of memory (`noeviction`) | Appends are refused (503, clients retry); claim and complete keep working, so flushing frees memory. |
+| Redis restart / `SCRIPT FLUSH` | Scripts are reloaded automatically. Unflushed data loss is bounded by the Redis persistence settings. |
+| Redis restored from an older snapshot, or failover to a lagging replica | Chunks flushed since the snapshot may be flushed again with less data; they are stored as separate versions and never overwrite the complete one. |
 | Undecodable chunk | Moved to a quarantine key and logged; it does not block flushing. |
+| Very large chunk | Persisted in parts of 100,000 samples, below Cassandra's mutation limit. |
 | Sample for a closed window | Rejected and counted (`outcome="too_old"`); remote write returns 400. |
-| Redis clock moves backwards | A claimed chunk still rejects appends (the in-flight check). A chunk re-created after completion is a new fragment and is stored as a separate Cassandra row; reads merge fragments. |
+| Redis clock moves backwards | A claimed chunk still rejects appends (the in-flight check). A chunk re-created after completion is a new fragment and is stored as a separate version; reads merge versions. |
 | Index write fails | The batch fails with 503 before any sample is stored; the client retries. |
 
 ## Cold tier (Cassandra)
 
 ```sql
 CREATE TABLE chunks (
-  series_id bigint, day int, start_ms bigint, fragment bigint,
+  series_id bigint, day int, start_ms bigint,
+  fragment bigint, total int, digest bigint, part int,
   max_t bigint, samples int, encoding tinyint, data blob,
-  PRIMARY KEY ((series_id, day), start_ms, fragment)
+  PRIMARY KEY ((series_id, day), start_ms, fragment, total, digest, part)
 ) WITH compaction = {'class': 'TimeWindowCompactionStrategy', ...};
 ```
 
-`day` is the UTC day of the window start, which bounds partition size. The
-blob is a sequence of length-prefixed Prometheus XOR chunks of sorted,
-de-duplicated samples (Gorilla encoding; typically 1–2 bytes per sample
-compared to 16 in Redis). Rows carry `USING TTL` from `storage.retention`,
-and TWCS drops whole SSTables when they expire.
+`day` is the UTC day of the window start, which bounds partition size.
+`(fragment, total, digest)` identify a version of a window, `part` splits
+large versions into rows of at most 100,000 samples. The blob is a sequence
+of length-prefixed Prometheus XOR chunks of sorted, de-duplicated samples
+(Gorilla encoding; typically 1–2 bytes per sample compared to 16 in Redis).
+Rows carry `USING TTL` from `storage.retention`, and TWCS drops whole
+SSTables when they expire.
 
 Reads for `[mint, maxt]` query the day partitions of
-`[mint - chunk_range, maxt]` with a clustering range on `start_ms`, decode
-the fragments and merge them, later fragments winning on equal timestamps.
+`[mint - chunk_range, maxt]` with a clustering range on `start_ms`,
+concatenate the parts of each version and merge versions in clustering
+order, so later incarnations and more complete versions win on equal
+timestamps.
 
 ## Series index (Cassandra)
 
@@ -162,31 +213,47 @@ candidate for today's queries.
 
 ## Read path
 
-1. **Resolve matchers** for each day of the query range. Matchers that do
-   not match the empty string select postings: `=` reads one partition,
-   `=~` with a literal alternation reads one partition per alternative,
-   other matchers filter `label_values` first. Postings are intersected
-   across matchers and unioned across days. Selectors without such a
-   matcher are rejected, as in Prometheus.
-2. **Load labels** of the candidates (LRU cached) and apply all matchers,
+1. **Bound the range.** Queries are clamped to `storage.retention` (or
+   `querier.max_query_lookback` when retention is 0, default one year), which
+   bounds the number of day partitions read. At most
+   `querier.max_concurrent_queries` queries run at once, each bounded by
+   `querier.timeout`, including the series and label endpoints.
+2. **Resolve matchers** for each day of the range. Matchers that do not
+   match the empty string select postings: `=` reads one partition, `=~` with
+   a literal alternation reads one partition per alternative, other matchers
+   filter `label_values` first. Cheap matchers run first; once 1,024 or fewer
+   candidates remain, expensive matchers are not resolved through the index
+   but applied to the labels. Postings are intersected across matchers and
+   unioned across days. Selectors without such a matcher are rejected, as in
+   Prometheus.
+3. **Load labels** of the candidates (LRU cached) and apply all matchers,
    including negative ones, on the full label sets.
-3. **Read samples** from Cassandra for the whole range and from Redis for
-   the part newer than `querier.hot_lookback`, in parallel. Hot samples win
-   over cold ones on equal timestamps.
 4. **Evaluate PromQL** with the Prometheus 3 engine through the
-   `storage.Queryable` interface.
+   `storage.Queryable` interface. Samples are loaded lazily, 256 series at a
+   time, when the engine iterates a series, so `querier.max_samples` stops a
+   query before all of its raw samples are in memory.
+5. **Read samples** of a batch from Redis first and Cassandra second, and
+   merge them; hot samples win on equal timestamps.
 
-`querier.hot_lookback` must cover `chunk_range + grace_period` plus the
-expected flush lag; chunks stay readable in Redis until they are deleted,
-and Cassandra holds them before that happens, so there is no gap during the
-hand-off.
+The order of step 5 is what makes the hand-off invisible to queries. A
+flusher writes a chunk to Cassandra before deleting it from Redis, so a
+chunk missing from the Redis read was already in Cassandra when the
+Cassandra read started. Reading both tiers concurrently (as an earlier
+version of v2 did) loses chunks that are persisted after the Cassandra read
+and deleted before the Redis read. With Cassandra replication, the read and
+write consistency levels must overlap (`LOCAL_QUORUM`, the default) for the
+same argument to hold.
+
+Redis is read for at least `querier.hot_lookback` and, using the oldest due
+time in the `due` and `infdue` sets (refreshed every 10 seconds), back to the
+oldest chunk Redis still holds, so data stays visible while flushing lags.
 
 ## Changes from 0.x
 
 | 0.x | v2 |
 |-----|-----|
 | Keyspace notifications + Redis Streams to detect expiry; payloads without the `ts:` prefix meant series that stopped receiving writes were never flushed | Due/in-flight sorted sets polled by flushers; no notifications |
-| `GET` then `UNLINK` race lost concurrent appends | Due windows are immutable; fenced completion |
+| `GET` then `UNLINK` race lost concurrent appends | Due windows are immutable; completion fenced by header and length |
 | Failed batches stuck in the stream's pending list forever | Leases with automatic re-claim |
 | Graphite millisecond timestamps written as seconds (year 58815) | One timestamp unit (ms) end to end, tested |
 | `EVALSHA` without fallback: writes failed after Redis restart | `EVALSHA` with automatic `EVAL` fallback |

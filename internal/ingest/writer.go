@@ -66,7 +66,12 @@ const (
 
 // WriterOptions configures a Writer.
 type WriterOptions struct {
-	MaxSampleFuture       time.Duration
+	MaxSampleFuture time.Duration
+	// MaxSampleAge drops samples older than this before they are indexed.
+	// Set it to chunk_range + grace_period (plus a little slack for clock
+	// skew): older samples belong to closed windows and would be rejected
+	// by the hot tier anyway.
+	MaxSampleAge          time.Duration
 	IndexCacheSize        int
 	IndexWriteConcurrency int
 	Registerer            prometheus.Registerer
@@ -80,6 +85,7 @@ type Writer struct {
 	index     storage.IndexWriter
 	cache     *lru.Cache[indexKey, struct{}]
 	maxFuture time.Duration
+	maxAge    time.Duration
 	indexConc int
 	logger    *slog.Logger
 	now       func() time.Time
@@ -91,6 +97,9 @@ type Writer struct {
 
 // NewWriter creates a Writer.
 func NewWriter(hot storage.HotStore, index storage.IndexWriter, opts WriterOptions) (*Writer, error) {
+	if opts.MaxSampleAge <= 0 || opts.MaxSampleFuture <= 0 {
+		return nil, errors.New("MaxSampleAge and MaxSampleFuture must be positive")
+	}
 	cache, err := lru.New[indexKey, struct{}](opts.IndexCacheSize)
 	if err != nil {
 		return nil, err
@@ -104,6 +113,7 @@ func NewWriter(hot storage.HotStore, index storage.IndexWriter, opts WriterOptio
 		index:     index,
 		cache:     cache,
 		maxFuture: opts.MaxSampleFuture,
+		maxAge:    opts.MaxSampleAge,
 		indexConc: opts.IndexWriteConcurrency,
 		logger:    opts.Logger,
 		now:       time.Now,
@@ -137,6 +147,7 @@ func (w *Writer) Write(ctx context.Context, batch []Series) (Result, error) {
 
 	var res Result
 	maxT := start.Add(w.maxFuture).UnixMilli()
+	minT := start.Add(-w.maxAge).UnixMilli()
 	type entry struct {
 		id   model.SeriesID
 		lset labels.Labels
@@ -162,6 +173,10 @@ func (w *Writer) Write(ctx context.Context, batch []Series) (Result, error) {
 		for _, smp := range s.Samples {
 			if smp.T > maxT {
 				res.TooNew++
+				continue
+			}
+			if smp.T < minT {
+				res.TooOld++
 				continue
 			}
 			if len(samples) == 0 || smp.T < minS {
@@ -237,6 +252,11 @@ func (w *Writer) Write(ctx context.Context, batch []Series) (Result, error) {
 }
 
 var kindNames = [...]string{kindSeries: "series", kindValue: "label_value", kindName: "label_name"}
+
+// discard counts samples dropped outside of Write.
+func (w *Writer) discard(outcome string, n int) {
+	w.samples.WithLabelValues(outcome).Add(float64(n))
+}
 
 func countSamples(batch []storage.SeriesSamples) int {
 	n := 0

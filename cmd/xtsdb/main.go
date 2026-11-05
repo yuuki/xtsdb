@@ -52,7 +52,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	case "version", "-version", "--version":
 		info := version.Info()
-		fmt.Fprintf(stdout, "xtsdb %s (revision %s, built %s, %s)\n",
+		fmt.Fprintf(stdout, "xtsdb %s (revision %s, date %s, %s)\n",
 			info["version"], info["revision"], info["buildDate"], info["goVersion"])
 		return 0
 	}
@@ -66,6 +66,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
+		return 2
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "error: unexpected argument %q (flags must come after the command, e.g. xtsdb %s -config.file=...)\n", fs.Arg(0), cmd)
 		return 2
 	}
 
@@ -85,6 +89,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// After the first signal starts a graceful shutdown, restore the default
+	// handling so that a second signal terminates immediately.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 
 	switch cmd {
 	case "config":

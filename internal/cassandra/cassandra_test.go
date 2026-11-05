@@ -104,6 +104,38 @@ func TestChunkStore(t *testing.T) {
 	}
 }
 
+func TestChunkVersionsAndParts(t *testing.T) {
+	s := newTestSession(t)
+	const hour = int64(time.Hour / time.Millisecond)
+	store := NewChunkStore(s, 24*time.Hour, hour, 8, nil)
+	ctx := context.Background()
+	id := model.SeriesID(77)
+	start := int64(20_000) * model.DayMillis
+	write := func(total int, digest uint64, part int, samples []model.Sample) {
+		t.Helper()
+		err := store.WriteChunk(ctx, storage.ColdChunk{
+			Series: id, Start: start, Fragment: 5, Total: total, Digest: digest, Part: part,
+			MaxT: samples[len(samples)-1].T, Count: len(samples), Encoding: chunk.EncodingXOR, Data: encode(t, samples),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A complete version in two parts...
+	write(3, 0xaaaa, 0, []model.Sample{{T: start + 1, V: 1}, {T: start + 2, V: 2}})
+	write(3, 0xaaaa, 1, []model.Sample{{T: start + 3, V: 3}})
+	// ...and a stale version of the same incarnation with less data.
+	write(1, 0xbbbb, 0, []model.Sample{{T: start + 1, V: 1}})
+	got, err := store.Read(ctx, []model.SeriesID{id}, start, start+hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []model.Sample{{T: start + 1, V: 1}, {T: start + 2, V: 2}, {T: start + 3, V: 3}}
+	if fmt.Sprint(got[id]) != fmt.Sprint(want) {
+		t.Fatalf("got %v, want %v", got[id], want)
+	}
+}
+
 func TestIndex(t *testing.T) {
 	s := newTestSession(t)
 	x := NewIndex(s, 24*time.Hour, 8)

@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -19,6 +20,10 @@ import (
 
 	"github.com/yuuki/xtsdb/internal/model"
 )
+
+// maxGraphiteSeconds is far beyond any sensible timestamp (year 5138) but
+// small enough to convert to milliseconds without overflow.
+const maxGraphiteSeconds = 1e11
 
 // ParseGraphiteLine parses one line of the Graphite plaintext protocol:
 //
@@ -60,7 +65,8 @@ func ParseGraphiteLine(line string, now time.Time) (Series, bool, error) {
 	ts := now.UnixMilli()
 	if len(fields) == 3 {
 		sec, err := strconv.ParseFloat(fields[2], 64)
-		if err != nil || math.IsNaN(sec) || math.IsInf(sec, 0) {
+		// Reject values whose conversion to milliseconds would overflow.
+		if err != nil || math.IsNaN(sec) || math.Abs(sec) > maxGraphiteSeconds {
 			return Series{}, false, fmt.Errorf("invalid timestamp %q", fields[2])
 		}
 		if sec >= 0 {
@@ -72,36 +78,52 @@ func ParseGraphiteLine(line string, now time.Time) (Series, bool, error) {
 
 // GraphiteServer accepts the Graphite plaintext protocol over TCP and UDP.
 type GraphiteServer struct {
-	addr   string
-	writer *Writer
-	logger *slog.Logger
+	addr     string
+	writer   *Writer
+	logger   *slog.Logger
+	maxConns int
 
-	tcp   net.Listener
-	udp   net.PacketConn
-	wg    sync.WaitGroup
-	mu    sync.Mutex
-	conns map[net.Conn]struct{}
+	tcp     net.Listener
+	udp     net.PacketConn
+	udpData chan []byte
+	closing atomic.Bool
+	wg      sync.WaitGroup
+	mu      sync.Mutex
+	conns   map[net.Conn]struct{}
 
-	lines *prometheus.CounterVec
+	lines       *prometheus.CounterVec
+	connections *prometheus.CounterVec
 }
 
-// Batching limits for Graphite connections.
+// Tuning of Graphite ingestion.
 const (
 	graphiteBatchSize     = 1000
-	graphiteFlushInterval = time.Second
+	graphiteFlushInterval = time.Second // longest time a line waits in a batch
+	graphiteIdleTimeout   = 5 * time.Minute
 	graphiteMaxLine       = 64 << 10
+	graphiteUDPWorkers    = 4
+	graphiteUDPQueue      = 10_000 // datagrams
+	graphiteUDPReadBuffer = 8 << 20
 )
 
 // NewGraphiteServer creates a server listening on addr for both TCP and UDP.
-func NewGraphiteServer(addr string, w *Writer, reg prometheus.Registerer, logger *slog.Logger) *GraphiteServer {
+// At most maxConns TCP connections are served at a time.
+func NewGraphiteServer(addr string, maxConns int, w *Writer, reg prometheus.Registerer, logger *slog.Logger) *GraphiteServer {
+	f := promauto.With(reg)
 	return &GraphiteServer{
-		addr:   addr,
-		writer: w,
-		logger: logger.With("component", "graphite"),
-		conns:  make(map[net.Conn]struct{}),
-		lines: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+		addr:     addr,
+		writer:   w,
+		logger:   logger.With("component", "graphite"),
+		maxConns: maxConns,
+		conns:    make(map[net.Conn]struct{}),
+		udpData:  make(chan []byte, graphiteUDPQueue),
+		lines: f.NewCounterVec(prometheus.CounterOpts{
 			Name: "xtsdb_graphite_lines_total",
-			Help: "Graphite lines received, by outcome.",
+			Help: "Graphite lines received, by outcome (parsed, invalid, nan, dropped).",
+		}, []string{"outcome"}),
+		connections: f.NewCounterVec(prometheus.CounterOpts{
+			Name: "xtsdb_graphite_connections_total",
+			Help: "Graphite TCP connections, by outcome (accepted, rejected).",
 		}, []string{"outcome"}),
 	}
 }
@@ -117,25 +139,41 @@ func (g *GraphiteServer) Start() error {
 		ln.Close()
 		return fmt.Errorf("graphite udp: %w", err)
 	}
+	if uc, ok := pc.(*net.UDPConn); ok {
+		_ = uc.SetReadBuffer(graphiteUDPReadBuffer) // capped by net.core.rmem_max
+	}
 	g.tcp, g.udp = ln, pc
 	g.logger.Info("listening for Graphite plaintext", "tcp", ln.Addr(), "udp", pc.LocalAddr())
 	g.wg.Add(2)
 	go g.acceptLoop()
 	go g.udpLoop()
+	for range graphiteUDPWorkers {
+		g.wg.Add(1)
+		go g.udpWorker()
+	}
 	return nil
 }
 
 // Addr returns the TCP listen address.
 func (g *GraphiteServer) Addr() net.Addr { return g.tcp.Addr() }
 
-// Stop closes the listeners and waits for open connections to drain until
-// ctx expires, then closes them.
+// UDPAddr returns the UDP listen address.
+func (g *GraphiteServer) UDPAddr() net.Addr { return g.udp.LocalAddr() }
+
+// Stop closes the listeners, makes every connection write what it has
+// buffered and close, and waits for that until ctx expires.
 func (g *GraphiteServer) Stop(ctx context.Context) {
-	if g.tcp == nil {
+	if g.tcp == nil || !g.closing.CompareAndSwap(false, true) {
 		return
 	}
 	g.tcp.Close()
 	g.udp.Close()
+	// Wake up blocked reads; serveConn sees closing and returns.
+	g.mu.Lock()
+	for c := range g.conns {
+		_ = c.SetReadDeadline(time.Now())
+	}
+	g.mu.Unlock()
 	done := make(chan struct{})
 	go func() { g.wg.Wait(); close(done) }()
 	select {
@@ -152,20 +190,40 @@ func (g *GraphiteServer) Stop(ctx context.Context) {
 
 func (g *GraphiteServer) acceptLoop() {
 	defer g.wg.Done()
+	sem := make(chan struct{}, g.maxConns)
+	backoff := time.Duration(0)
 	for {
 		c, err := g.tcp.Accept()
 		if err != nil {
-			if !errors.Is(err, net.ErrClosed) {
-				g.logger.Error("accept failed", "err", err)
+			if g.closing.Load() || errors.Is(err, net.ErrClosed) {
+				return
 			}
-			return
+			// Typically EMFILE: back off and keep serving, like net/http.
+			backoff = min(max(2*backoff, 5*time.Millisecond), time.Second)
+			g.logger.Warn("accept failed; retrying", "err", err, "backoff", backoff)
+			time.Sleep(backoff)
+			continue
 		}
+		backoff = 0
+		select {
+		case sem <- struct{}{}:
+		default:
+			g.connections.WithLabelValues("rejected").Inc()
+			c.Close()
+			continue
+		}
+		g.connections.WithLabelValues("accepted").Inc()
 		g.mu.Lock()
 		g.conns[c] = struct{}{}
+		closing := g.closing.Load()
 		g.mu.Unlock()
+		if closing {
+			_ = c.SetReadDeadline(time.Now())
+		}
 		g.wg.Add(1)
 		go func() {
 			defer g.wg.Done()
+			defer func() { <-sem }()
 			g.serveConn(c)
 			g.mu.Lock()
 			delete(g.conns, c)
@@ -175,78 +233,130 @@ func (g *GraphiteServer) acceptLoop() {
 	}
 }
 
-// serveConn reads lines and writes them in batches, flushing at least
-// every graphiteFlushInterval.
+// serveConn reads lines and writes them in batches. A line waits at most
+// graphiteFlushInterval in a batch, whether or not more data arrives.
 func (g *GraphiteServer) serveConn(c net.Conn) {
 	r := bufio.NewReaderSize(c, 64<<10)
 	var (
 		batch   []Series
 		partial []byte
+		since   time.Time // when the oldest line of the batch arrived
 	)
 	flush := func() {
-		if len(batch) == 0 {
-			return
+		if len(batch) > 0 {
+			g.write(batch)
+			batch = batch[:0]
 		}
-		g.write(batch)
-		batch = batch[:0]
+	}
+	add := func(line []byte) {
+		if s, ok := g.parse(string(line)); ok {
+			if len(batch) == 0 {
+				since = time.Now()
+			}
+			batch = append(batch, s)
+		}
 	}
 	for {
-		_ = c.SetReadDeadline(time.Now().Add(graphiteFlushInterval))
+		if g.closing.Load() {
+			flush()
+			return
+		}
+		deadline := time.Now().Add(graphiteIdleTimeout)
+		if len(batch) > 0 {
+			deadline = since.Add(graphiteFlushInterval)
+		}
+		_ = c.SetReadDeadline(deadline)
 		chunk, err := r.ReadSlice('\n')
 		partial = append(partial, chunk...)
-		if errors.Is(err, bufio.ErrBufferFull) {
+		switch {
+		case err == nil:
+			add(partial)
+			partial = partial[:0]
+			if len(batch) >= graphiteBatchSize || (len(batch) > 0 && time.Since(since) >= graphiteFlushInterval) {
+				flush()
+			}
+		case errors.Is(err, bufio.ErrBufferFull):
 			if len(partial) > graphiteMaxLine {
 				g.lines.WithLabelValues("invalid").Inc()
-				g.logger.Debug("dropping connection with over-long line", "remote", c.RemoteAddr())
+				g.logger.Warn("closing connection with over-long line", "remote", c.RemoteAddr())
 				flush()
 				return
 			}
-			continue
-		}
-		if err == nil {
-			if s, ok := g.parse(string(partial)); ok {
-				batch = append(batch, s)
-				if len(batch) >= graphiteBatchSize {
-					flush()
-				}
+		case isTimeout(err):
+			if g.closing.Load() {
+				flush()
+				return
 			}
-			partial = partial[:0]
-			continue
-		}
-		var ne net.Error
-		if errors.As(err, &ne) && ne.Timeout() {
+			if len(batch) == 0 && len(partial) == 0 {
+				return // idle
+			}
 			flush()
-			continue
-		}
-		// EOF or connection error: the last line may lack a newline.
-		if len(partial) > 0 {
-			if s, ok := g.parse(string(partial)); ok {
-				batch = append(batch, s)
+		default:
+			// EOF or connection error: the last line may lack a newline.
+			if len(partial) > 0 {
+				add(partial)
 			}
+			flush()
+			return
 		}
-		flush()
-		return
 	}
 }
 
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// udpLoop only copies datagrams off the socket so that the kernel buffer
+// drains quickly; workers parse and write them. When the workers cannot keep
+// up, datagrams are dropped and counted rather than blocking the socket.
 func (g *GraphiteServer) udpLoop() {
 	defer g.wg.Done()
+	defer close(g.udpData)
 	buf := make([]byte, 64<<10)
 	for {
 		n, _, err := g.udp.ReadFrom(buf)
 		if err != nil {
-			if !errors.Is(err, net.ErrClosed) {
-				g.logger.Error("udp read failed", "err", err)
+			if g.closing.Load() || errors.Is(err, net.ErrClosed) {
+				return
 			}
-			return
+			g.logger.Warn("udp read failed", "err", err)
+			time.Sleep(10 * time.Millisecond)
+			continue
 		}
-		var batch []Series
-		for line := range strings.Lines(string(buf[:n])) {
-			if s, ok := g.parse(line); ok {
-				batch = append(batch, s)
+		select {
+		case g.udpData <- append([]byte(nil), buf[:n]...):
+		default:
+			g.lines.WithLabelValues("dropped").Add(float64(max(1, strings.Count(string(buf[:n]), "\n"))))
+		}
+	}
+}
+
+func (g *GraphiteServer) udpWorker() {
+	defer g.wg.Done()
+	var batch []Series
+	t := time.NewTicker(graphiteFlushInterval)
+	defer t.Stop()
+	for {
+		select {
+		case d, ok := <-g.udpData:
+			if !ok {
+				g.write(batch)
+				return
 			}
+			for line := range strings.Lines(string(d)) {
+				if s, ok := g.parse(line); ok {
+					batch = append(batch, s)
+				}
+			}
+			if len(batch) >= graphiteBatchSize {
+				g.write(batch)
+				batch = nil
+			}
+		case <-t.C:
+			g.write(batch)
+			batch = nil
 		}
-		g.write(batch)
 	}
 }
 

@@ -4,54 +4,71 @@ import "github.com/redis/go-redis/v9"
 
 // All scripts operate on the keys of a single shard. Every key of a shard
 // shares the same hash tag, so each script touches a single Redis Cluster
-// slot and runs atomically.
+// slot and runs atomically. Scripts declare every key they access.
 //
 // Scripts read the clock with TIME on the Redis node that owns the shard.
 // Accepting samples (append) and closing windows (claim) therefore use the
 // same clock, which is what makes the hand-off race free: once a window is
 // due, no further sample can be appended to it.
+//
+// claim, complete and quarantine carry the allow-oom flag (Redis >= 7.0):
+// they must keep working when Redis is full, because flushing is the only
+// way memory is ever freed. append has no flags and is refused as a whole
+// when Redis is out of memory.
 
-// prelude enables effect replication on Redis < 7 (TIME is non-deterministic)
-// and computes the server time in milliseconds and a 16-digit microsecond
-// stamp used as the chunk header.
+// prelude computes the server time in milliseconds.
 const prelude = `
 if redis.replicate_commands then redis.replicate_commands() end
 local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 `
 
+const allowOOM = "#!lua flags=allow-oom\n"
+
 // appendScript appends raw samples to chunks.
 //
 // KEYS[1] = due set, KEYS[2] = in-flight set, KEYS[3..] = chunk keys
-// ARGV    = (member, due, data) for every chunk key
-// Returns the 0-based indexes of chunks whose window was closed.
+// ARGV[1] = maximum chunk size in bytes
+// ARGV[2..] = (member, due, data) for every chunk key
+// Returns {closed, full}: 0-based indexes of chunks whose window was closed
+// and of chunks that would exceed the maximum size.
 var appendScript = redis.NewScript(prelude + `
 local hdr = string.rep('0', 10 - string.len(t[1])) .. t[1] .. string.rep('0', 6 - string.len(t[2])) .. t[2]
-local rejected = {}
+local maxBytes = tonumber(ARGV[1])
+local closed, full = {}, {}
 for i = 3, #KEYS do
-  local j = (i - 3) * 3
+  local j = (i - 3) * 3 + 1
   local member = ARGV[j + 1]
   local due = tonumber(ARGV[j + 2])
+  local data = ARGV[j + 3]
   if now >= due or redis.call('ZSCORE', KEYS[2], member) then
-    rejected[#rejected + 1] = i - 3
+    closed[#closed + 1] = i - 3
   else
-    if redis.call('EXISTS', KEYS[i]) == 0 then
-      redis.call('SET', KEYS[i], hdr)
-      redis.call('ZADD', KEYS[1], due, member)
+    local len = redis.call('STRLEN', KEYS[i])
+    if len == 0 then len = string.len(hdr) end
+    if len + string.len(data) > maxBytes then
+      full[#full + 1] = i - 3
+    else
+      if redis.call('EXISTS', KEYS[i]) == 0 then
+        redis.call('SET', KEYS[i], hdr)
+        redis.call('ZADD', KEYS[1], due, member)
+      end
+      redis.call('APPEND', KEYS[i], data)
     end
-    redis.call('APPEND', KEYS[i], ARGV[j + 3])
   end
 end
-return rejected
+return {closed, full}
 `)
 
 // claimScript leases closed chunks to a flusher. Chunks whose lease expired
-// (their flusher died) are handed out again before new ones.
+// (their flusher died or was too slow) are handed out again before new ones.
+// The due time of every in-flight chunk is kept in the in-flight due set,
+// so that the age of the oldest chunk is always known.
 //
-// KEYS[1] = due set, KEYS[2] = in-flight set
+// KEYS[1] = due set, KEYS[2] = in-flight set, KEYS[3] = in-flight due set
 // ARGV[1] = maximum number of chunks, ARGV[2] = lease in milliseconds
 // Returns the claimed members.
-var claimScript = redis.NewScript(prelude + `
+var claimScript = redis.NewScript(allowOOM + prelude + `
 local limit = tonumber(ARGV[1])
 local deadline = now + tonumber(ARGV[2])
 local out = {}
@@ -61,31 +78,47 @@ for _, m in ipairs(expired) do
   out[#out + 1] = m
 end
 if #out < limit then
-  local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now, 'LIMIT', 0, limit - #out)
-  for _, m in ipairs(due) do
+  local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now, 'WITHSCORES', 'LIMIT', 0, limit - #out)
+  for k = 1, #due, 2 do
+    local m = due[k]
     redis.call('ZREM', KEYS[1], m)
     redis.call('ZADD', KEYS[2], deadline, m)
+    redis.call('ZADD', KEYS[3], due[k + 1], m)
     out[#out + 1] = m
   end
 end
 return out
 `)
 
-// completeScript deletes persisted chunks. A chunk is deleted only if its
-// header still matches the persisted fragment, so a flusher whose lease
-// expired can never delete a newer incarnation of the same chunk.
+// completeScript finishes in-flight chunks.
 //
-// KEYS[1] = in-flight set, KEYS[2..] = chunk keys
-// ARGV    = (member, header) for every chunk key
-// Returns the number of chunks completed.
-var completeScript = redis.NewScript(`
+// For a persisted chunk (header non-empty) the chunk is deleted only if it
+// is still exactly what was persisted: same header (incarnation) and same
+// length (no sample appended since it was loaded). Otherwise it is left in
+// flight and re-processed after its lease expires.
+//
+// For a chunk that no longer exists (header empty) the in-flight entries
+// are removed, so that they do not leak.
+//
+// KEYS[1] = in-flight set, KEYS[2] = in-flight due set, KEYS[3..] = chunk keys
+// ARGV = (member, header, length) for every chunk key
+// Returns the number of chunks finished.
+var completeScript = redis.NewScript(allowOOM + `
 local done = 0
-for i = 2, #KEYS do
-  local j = (i - 2) * 2
+for i = 3, #KEYS do
+  local j = (i - 3) * 3
+  local member, want, size = ARGV[j + 1], ARGV[j + 2], tonumber(ARGV[j + 3])
   local hdr = redis.call('GETRANGE', KEYS[i], 0, 15)
-  if hdr == ARGV[j + 2] or hdr == '' then
-    if hdr ~= '' then redis.call('DEL', KEYS[i]) end
-    redis.call('ZREM', KEYS[1], ARGV[j + 1])
+  local finished = false
+  if want == '' then
+    finished = (hdr == '')
+  elseif hdr == want and redis.call('STRLEN', KEYS[i]) == size then
+    redis.call('DEL', KEYS[i])
+    finished = true
+  end
+  if finished then
+    redis.call('ZREM', KEYS[1], member)
+    redis.call('ZREM', KEYS[2], member)
     done = done + 1
   end
 end
@@ -95,12 +128,13 @@ return done
 // quarantineScript moves an undecodable chunk out of the way so that it
 // does not block the flusher forever, while keeping it for inspection.
 //
-// KEYS[1] = in-flight set, KEYS[2] = chunk key, KEYS[3] = quarantine key
-// ARGV[1] = member
-var quarantineScript = redis.NewScript(`
-if redis.call('EXISTS', KEYS[2]) == 1 then
-  redis.call('RENAME', KEYS[2], KEYS[3])
+// KEYS[1] = in-flight set, KEYS[2] = in-flight due set, KEYS[3] = chunk key,
+// KEYS[4] = quarantine key; ARGV[1] = member
+var quarantineScript = redis.NewScript(allowOOM + `
+if redis.call('EXISTS', KEYS[3]) == 1 then
+  redis.call('RENAME', KEYS[3], KEYS[4])
 end
 redis.call('ZREM', KEYS[1], ARGV[1])
+redis.call('ZREM', KEYS[2], ARGV[1])
 return 1
 `)

@@ -19,6 +19,10 @@ func TestCommands(t *testing.T) {
 	if code := run([]string{"bogus"}, &out, &errOut); code != 2 {
 		t.Fatalf("unknown command: exit %d", code)
 	}
+	// A stray argument would otherwise silently stop flag parsing.
+	if code := run([]string{"all", "extra", "-config.file=x.yaml"}, &out, &errOut); code != 2 {
+		t.Fatalf("positional argument: exit %d", code)
+	}
 }
 
 func TestConfigCommandRedactsSecrets(t *testing.T) {

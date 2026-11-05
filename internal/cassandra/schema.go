@@ -16,18 +16,23 @@ import (
 // per-write TTLs; TimeWindowCompactionStrategy then drops whole SSTables.
 var tables = []string{
 	// Compressed chunks of the persistent tier. A window normally has one
-	// fragment; more appear only if a window is re-opened after a flush.
+	// version (fragment, total, digest) stored in one or more parts. More
+	// versions appear only when a window is persisted again with different
+	// content, for example after Redis was restored from an older snapshot.
 	`CREATE TABLE IF NOT EXISTS chunks (
 		series_id bigint,
 		day       int,
 		start_ms  bigint,
 		fragment  bigint,
+		total     int,
+		digest    bigint,
+		part      int,
 		max_t     bigint,
 		samples   int,
 		encoding  tinyint,
 		data      blob,
-		PRIMARY KEY ((series_id, day), start_ms, fragment)
-	) WITH CLUSTERING ORDER BY (start_ms ASC, fragment ASC)
+		PRIMARY KEY ((series_id, day), start_ms, fragment, total, digest, part)
+	) WITH CLUSTERING ORDER BY (start_ms ASC, fragment ASC, total ASC, digest ASC, part ASC)
 	  AND compaction = {'class': 'TimeWindowCompactionStrategy', 'compaction_window_unit': 'DAYS', 'compaction_window_size': 1}
 	  AND gc_grace_seconds = 86400`,
 

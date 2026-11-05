@@ -80,6 +80,7 @@ func New(ctx context.Context, target Target, cfg *config.Config, logger *slog.Lo
 		buildInfo(),
 	)
 
+	hot.SetLogger(logger)
 	a.redis, err = hot.NewClient(cfg.Redis)
 	if err != nil {
 		return nil, err
@@ -125,7 +126,10 @@ func New(ctx context.Context, target Target, cfg *config.Config, logger *slog.Lo
 
 	if target.runs(TargetIngester) {
 		w, err := ingest.NewWriter(a.Hot, index, ingest.WriterOptions{
-			MaxSampleFuture:       cfg.Ingester.MaxSampleFuture.D(),
+			MaxSampleFuture: cfg.Ingester.MaxSampleFuture.D(),
+			// Windows close chunk_range + grace after they start; allow a
+			// minute of clock skew between ingesters and Redis.
+			MaxSampleAge:          cfg.Storage.ChunkRange.D() + cfg.Storage.GracePeriod.D() + time.Minute,
 			IndexCacheSize:        cfg.Ingester.IndexCacheSize,
 			IndexWriteConcurrency: cfg.Ingester.IndexWriteConcurrency,
 			Registerer:            a.Registry,
@@ -135,9 +139,18 @@ func New(ctx context.Context, target Target, cfg *config.Config, logger *slog.Lo
 			return nil, err
 		}
 		a.Server.Mux.Handle("POST /api/v1/write",
-			a.Server.Instrument("write", ingest.RemoteWriteHandler(w, cfg.Ingester.MaxRequestBodySize, logger)))
+			a.Server.Instrument("write", ingest.RemoteWriteHandler(w, ingest.RemoteWriteOptions{
+				MaxBodySize:         cfg.Ingester.MaxRequestBodySize,
+				MaxDecompressedSize: cfg.Ingester.MaxDecompressedSize,
+				MaxInflight:         cfg.Ingester.MaxInflightRequests,
+				Limits: ingest.Limits{
+					MaxSeries:  cfg.Ingester.MaxSeriesPerRequest,
+					MaxSamples: cfg.Ingester.MaxSamplesPerRequest,
+				},
+			}, logger)))
 		if cfg.Ingester.GraphiteListenAddress != "" {
-			a.Graphite = ingest.NewGraphiteServer(cfg.Ingester.GraphiteListenAddress, w, a.Registry, logger)
+			a.Graphite = ingest.NewGraphiteServer(cfg.Ingester.GraphiteListenAddress, cfg.Ingester.GraphiteMaxConnections,
+				w, a.Registry, logger)
 		}
 	}
 
@@ -156,6 +169,7 @@ func New(ctx context.Context, target Target, cfg *config.Config, logger *slog.Lo
 		q, err := query.NewQueryable(a.Hot, cold, index, query.Options{
 			HotLookback:       cfg.Querier.HotLookback.D(),
 			Retention:         retention,
+			MaxQueryLookback:  cfg.Querier.MaxQueryLookback.D(),
 			MaxSeriesPerQuery: cfg.Querier.MaxSeriesPerQuery,
 			SeriesCacheSize:   cfg.Querier.SeriesCacheSize,
 			ReadConcurrency:   cfg.Querier.ReadConcurrency,
@@ -164,12 +178,13 @@ func New(ctx context.Context, target Target, cfg *config.Config, logger *slog.Lo
 			return nil, err
 		}
 		api := query.NewAPI(q, query.APIOptions{
-			LookbackDelta: cfg.Querier.LookbackDelta.D(),
-			Timeout:       cfg.Querier.Timeout.D(),
-			MaxSamples:    cfg.Querier.MaxSamples,
-			Registerer:    a.Registry,
-			Logger:        logger,
-			BuildInfo:     version.Info(),
+			LookbackDelta:        cfg.Querier.LookbackDelta.D(),
+			Timeout:              cfg.Querier.Timeout.D(),
+			MaxSamples:           cfg.Querier.MaxSamples,
+			MaxConcurrentQueries: cfg.Querier.MaxConcurrent,
+			Registerer:           a.Registry,
+			Logger:               logger,
+			BuildInfo:            version.Info(),
 		})
 		api.Register(a.Server.Mux, func(h http.Handler) http.Handler {
 			return gzhttp.GzipHandler(a.Server.Instrument("query", h))

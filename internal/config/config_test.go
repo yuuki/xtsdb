@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,12 +16,24 @@ func TestDefaultIsValid(t *testing.T) {
 }
 
 func TestLoadExampleConfig(t *testing.T) {
+	t.Setenv("XTSDB_CASSANDRA_HOSTS", "c1:9042, c2:9042")
 	cfg, err := Load(filepath.Join("..", "..", "examples", "xtsdb.yaml"), true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.Storage.ChunkRange.D() != time.Hour {
 		t.Fatalf("chunk_range = %v", cfg.Storage.ChunkRange)
+	}
+	if len(cfg.Cassandra.Hosts) != 2 || cfg.Redis.Addrs[0] != "127.0.0.1:6379" {
+		t.Fatalf("env lists not expanded: %v %v", cfg.Cassandra.Hosts, cfg.Redis.Addrs)
+	}
+	// The example documents the defaults; only fields marked "example" differ.
+	def := Default()
+	cfg.Redis.Addrs, cfg.Cassandra.Hosts = def.Redis.Addrs, def.Cassandra.Hosts
+	cfg.Cassandra.AutoMigrate = def.Cassandra.AutoMigrate
+	cfg.Ingester.GraphiteListenAddress = def.Ingester.GraphiteListenAddress
+	if got, want := fmt.Sprintf("%+v", cfg), fmt.Sprintf("%+v", def); got != want {
+		t.Fatalf("example config differs from the defaults:\n%s\n%s", got, want)
 	}
 }
 
@@ -55,8 +68,8 @@ storage:
 func TestExpandEnvDefaults(t *testing.T) {
 	t.Setenv("XT_SET", "v")
 	t.Setenv("XT_EMPTY", "")
-	got := ExpandEnv("${XT_SET:-d} ${XT_EMPTY:-d} ${XT_UNSET:-a:b} $XT_SET ${XT_UNSET}")
-	if got != "v d a:b v " {
+	got := ExpandEnv("${XT_SET:-d} ${XT_EMPTY:-d} ${XT_UNSET:-a:b} $XT_SET ${XT_UNSET} ${XT_EMPTY-d} ${XT_UNSET-d} p$$w$$")
+	if got != "v d a:b v   d p$w$" {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -83,12 +96,17 @@ func TestEmptyFileUsesDefaults(t *testing.T) {
 
 func TestValidate(t *testing.T) {
 	cases := map[string]func(*Config){
-		"shards":       func(c *Config) { c.Storage.Shards = 0 },
-		"key_prefix":   func(c *Config) { c.Storage.KeyPrefix = "a{b}" },
-		"chunk_range":  func(c *Config) { c.Storage.ChunkRange = Duration(48 * time.Hour) },
-		"hot_lookback": func(c *Config) { c.Querier.HotLookback = Duration(time.Minute) },
-		"log.level":    func(c *Config) { c.Log.Level = "verbose" },
-		"retention":    func(c *Config) { c.Storage.Retention = Duration(30 * 365 * 24 * time.Hour) },
+		"shards":                func(c *Config) { c.Storage.Shards = 0 },
+		"key_prefix":            func(c *Config) { c.Storage.KeyPrefix = "a{b}" },
+		"chunk_range":           func(c *Config) { c.Storage.ChunkRange = Duration(48 * time.Hour) },
+		"hot_lookback":          func(c *Config) { c.Querier.HotLookback = Duration(time.Minute) },
+		"log.level":             func(c *Config) { c.Log.Level = "verbose" },
+		"retention":             func(c *Config) { c.Storage.Retention = Duration(20 * 365 * 24 * time.Hour) },
+		"consistency":           func(c *Config) { c.Cassandra.Consistency = "ANY" },
+		"keyspace":              func(c *Config) { c.Cassandra.Keyspace = "bad-name" },
+		"pool_size":             func(c *Config) { c.Redis.PoolSize = -1 },
+		"redis.addrs":           func(c *Config) { c.Redis.Addrs = []string{""} },
+		"max_request_body_size": func(c *Config) { c.Ingester.MaxRequestBodySize = 1 << 62 },
 	}
 	for field, mutate := range cases {
 		cfg := Default()

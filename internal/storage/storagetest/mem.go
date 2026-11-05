@@ -3,6 +3,7 @@
 package storagetest
 
 import (
+	"cmp"
 	"context"
 	"slices"
 	"sync"
@@ -27,10 +28,13 @@ type Hot struct {
 	Layout   model.Layout
 	Lease    time.Duration
 	Now      func() time.Time
+	MaxChunk int // maximum samples per chunk; 0 means unlimited
 	chunks   map[storage.ChunkRef]*hotChunk
 	inflight map[storage.ChunkRef]int64
 	seq      int64
 }
+
+func size(c *hotChunk) int { return 16 + 16*len(c.raw) }
 
 // NewHot creates a Hot store.
 func NewHot(layout model.Layout, lease time.Duration) *Hot {
@@ -63,6 +67,10 @@ func (h *Hot) Append(_ context.Context, batch []storage.SeriesSamples) (storage.
 				continue
 			}
 			c := h.chunks[ref]
+			if c != nil && h.MaxChunk > 0 && len(c.raw) >= h.MaxChunk {
+				res.ChunkFull++
+				continue
+			}
 			if c == nil {
 				h.seq++
 				c = &hotChunk{fragment: now*1000 + h.seq, due: due}
@@ -97,16 +105,24 @@ func (h *Hot) Claim(_ context.Context, shard, limit int) ([]storage.ChunkRef, er
 }
 
 // Load implements storage.HotStore.
-func (h *Hot) Load(_ context.Context, refs []storage.ChunkRef) ([]storage.HotChunk, error) {
+func (h *Hot) Load(_ context.Context, refs []storage.ChunkRef) ([]storage.HotChunk, []storage.ChunkRef, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	var out []storage.HotChunk
+	var (
+		out     []storage.HotChunk
+		missing []storage.ChunkRef
+	)
 	for _, ref := range refs {
-		if c := h.chunks[ref]; c != nil {
-			out = append(out, storage.HotChunk{Ref: ref, Fragment: c.fragment, Samples: chunk.Normalize(slices.Clone(c.raw))})
+		c := h.chunks[ref]
+		if c == nil {
+			missing = append(missing, ref)
+			continue
 		}
+		out = append(out, storage.HotChunk{
+			Ref: ref, Fragment: c.fragment, Size: size(c), Samples: chunk.Normalize(slices.Clone(c.raw)),
+		})
 	}
-	return out, nil
+	return out, missing, nil
 }
 
 // Complete implements storage.HotStore.
@@ -114,12 +130,38 @@ func (h *Hot) Complete(_ context.Context, chunks []storage.HotChunk) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for _, hc := range chunks {
-		if c := h.chunks[hc.Ref]; c == nil || c.fragment == hc.Fragment {
+		if c := h.chunks[hc.Ref]; c != nil && c.fragment == hc.Fragment && size(c) == hc.Size {
 			delete(h.chunks, hc.Ref)
 			delete(h.inflight, hc.Ref)
 		}
 	}
 	return nil
+}
+
+// Release implements storage.HotStore.
+func (h *Hot) Release(_ context.Context, refs []storage.ChunkRef) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, ref := range refs {
+		if h.chunks[ref] == nil {
+			delete(h.inflight, ref)
+		}
+	}
+	return nil
+}
+
+// Inflight returns the number of claimed chunks.
+func (h *Hot) Inflight() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.inflight)
+}
+
+// Delete removes a chunk without completing it, to simulate data loss.
+func (h *Hot) Delete(ref storage.ChunkRef) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.chunks, ref)
 }
 
 // Read implements storage.HotStore.
@@ -157,12 +199,15 @@ func (h *Hot) Backlog(context.Context) (storage.Backlog, error) {
 	for ref, c := range h.chunks {
 		if _, busy := h.inflight[ref]; busy {
 			b.InflightChunks++
-			continue
+		} else {
+			b.PendingChunks++
 		}
-		b.PendingChunks++
 		if b.OldestDue == 0 || c.due < b.OldestDue {
 			b.OldestDue = c.due
 		}
+	}
+	if b.OldestDue != 0 {
+		b.OldestStart = b.OldestDue - h.Layout.ChunkRange - h.Layout.Grace
 	}
 	return b, nil
 }
@@ -180,6 +225,9 @@ type coldKey struct {
 	series   model.SeriesID
 	start    int64
 	fragment int64
+	total    int
+	digest   uint64
+	part     int
 }
 
 // Cold is an in-memory storage.ColdStore.
@@ -205,7 +253,7 @@ func (c *Cold) WriteChunk(_ context.Context, ch storage.ColdChunk) error {
 	if c.FailWrites != nil {
 		return c.FailWrites
 	}
-	c.chunks[coldKey{ch.Series, ch.Start, ch.Fragment}] = ch
+	c.chunks[coldKey{ch.Series, ch.Start, ch.Fragment, ch.Total, ch.Digest, ch.Part}] = ch
 	return nil
 }
 
@@ -225,24 +273,36 @@ func (c *Cold) Read(_ context.Context, ids []model.SeriesID, mint, maxt int64) (
 		keys = append(keys, k)
 	}
 	slices.SortFunc(keys, func(a, b coldKey) int {
-		if a.start != b.start {
-			return int(a.start - b.start)
-		}
-		return int(a.fragment - b.fragment)
+		return cmp.Or(cmp.Compare(a.start, b.start), cmp.Compare(a.fragment, b.fragment),
+			cmp.Compare(a.total, b.total), cmp.Compare(a.digest, b.digest), cmp.Compare(a.part, b.part))
 	})
 	out := make(map[model.SeriesID][]model.Sample)
 	for _, id := range ids {
-		var sets [][]model.Sample
+		// Concatenate the parts of each version, then merge versions in
+		// order so that later and more complete versions win.
+		var (
+			sets    [][]model.Sample
+			pending []model.Sample
+			cur     *coldKey
+		)
 		for _, k := range keys {
 			if k.series != id || k.start > maxt || k.start+c.ChunkRange <= mint {
 				continue
+			}
+			if cur != nil && (cur.start != k.start || cur.fragment != k.fragment || cur.total != k.total || cur.digest != k.digest) {
+				sets = append(sets, chunk.Filter(chunk.Normalize(pending), mint, maxt))
+				pending = nil
 			}
 			ch := c.chunks[k]
 			s, err := chunk.Decode(ch.Encoding, ch.Data)
 			if err != nil {
 				return nil, err
 			}
-			sets = append(sets, chunk.Filter(s, mint, maxt))
+			pending = append(pending, s...)
+			cur = &k
+		}
+		if cur != nil {
+			sets = append(sets, chunk.Filter(chunk.Normalize(pending), mint, maxt))
 		}
 		if s := chunk.Merge(sets...); len(s) > 0 {
 			out[id] = s

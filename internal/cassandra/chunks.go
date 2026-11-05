@@ -55,9 +55,11 @@ func NewChunkStore(s *gocql.Session, retention time.Duration, chunkRange int64, 
 
 // WriteChunk stores a chunk. The primary key makes the write idempotent.
 func (c *ChunkStore) WriteChunk(ctx context.Context, ch storage.ColdChunk) error {
-	err := c.session.Query(`INSERT INTO chunks (series_id, day, start_ms, fragment, max_t, samples, encoding, data)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?) USING TTL ?`,
-		int64(ch.Series), model.Day(ch.Start), ch.Start, ch.Fragment, ch.MaxT, ch.Count, int8(ch.Encoding), ch.Data, c.ttl,
+	err := c.session.Query(`INSERT INTO chunks
+		(series_id, day, start_ms, fragment, total, digest, part, max_t, samples, encoding, data)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL ?`,
+		int64(ch.Series), model.Day(ch.Start), ch.Start, ch.Fragment, ch.Total, int64(ch.Digest), ch.Part,
+		ch.MaxT, ch.Count, int8(ch.Encoding), ch.Data, c.ttl,
 	).Idempotent(true).ExecContext(ctx)
 	if err != nil {
 		return fmt.Errorf("write chunk %s@%d: %w", ch.Series, ch.Start, err)
@@ -94,32 +96,55 @@ func (c *ChunkStore) Read(ctx context.Context, ids []model.SeriesID, mint, maxt 
 }
 
 func (c *ChunkStore) readSeries(ctx context.Context, id model.SeriesID, days []int32, from, mint, maxt int64) ([]model.Sample, error) {
-	// Fragments are returned in (start, fragment) order, so later
-	// incarnations of a window take precedence when merged.
-	var sets [][]model.Sample
+	// Rows arrive in clustering order, so the parts of a version are
+	// consecutive and versions of a window are ordered by (fragment, total):
+	// later incarnations and more complete versions come last and win when
+	// merged.
+	type version struct {
+		start, fragment, digest int64
+		total                   int
+	}
+	var (
+		sets    [][]model.Sample
+		cur     version
+		pending []model.Sample
+		started bool
+	)
+	flushVersion := func() {
+		if s := chunk.Filter(chunk.Normalize(pending), mint, maxt); len(s) > 0 {
+			sets = append(sets, s)
+		}
+		pending = nil
+	}
 	for _, day := range days {
-		iter := c.session.Query(`SELECT encoding, data FROM chunks
+		iter := c.session.Query(`SELECT start_ms, fragment, total, digest, encoding, data FROM chunks
 			WHERE series_id = ? AND day = ? AND start_ms >= ? AND start_ms <= ?`,
 			int64(id), day, from, maxt,
 		).Idempotent(true).IterContext(ctx)
 		var (
+			v    version
 			enc  int8
 			data []byte
 		)
-		for iter.Scan(&enc, &data) {
+		for iter.Scan(&v.start, &v.fragment, &v.total, &v.digest, &enc, &data) {
+			if started && v != cur {
+				flushVersion()
+			}
+			cur, started = v, true
 			samples, err := chunk.Decode(chunk.Encoding(enc), data)
 			if err != nil {
 				c.logger.Error("skipping undecodable chunk", "series", id, "day", day, "err", err)
-				continue
-			}
-			if s := chunk.Filter(samples, mint, maxt); len(s) > 0 {
-				sets = append(sets, s)
+			} else {
+				pending = append(pending, samples...)
 			}
 			data = nil
 		}
 		if err := iter.Close(); err != nil {
 			return nil, fmt.Errorf("read chunks of %s: %w", id, err)
 		}
+	}
+	if started {
+		flushVersion()
 	}
 	return chunk.Merge(sets...), nil
 }

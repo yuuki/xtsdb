@@ -15,8 +15,9 @@ use each store for what it is good at, and scale each tier independently.
 ## Features
 
 - **No data loss in the hand-off.** Samples move from Redis to Cassandra
-  with an at-least-once protocol based on leases and idempotent writes,
-  without depending on Redis keyspace notifications.
+  with an at-least-once protocol based on leases and content-idempotent
+  writes, keep working when Redis is full or Cassandra is slow, and stay
+  visible to queries throughout. No Redis keyspace notifications are used.
 - **Prometheus compatible.** Remote Write 1.0 and 2.0 for ingestion; PromQL
   through `/api/v1/query`, `/api/v1/query_range`, `/api/v1/series`,
   `/api/v1/labels` and `/api/v1/label/<name>/values`, evaluated by the
@@ -27,7 +28,7 @@ use each store for what it is good at, and scale each tier independently.
 - **Series index** in Cassandra, partitioned by day, so label matchers
   (`=`, `!=`, `=~`, `!~`) work on any time range.
 - **Gorilla compression** in the persistent tier (Prometheus XOR chunks).
-- **Redis standalone, Sentinel or Cluster; Valkey** as a drop-in
+- **Redis 7.0+ standalone, Sentinel or Cluster; Valkey 7.2+** as a drop-in
   replacement. Every Redis script touches a single cluster slot.
 - **One binary, four roles** (`ingester`, `flusher`, `querier`, or `all`)
   that scale independently.
@@ -72,6 +73,8 @@ docker compose up -d --build
 This starts Redis 8.10, Cassandra 5.0, xtsdb, a Prometheus that
 remote-writes into xtsdb, and Grafana with xtsdb as its default data source
 at <http://localhost:3000>. Cassandra takes about a minute to become ready.
+Nothing in this stack is authenticated, so all ports are published on
+127.0.0.1 only.
 
 Send a Graphite sample and query it back:
 
@@ -100,7 +103,14 @@ remote_write:
 
 Samples are accepted until their chunk window closes. Older samples are
 rejected (remote write answers `400` with a description), which bounds
-backfill to `chunk_range` + `grace_period`.
+backfill to `chunk_range` + `grace_period`. Remote write requests are limited
+in size and number of elements, and at most
+`ingester.max_inflight_requests` are processed at once (others get 503 and
+are retried by Prometheus); see [examples/xtsdb.yaml](examples/xtsdb.yaml).
+
+Graphite lines are written at most one second after they arrive. Graphite
+cannot report errors to its clients, so rejected and dropped lines are only
+visible in the metrics below and in the logs.
 
 ## Querying
 
@@ -115,8 +125,9 @@ no `start` is given.
 
 ## Running in production
 
-Run `xtsdb <role> -config.file=xtsdb.yaml`. All roles are stateless and can
-be scaled horizontally:
+Run `xtsdb <role> -config.file=xtsdb.yaml -config.expand-env` (drop
+`-config.expand-env` if your file has no `${VAR}` references). All roles are
+stateless and can be scaled horizontally:
 
 | Role       | Scales with                         | Notes |
 |------------|-------------------------------------|-------|
@@ -130,12 +141,15 @@ be scaled horizontally:
 - Enable AOF (`appendonly yes`) and replicas: the hot tier holds the most
   recent `chunk_range` + `grace_period` of data.
 - Memory needed is roughly 16 bytes per sample held in Redis.
-- No keyspace-notification or other special configuration is required.
+- Redis 7.0 or later (Valkey 7.2 or later) is required. No
+  keyspace-notification or other special configuration is needed.
 
 **Cassandra**
 - Create the schema with `xtsdb migrate -config.file=...` (or set
-  `cassandra.auto_migrate: true`). Use `NetworkTopologyStrategy` and
-  `LOCAL_QUORUM` in production.
+  `cassandra.auto_migrate: true`). Use `NetworkTopologyStrategy` in
+  production, and keep `cassandra.consistency` at `LOCAL_QUORUM` (or
+  `QUORUM`): reads must see what flushers wrote, otherwise queries can miss
+  data while it moves between tiers.
 - Samples and index entries expire through TTLs set from
   `storage.retention`; chunk and postings tables use
   `TimeWindowCompactionStrategy`.
@@ -145,10 +159,11 @@ Watch in particular:
 
 | Metric | Meaning |
 |--------|---------|
-| `xtsdb_flusher_lag_seconds` | How long the oldest closed chunk has been waiting. Should stay near zero. |
+| `xtsdb_flusher_lag_seconds` | How long the oldest closed chunk (pending or claimed) has been waiting. Should stay near zero. |
 | `xtsdb_hot_pending_chunks`, `xtsdb_hot_inflight_chunks` | Chunks held in Redis. |
 | `xtsdb_flusher_chunks_total{outcome="error"}` | Failed flushes; they are retried after the lease. |
-| `xtsdb_ingester_samples_total{outcome=...}` | Accepted and rejected samples. |
+| `xtsdb_ingester_samples_total{outcome=...}` | Accepted samples and rejections: `too_old`, `too_new`, `invalid`, `chunk_full`, `unsupported` (histograms), `throttled`, `error`. |
+| `xtsdb_graphite_lines_total{outcome="dropped"}`, `xtsdb_graphite_connections_total{outcome="rejected"}` | Graphite overload. |
 
 **Configuration.** [examples/xtsdb.yaml](examples/xtsdb.yaml) documents every
 option with its default. `xtsdb config -config.file=...` prints the
@@ -179,12 +194,17 @@ Cassandra 5.0.9, Prometheus 3.15.1 and Grafana 13.3.0.
 
 ## Limitations
 
-- Native histograms and exemplars are not supported yet; they are dropped
-  on ingestion.
+- Native histograms and exemplars are not supported yet. Requests that
+  carry histograms store their float samples and answer 400, so Prometheus
+  reports the dropped histograms instead of silently losing them.
 - No multi-tenancy, authentication, remote read, downsampling or recording
   rules.
 - Samples older than their closed chunk window are rejected, so large
   backfills are not possible.
+- A series can hold at most about two million samples per chunk window in
+  Redis (32 MiB); more are rejected as `chunk_full`.
+- Queries reach back at most `storage.retention`, or
+  `querier.max_query_lookback` (default one year) when retention is 0.
 - Series are identified by a 64-bit hash of their labels.
 - Very high-cardinality label pairs (millions of series sharing one value on
   one day) produce large Cassandra partitions in the index.

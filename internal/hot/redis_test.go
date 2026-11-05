@@ -177,11 +177,11 @@ func TestFlushLifecycle(t *testing.T) {
 		t.Fatalf("late sample must be rejected, got %+v", res)
 	}
 
-	chunks, err := s.Load(ctx, refs)
+	chunks, missing, err := s.Load(ctx, refs)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(chunks) != 1 || len(chunks[0].Samples) != 2 || chunks[0].Fragment == 0 {
+	if len(missing) != 0 || len(chunks) != 1 || len(chunks[0].Samples) != 2 || chunks[0].Fragment == 0 {
 		t.Fatalf("unexpected load %+v", chunks)
 	}
 	// Data stays readable until the chunk is completed.
@@ -232,7 +232,7 @@ func TestCompleteIgnoresNewerIncarnation(t *testing.T) {
 		t.Fatal(err)
 	}
 	refs := waitClaim(t, s, 0)
-	chunks, err := s.Load(ctx, refs)
+	chunks, _, err := s.Load(ctx, refs)
 	if err != nil || len(chunks) != 1 {
 		t.Fatalf("load: %v %v", chunks, err)
 	}
@@ -257,9 +257,9 @@ func TestQuarantinesCorruptChunks(t *testing.T) {
 	refs := waitClaim(t, s, 0)
 	m := member(refs[0].Series, refs[0].Start)
 	client.Append(ctx, s.chunkKey(0, m), "x") // break record alignment
-	chunks, err := s.Load(ctx, refs)
-	if err != nil || len(chunks) != 0 {
-		t.Fatalf("corrupt chunk must be skipped: %v %v", chunks, err)
+	chunks, missing, err := s.Load(ctx, refs)
+	if err != nil || len(chunks) != 0 || len(missing) != 0 {
+		t.Fatalf("corrupt chunk must be skipped: %v %v %v", chunks, missing, err)
 	}
 	if client.Exists(ctx, s.quarantineKey(0, m)).Val() != 1 {
 		t.Fatal("corrupt chunk was not quarantined")
@@ -296,6 +296,159 @@ func TestRefusesShardCountChange(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "shards") {
 		t.Fatalf("expected shard mismatch error, got %v", err)
 	}
+}
+
+func TestRefusesChunkRangeChange(t *testing.T) {
+	layout := model.Layout{Shards: 4, ChunkRange: 1000}
+	s, client := newTestStore(t, layout, time.Minute)
+	layout.ChunkRange = 2000
+	_, err := New(context.Background(), client, Options{Prefix: s.prefix, Layout: layout, Lease: time.Minute})
+	if err == nil || !strings.Contains(err.Error(), "chunk_range") {
+		t.Fatalf("expected chunk_range mismatch error, got %v", err)
+	}
+}
+
+func TestChunkSizeLimit(t *testing.T) {
+	layout := model.Layout{Shards: 1, ChunkRange: time.Hour.Milliseconds()}
+	s, client := newTestStore(t, layout, time.Minute)
+	ctx := context.Background()
+	s2, err := New(ctx, client, Options{Prefix: s.prefix, Layout: layout, Lease: time.Minute, MaxChunkBytes: 16 + 3*16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := nowMs()
+	var samples []model.Sample
+	for i := range 5 {
+		samples = append(samples, model.Sample{T: now + int64(i), V: 1})
+	}
+	res, err := s2.Append(ctx, []storage.SeriesSamples{{ID: 1, Samples: samples[:3]}})
+	if err != nil || res.Accepted != 3 {
+		t.Fatalf("first append: %+v %v", res, err)
+	}
+	res, err = s2.Append(ctx, []storage.SeriesSamples{{ID: 1, Samples: samples[3:]}})
+	if err != nil || res.ChunkFull != 2 || res.Accepted != 0 {
+		t.Fatalf("append beyond the limit: %+v %v", res, err)
+	}
+}
+
+func TestCompleteKeepsChunkThatGrew(t *testing.T) {
+	layout := model.Layout{Shards: 1, ChunkRange: 300, Grace: 0}
+	s, client := newTestStore(t, layout, 500*time.Millisecond)
+	ctx := context.Background()
+	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: 5, Samples: []model.Sample{{T: nowMs(), V: 1}}}}); err != nil {
+		t.Fatal(err)
+	}
+	refs := waitClaim(t, s, 0)
+	chunks, _, err := s.Load(ctx, refs)
+	if err != nil || len(chunks) != 1 {
+		t.Fatalf("load: %v %v", chunks, err)
+	}
+	// A sample appended after the chunk was loaded (only possible after a
+	// failover or clock jump) must not be deleted by Complete.
+	key := s.chunkKey(0, member(refs[0].Series, refs[0].Start))
+	client.Append(ctx, key, string(make([]byte, 16)))
+	if err := s.Complete(ctx, chunks); err != nil {
+		t.Fatal(err)
+	}
+	if client.Exists(ctx, key).Val() != 1 {
+		t.Fatal("chunk that grew after loading was deleted")
+	}
+	// It is handed out again after the lease and can then be completed.
+	again := waitClaim(t, s, 0)
+	chunks, _, err = s.Load(ctx, again)
+	if err != nil || len(chunks) != 1 || len(chunks[0].Samples) != 2 {
+		t.Fatalf("reload: %v %v", chunks, err)
+	}
+	if err := s.Complete(ctx, chunks); err != nil {
+		t.Fatal(err)
+	}
+	if client.Exists(ctx, key).Val() != 0 {
+		t.Fatal("chunk was not completed")
+	}
+}
+
+func TestReleaseMissingChunks(t *testing.T) {
+	layout := model.Layout{Shards: 1, ChunkRange: 300, Grace: 0}
+	s, client := newTestStore(t, layout, time.Minute)
+	ctx := context.Background()
+	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: 5, Samples: []model.Sample{{T: nowMs(), V: 1}}}}); err != nil {
+		t.Fatal(err)
+	}
+	refs := waitClaim(t, s, 0)
+	client.Del(ctx, s.chunkKey(0, member(refs[0].Series, refs[0].Start)))
+	chunks, missing, err := s.Load(ctx, refs)
+	if err != nil || len(chunks) != 0 || len(missing) != 1 {
+		t.Fatalf("load: %v %v %v", chunks, missing, err)
+	}
+	if err := s.Release(ctx, missing); err != nil {
+		t.Fatal(err)
+	}
+	if n := client.ZCard(ctx, s.inflightKey(0)).Val() + client.ZCard(ctx, s.inflightDueKey(0)).Val(); n != 0 {
+		t.Fatalf("in-flight entries leaked: %d", n)
+	}
+}
+
+func TestBacklogCountsInflightChunks(t *testing.T) {
+	layout := model.Layout{Shards: 2, ChunkRange: 300, Grace: 100}
+	s, _ := newTestStore(t, layout, time.Minute)
+	ctx := context.Background()
+	id := model.SeriesID(9)
+	t0 := nowMs()
+	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: id, Samples: []model.Sample{{T: t0, V: 1}}}}); err != nil {
+		t.Fatal(err)
+	}
+	waitClaim(t, s, layout.Shard(id))
+	b, err := s.Backlog(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := layout.WindowStart(id, t0)
+	if b.InflightChunks != 1 || b.OldestDue != layout.Due(start) || b.OldestStart != start {
+		t.Fatalf("in-flight chunk not reflected in backlog: %+v (start %d)", b, start)
+	}
+}
+
+// TestClaimWorksAtMaxmemory needs a throwaway server whose maxmemory the
+// test may change: XTSDB_TEST_REDIS_OOM_ADDR.
+func TestClaimWorksAtMaxmemory(t *testing.T) {
+	addr := os.Getenv("XTSDB_TEST_REDIS_OOM_ADDR")
+	if addr == "" {
+		t.Skip("XTSDB_TEST_REDIS_OOM_ADDR not set")
+	}
+	t.Setenv("XTSDB_TEST_REDIS_ADDRS", addr)
+	t.Setenv("XTSDB_TEST_REDIS_CLUSTER", "")
+	layout := model.Layout{Shards: 1, ChunkRange: 300, Grace: 0}
+	s, client := newTestStore(t, layout, 300*time.Millisecond)
+	ctx := context.Background()
+	t.Cleanup(func() { client.ConfigSet(context.Background(), "maxmemory", "0") })
+	client.ConfigSet(ctx, "maxmemory-policy", "noeviction")
+	for i := range 20 {
+		if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: model.SeriesID(i), Samples: []model.Sample{{T: nowMs(), V: 1}}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	refs := waitClaim(t, s, 0)
+	time.Sleep(400 * time.Millisecond) // let the leases expire
+	// Far below the memory in use: Redis is now out of memory.
+	if err := client.ConfigSet(ctx, "maxmemory", "100kb").Err(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: 99, Samples: []model.Sample{{T: nowMs(), V: 1}}}}); err == nil ||
+		!strings.Contains(err.Error(), "OOM") {
+		t.Fatalf("precondition: append must be refused at maxmemory, got %v", err)
+	}
+	again, err := s.Claim(ctx, 0, 100)
+	if err != nil || len(again) == 0 {
+		t.Fatalf("claim must work at maxmemory: %d refs, %v", len(again), err)
+	}
+	chunks, _, err := s.Load(ctx, again)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Complete(ctx, chunks); err != nil {
+		t.Fatalf("complete must work at maxmemory: %v", err)
+	}
+	_ = refs
 }
 
 func TestManySeriesAcrossShards(t *testing.T) {

@@ -31,11 +31,28 @@ const (
 	headerExemplarsWritten  = "X-Prometheus-Remote-Write-Exemplars-Written"
 )
 
+// RemoteWriteOptions bounds the resources a remote write request may use.
+type RemoteWriteOptions struct {
+	MaxBodySize         int64 // compressed body
+	MaxDecompressedSize int64
+	MaxInflight         int // concurrent requests; more get 503 and are retried
+	Limits              Limits
+}
+
 // RemoteWriteHandler serves the Prometheus Remote Write 1.0 and 2.0
-// protocols. Native histograms and exemplars are not supported yet and are
-// dropped.
-func RemoteWriteHandler(w *Writer, maxBodySize int64, logger *slog.Logger) http.Handler {
+// protocols. Native histograms and exemplars are not supported: requests
+// carrying histograms store their float samples and answer 400.
+func RemoteWriteHandler(w *Writer, opts RemoteWriteOptions, logger *slog.Logger) http.Handler {
+	inflight := make(chan struct{}, opts.MaxInflight)
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		select {
+		case inflight <- struct{}{}:
+			defer func() { <-inflight }()
+		default:
+			w.discard("throttled", 0)
+			http.Error(rw, "too many concurrent remote write requests", http.StatusServiceUnavailable)
+			return
+		}
 		proto, err := remoteWriteProto(r.Header.Get("Content-Type"))
 		if err != nil {
 			http.Error(rw, err.Error(), http.StatusUnsupportedMediaType)
@@ -45,7 +62,7 @@ func RemoteWriteHandler(w *Writer, maxBodySize int64, logger *slog.Logger) http.
 			http.Error(rw, "unsupported Content-Encoding "+enc, http.StatusUnsupportedMediaType)
 			return
 		}
-		compressed, err := io.ReadAll(http.MaxBytesReader(rw, r.Body, maxBodySize))
+		compressed, err := io.ReadAll(http.MaxBytesReader(rw, r.Body, opts.MaxBodySize))
 		if err != nil {
 			var tooLarge *http.MaxBytesError
 			if errors.As(err, &tooLarge) {
@@ -55,34 +72,50 @@ func RemoteWriteHandler(w *Writer, maxBodySize int64, logger *slog.Logger) http.
 			http.Error(rw, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if n, err := snappy.DecodedLen(compressed); err != nil || int64(n) > 4*maxBodySize {
-			http.Error(rw, "invalid or too large snappy payload", http.StatusBadRequest)
-			return
-		}
-		body, err := snappy.Decode(nil, compressed)
+		n, err := snappy.DecodedLen(compressed)
 		if err != nil {
 			http.Error(rw, "snappy: "+err.Error(), http.StatusBadRequest)
 			return
 		}
+		if int64(n) > opts.MaxDecompressedSize {
+			http.Error(rw, fmt.Sprintf("decompressed request of %d bytes exceeds the limit of %d", n, opts.MaxDecompressedSize),
+				http.StatusRequestEntityTooLarge)
+			return
+		}
+		// Strict Snappy: the S2 extensions accepted by snappy.Decode allow
+		// far higher compression ratios.
+		body, err := snappy.DecodeStrict(nil, compressed)
+		if err != nil {
+			http.Error(rw, "snappy: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := prescan(body, proto == protoV2, opts.Limits); err != nil {
+			code := http.StatusBadRequest
+			if errors.Is(err, errLimit) {
+				code = http.StatusRequestEntityTooLarge
+			}
+			http.Error(rw, err.Error(), code)
+			return
+		}
 
 		var (
-			batch   []Series
-			dropped int
+			batch      []Series
+			histograms int
 		)
 		if proto == protoV2 {
-			batch, dropped, err = decodeV2(body)
+			batch, histograms, err = decodeV2(body)
 		} else {
-			batch, dropped, err = decodeV1(body)
+			batch, histograms, err = decodeV1(body)
 		}
 		if err != nil {
 			http.Error(rw, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if dropped > 0 {
-			logger.Debug("dropped unsupported histograms", "count", dropped)
-		}
 
 		res, err := w.Write(r.Context(), batch)
+		if histograms > 0 {
+			w.discard("unsupported", histograms)
+		}
 		if proto == protoV2 {
 			rw.Header().Set(headerSamplesWritten, strconv.Itoa(res.Accepted))
 			rw.Header().Set(headerHistogramsWritten, "0")
@@ -91,10 +124,14 @@ func RemoteWriteHandler(w *Writer, maxBodySize int64, logger *slog.Logger) http.
 		switch {
 		case err != nil:
 			logger.Warn("remote write failed", "err", err)
-			http.Error(rw, err.Error(), http.StatusServiceUnavailable)
-		case res.Rejected() > 0:
+			http.Error(rw, "storage unavailable, retry later", http.StatusServiceUnavailable)
+		case res.Rejected() > 0 || histograms > 0:
 			// Partial success. 4xx tells the sender not to retry.
-			http.Error(rw, describeRejections(res), http.StatusBadRequest)
+			msg := describeRejections(res)
+			if histograms > 0 {
+				msg += fmt.Sprintf("; %d native histogram samples dropped: native histograms are not supported", histograms)
+			}
+			http.Error(rw, msg, http.StatusBadRequest)
 		default:
 			rw.WriteHeader(http.StatusNoContent)
 		}

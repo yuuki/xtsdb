@@ -3,19 +3,23 @@ package query
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/prometheus/prometheus/model/labels"
 
 	"github.com/yuuki/xtsdb/internal/chunk"
+	"github.com/yuuki/xtsdb/internal/flush"
 	"github.com/yuuki/xtsdb/internal/model"
 	"github.com/yuuki/xtsdb/internal/storage"
 	"github.com/yuuki/xtsdb/internal/storage/storagetest"
@@ -146,7 +150,7 @@ func TestSeriesResolution(t *testing.T) {
 		}, 0},
 	}
 	for i, c := range cases {
-		refs, err := f.q.Series(ctx, ms(-time.Hour), ms(0), c.matchers...)
+		refs, _, err := f.q.Series(ctx, ms(-time.Hour), ms(0), 0, c.matchers...)
 		if err != nil {
 			t.Fatalf("case %d: %v", i, err)
 		}
@@ -154,7 +158,7 @@ func TestSeriesResolution(t *testing.T) {
 			t.Errorf("case %d: got %d series, want %d", i, len(refs), c.want)
 		}
 	}
-	_, err := f.q.Series(ctx, ms(-time.Hour), ms(0), labels.MustNewMatcher(labels.MatchNotEqual, "job", "x"))
+	_, _, err := f.q.Series(ctx, ms(-time.Hour), ms(0), 0, labels.MustNewMatcher(labels.MatchNotEqual, "job", "x"))
 	if err != ErrNoPositiveMatcher {
 		t.Fatalf("expected ErrNoPositiveMatcher, got %v", err)
 	}
@@ -304,9 +308,16 @@ func TestParseTimeAndDuration(t *testing.T) {
 	if tm, _ := parseTime("1700000000.5"); tm.UnixMilli() != 1_700_000_000_500 {
 		t.Errorf("fractional seconds lost: %v", tm)
 	}
-	for _, s := range []string{"", "abc", "NaN", "1e300"} {
+	for _, s := range []string{"", "abc", "NaN"} {
 		if _, err := parseTime(s); err == nil {
 			t.Errorf("parseTime(%q) should fail", s)
+		}
+	}
+	// Huge values and the min/max sentinels sent by Prometheus clients are
+	// accepted and clamped.
+	for _, s := range []string{"1e12", "1e300", "-1e300", minTimeFormatted, maxTimeFormatted} {
+		if _, err := parseTime(s); err != nil {
+			t.Errorf("parseTime(%q): %v", s, err)
 		}
 	}
 	for s, want := range map[string]time.Duration{"15": 15 * time.Second, "1.5": 1500 * time.Millisecond, "5m": 5 * time.Minute, "1d": 24 * time.Hour} {
@@ -316,5 +327,248 @@ func TestParseTimeAndDuration(t *testing.T) {
 	}
 	if _, err := parseDuration("x"); err == nil || !strings.Contains(err.Error(), "cannot parse") {
 		t.Errorf("parseDuration should fail: %v", err)
+	}
+}
+
+// handoffCold simulates a flusher that persists and deletes a chunk at the
+// moment the cold tier is read, after the cold read took its snapshot.
+type handoffCold struct {
+	*storagetest.Cold
+	hotRead *bool
+	order   []string
+	handoff func()
+}
+
+func (h *handoffCold) Read(ctx context.Context, ids []model.SeriesID, mint, maxt int64) (map[model.SeriesID][]model.Sample, error) {
+	if !*h.hotRead {
+		h.order = append(h.order, "cold-before-hot")
+	}
+	res, err := h.Cold.Read(ctx, ids, mint, maxt)
+	if h.handoff != nil {
+		h.handoff()
+		h.handoff = nil
+	}
+	return res, err
+}
+
+type recordingHot struct {
+	*storagetest.Hot
+	read *bool
+}
+
+func (r *recordingHot) Read(ctx context.Context, ids []model.SeriesID, mint, maxt int64) (map[model.SeriesID][]model.Sample, error) {
+	*r.read = true
+	return r.Hot.Read(ctx, ids, mint, maxt)
+}
+
+func TestNoGapDuringHandoff(t *testing.T) {
+	f := newFixture(t)
+	lset := labels.FromStrings("__name__", "handoff")
+	id := f.add(t, lset, model.Sample{T: ms(-time.Minute), V: 7})
+
+	var hotRead bool
+	cold := &handoffCold{Cold: f.cold, hotRead: &hotRead}
+	cold.handoff = func() {
+		// Close the window, persist it and delete it from the hot tier.
+		f.hot.Now = func() time.Time { return now.Add(3 * time.Hour) }
+		flush.New(f.hot, f.cold, flush.Options{BatchSize: 10, Concurrency: 1, Lease: time.Minute}).FlushOnce(context.Background())
+		if f.hot.Len() != 0 || f.cold.Len() != 1 {
+			t.Fatalf("hand-off did not happen: hot=%d cold=%d", f.hot.Len(), f.cold.Len())
+		}
+	}
+	q, err := NewQueryable(&recordingHot{Hot: f.hot, read: &hotRead}, cold, f.index, f.q.opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.now = f.q.now
+	got, err := q.Samples(context.Background(), []model.SeriesID{id}, ms(-time.Hour), ms(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cold.order) > 0 {
+		t.Fatal("the cold tier must be read after the hot tier")
+	}
+	if len(got[id]) != 1 {
+		t.Fatalf("sample lost during hand-off: %v", got[id])
+	}
+}
+
+// countingIndex counts index reads; it is called concurrently.
+type countingIndex struct {
+	*storagetest.Index
+	postings, labelNames atomic.Int64
+}
+
+func (c *countingIndex) Postings(ctx context.Context, day int32, name, value string) ([]model.SeriesID, error) {
+	c.postings.Add(1)
+	return c.Index.Postings(ctx, day, name, value)
+}
+
+func (c *countingIndex) LabelNames(ctx context.Context, day int32) ([]string, error) {
+	c.labelNames.Add(1)
+	return c.Index.LabelNames(ctx, day)
+}
+
+// countingCold counts the series whose samples were loaded.
+type countingCold struct {
+	*storagetest.Cold
+	loaded int
+}
+
+func (c *countingCold) Read(ctx context.Context, ids []model.SeriesID, mint, maxt int64) (map[model.SeriesID][]model.Sample, error) {
+	c.loaded += len(ids)
+	return c.Cold.Read(ctx, ids, mint, maxt)
+}
+
+func TestSamplesAreLoadedLazilyAndBounded(t *testing.T) {
+	f := newFixture(t)
+	seedSeries(t, f) // 6 series with 2 samples each
+	cold := &countingCold{Cold: f.cold}
+	q, err := NewQueryable(f.hot, cold, f.index, Options{
+		HotLookback: 6 * time.Hour, MaxSeriesPerQuery: 100, SeriesCacheSize: 100, ReadConcurrency: 4, LoadBatchSize: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.now = f.q.now
+	api := NewAPI(q, APIOptions{LookbackDelta: 5 * time.Minute, Timeout: time.Minute, MaxSamples: 3})
+	api.now = f.q.now
+	mux := http.NewServeMux()
+	api.Register(mux, func(h http.Handler) http.Handler { return h })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/api/v1/query?" + url.Values{"query": {"up[1h]"}, "time": {fmt.Sprint(now.Unix())}}.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status %d, want 422 (too many samples)", resp.StatusCode)
+	}
+	if cold.loaded >= 6 {
+		t.Fatalf("all %d series were loaded although max_samples stopped the query early", cold.loaded)
+	}
+}
+
+func TestPostingsFanoutIsBounded(t *testing.T) {
+	f := newFixture(t)
+	idx := &countingIndex{Index: f.index}
+	for i := range 500 {
+		lset := labels.FromStrings("__name__", "other", "instance", fmt.Sprintf("i%d", i))
+		f.add(t, lset, model.Sample{T: ms(-time.Minute), V: 1})
+	}
+	f.add(t, labels.FromStrings("__name__", "rare", "instance", "x"), model.Sample{T: ms(-time.Minute), V: 1})
+	q, _ := NewQueryable(f.hot, f.cold, idx, f.q.opts)
+	q.now = f.q.now
+	for _, m := range []*labels.Matcher{
+		labels.MustNewMatcher(labels.MatchRegexp, "instance", ".+"),
+		labels.MustNewMatcher(labels.MatchNotEqual, "instance", ""),
+	} {
+		idx.postings.Store(0)
+		refs, _, err := q.Series(context.Background(), ms(-time.Hour), ms(0), 0,
+			labels.MustNewMatcher(labels.MatchEqual, "__name__", "rare"), m)
+		if err != nil || len(refs) != 1 {
+			t.Fatalf("%s: %v %v", m, refs, err)
+		}
+		if n := idx.postings.Load(); n > 2 {
+			t.Fatalf("%s: %d postings reads for one candidate series", m, n)
+		}
+	}
+}
+
+func TestQueryRangeIsBoundedWithoutRetention(t *testing.T) {
+	f := newFixture(t)
+	idx := &countingIndex{Index: f.index}
+	q, _ := NewQueryable(f.hot, f.cold, idx, Options{HotLookback: time.Hour, SeriesCacheSize: 10, ReadConcurrency: 4})
+	q.now = f.q.now
+	if _, _, err := q.LabelNames(context.Background(), math.MinInt64/2, ms(0), 0); err != nil {
+		t.Fatal(err)
+	}
+	if n := idx.labelNames.Load(); n > 367 {
+		t.Fatalf("label names read %d days", n)
+	}
+}
+
+func TestEmptyResultsAreArrays(t *testing.T) {
+	f := newFixture(t)
+	for _, path := range []string{"/api/v1/labels", "/api/v1/label/job/values", "/api/v1/series?match[]=nothing"} {
+		resp, err := http.Get(f.srv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if !strings.Contains(string(b), `"data":[]`) {
+			t.Errorf("%s: %s", path, b)
+		}
+	}
+}
+
+func TestSeriesLimitTruncates(t *testing.T) {
+	f := newFixture(t)
+	seedSeries(t, f)
+	f.q.opts.MaxSeriesPerQuery = 3
+	code, body := f.get(t, "/api/v1/series", url.Values{"match[]": {"up"}, "limit": {"2"}})
+	if code != http.StatusOK || len(body["data"].([]any)) != 2 || body["warnings"] == nil {
+		t.Fatalf("status %d: %v", code, body)
+	}
+	code, body = f.get(t, "/api/v1/label/job/values", url.Values{"limit": {"1"}})
+	if code != http.StatusOK || len(body["data"].([]any)) != 1 || body["warnings"] == nil {
+		t.Fatalf("label values: status %d: %v", code, body)
+	}
+}
+
+// failingCold simulates a Cassandra outage.
+type failingCold struct{ *storagetest.Cold }
+
+func (failingCold) Read(context.Context, []model.SeriesID, int64, int64) (map[model.SeriesID][]model.Sample, error) {
+	return nil, errors.New("connection refused")
+}
+
+func TestStorageOutageIs503(t *testing.T) {
+	f := newFixture(t)
+	seedSeries(t, f)
+	q, _ := NewQueryable(f.hot, failingCold{f.cold}, f.index, f.q.opts)
+	q.now = f.q.now
+	api := NewAPI(q, APIOptions{LookbackDelta: 5 * time.Minute, Timeout: time.Minute, MaxSamples: 1000})
+	api.now = f.q.now
+	mux := http.NewServeMux()
+	api.Register(mux, func(h http.Handler) http.Handler { return h })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/api/v1/query?query=up&time=" + fmt.Sprint(now.Unix()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(b), `"errorType":"unavailable"`) {
+		t.Fatalf("status %d: %s", resp.StatusCode, b)
+	}
+}
+
+func TestNonUTF8MatcherMatchesNothing(t *testing.T) {
+	f := newFixture(t)
+	seedSeries(t, f)
+	refs, _, err := f.q.Series(context.Background(), ms(-time.Hour), ms(0), 0,
+		labels.MustNewMatcher(labels.MatchEqual, "__name__", "\xff"))
+	if err != nil || len(refs) != 0 {
+		t.Fatalf("got %v, %v", refs, err)
+	}
+}
+
+func TestHotLookbackFollowsUnflushedChunks(t *testing.T) {
+	f := newFixture(t)
+	lset := labels.FromStrings("__name__", "lagging")
+	// The sample is 8h old and was never flushed (flushers are behind).
+	f.hot.Now = func() time.Time { return now.Add(-8 * time.Hour) }
+	id := f.add(t, lset, model.Sample{T: ms(-8 * time.Hour), V: 1})
+	f.hot.Now = func() time.Time { return now }
+	got, err := f.q.Samples(context.Background(), []model.SeriesID{id}, ms(-12*time.Hour), ms(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got[id]) != 1 {
+		t.Fatal("a chunk still in the hot tier must stay visible beyond hot_lookback")
 	}
 }

@@ -67,6 +67,8 @@ func New(addr string, reg *prometheus.Registry, enablePprof bool, logger *slog.L
 		Addr:              addr,
 		Handler:           s.Mux,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       time.Minute, // whole request, including the body
+		IdleTimeout:       2 * time.Minute,
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
 	}
 	return s
