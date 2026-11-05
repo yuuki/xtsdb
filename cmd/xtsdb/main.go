@@ -128,6 +128,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		redacted := *cfg
 		redacted.Redis.Password = redact(cfg.Redis.Password)
 		redacted.Cassandra.Password = redact(cfg.Cassandra.Password)
+		redacted.Server.Auth.Read = cfg.Server.Auth.Read.Redacted()
+		redacted.Server.Auth.Write = cfg.Server.Auth.Write.Redacted()
 		out, err := yaml.Marshal(&redacted)
 		if err != nil {
 			fmt.Fprintf(stderr, "error: %v\n", err)

@@ -3,6 +3,7 @@ package ingest
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -78,6 +79,11 @@ func ParseGraphiteLine(line string, now time.Time) (Series, bool, error) {
 
 // GraphiteServer accepts the Graphite plaintext protocol over TCP and UDP.
 type GraphiteServer struct {
+	// TLS, when set before Start, serves TCP over TLS (with client
+	// certificates if it requires them) and disables UDP, which cannot be
+	// protected.
+	TLS *tls.Config
+
 	addr     string
 	writer   *Writer
 	logger   *slog.Logger
@@ -134,6 +140,13 @@ func (g *GraphiteServer) Start() error {
 	if err != nil {
 		return fmt.Errorf("graphite tcp: %w", err)
 	}
+	if g.TLS != nil {
+		g.tcp = tls.NewListener(ln, g.TLS)
+		g.logger.Info("listening for Graphite plaintext over TLS (UDP disabled)", "tcp", ln.Addr())
+		g.wg.Add(1)
+		go g.acceptLoop()
+		return nil
+	}
 	pc, err := net.ListenPacket("udp", g.addr)
 	if err != nil {
 		ln.Close()
@@ -157,8 +170,13 @@ func (g *GraphiteServer) Start() error {
 // Addr returns the TCP listen address.
 func (g *GraphiteServer) Addr() net.Addr { return g.tcp.Addr() }
 
-// UDPAddr returns the UDP listen address.
-func (g *GraphiteServer) UDPAddr() net.Addr { return g.udp.LocalAddr() }
+// UDPAddr returns the UDP listen address, or nil when UDP is disabled.
+func (g *GraphiteServer) UDPAddr() net.Addr {
+	if g.udp == nil {
+		return nil
+	}
+	return g.udp.LocalAddr()
+}
 
 // Stop closes the listeners, makes every connection write what it has
 // buffered and close, and waits for that until ctx expires.
@@ -167,7 +185,9 @@ func (g *GraphiteServer) Stop(ctx context.Context) {
 		return
 	}
 	g.tcp.Close()
-	g.udp.Close()
+	if g.udp != nil {
+		g.udp.Close()
+	}
 	// Wake up blocked reads; serveConn sees closing and returns.
 	g.mu.Lock()
 	for c := range g.conns {

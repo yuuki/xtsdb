@@ -28,9 +28,64 @@ type Config struct {
 
 // ServerConfig configures the HTTP server shared by every role.
 type ServerConfig struct {
-	HTTPListenAddress       string   `yaml:"http_listen_address"`
-	GracefulShutdownTimeout Duration `yaml:"graceful_shutdown_timeout"`
-	EnablePprof             bool     `yaml:"enable_pprof"`
+	HTTPListenAddress       string          `yaml:"http_listen_address"`
+	GracefulShutdownTimeout Duration        `yaml:"graceful_shutdown_timeout"`
+	EnablePprof             bool            `yaml:"enable_pprof"`
+	TLS                     ServerTLSConfig `yaml:"tls"`
+	Auth                    AuthConfig      `yaml:"auth"`
+}
+
+// AuthConfig configures authentication of the HTTP API. A scope without
+// credentials is open. /-/healthy and /-/ready are always open.
+type AuthConfig struct {
+	// Write protects remote write (/api/v1/write).
+	Write Credentials `yaml:"write"`
+	// Read protects the query API (/api/v1/...), /metrics and
+	// /debug/pprof.
+	Read Credentials `yaml:"read"`
+}
+
+// Credentials are accepted alternatives: any of the users (HTTP basic
+// authentication) or any of the bearer tokens.
+type Credentials struct {
+	BasicAuth    []BasicAuthUser `yaml:"basic_auth"`
+	BearerTokens []string        `yaml:"bearer_tokens"`
+}
+
+// BasicAuthUser is a user for HTTP basic authentication.
+type BasicAuthUser struct {
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
+}
+
+// Enabled reports whether any credential is configured.
+func (c Credentials) Enabled() bool { return len(c.BasicAuth) > 0 || len(c.BearerTokens) > 0 }
+
+// Redacted returns a copy with passwords and tokens replaced.
+func (c Credentials) Redacted() Credentials {
+	out := Credentials{}
+	for _, u := range c.BasicAuth {
+		out.BasicAuth = append(out.BasicAuth, BasicAuthUser{Username: u.Username, Password: "<redacted>"})
+	}
+	for range c.BearerTokens {
+		out.BearerTokens = append(out.BearerTokens, "<redacted>")
+	}
+	return out
+}
+
+func (c Credentials) validate(field string) []error {
+	var errs []error
+	for i, u := range c.BasicAuth {
+		if u.Username == "" || u.Password == "" || strings.Contains(u.Username, ":") {
+			errs = append(errs, fmt.Errorf("%s.basic_auth[%d] needs a username without ':' and a non-empty password", field, i))
+		}
+	}
+	for i, t := range c.BearerTokens {
+		if t == "" {
+			errs = append(errs, fmt.Errorf("%s.bearer_tokens[%d] must not be empty", field, i))
+		}
+	}
+	return errs
 }
 
 // LogConfig configures structured logging.
@@ -103,16 +158,19 @@ type StorageConfig struct {
 
 // IngesterConfig configures the write path.
 type IngesterConfig struct {
-	GraphiteListenAddress  string   `yaml:"graphite_listen_address"`
-	GraphiteMaxConnections int      `yaml:"graphite_max_connections"`
-	MaxRequestBodySize     int64    `yaml:"max_request_body_size"`
-	MaxDecompressedSize    int64    `yaml:"max_decompressed_size"`
-	MaxSeriesPerRequest    int      `yaml:"max_series_per_request"`
-	MaxSamplesPerRequest   int      `yaml:"max_samples_per_request"`
-	MaxInflightRequests    int      `yaml:"max_inflight_requests"`
-	MaxSampleFuture        Duration `yaml:"max_sample_future"`
-	IndexCacheSize         int      `yaml:"index_cache_size"`
-	IndexWriteConcurrency  int      `yaml:"index_write_concurrency"`
+	GraphiteListenAddress  string `yaml:"graphite_listen_address"`
+	GraphiteMaxConnections int    `yaml:"graphite_max_connections"`
+	// GraphiteTLS serves Graphite over TLS on TCP. UDP is then disabled,
+	// since it cannot be protected.
+	GraphiteTLS           ServerTLSConfig `yaml:"graphite_tls"`
+	MaxRequestBodySize    int64           `yaml:"max_request_body_size"`
+	MaxDecompressedSize   int64           `yaml:"max_decompressed_size"`
+	MaxSeriesPerRequest   int             `yaml:"max_series_per_request"`
+	MaxSamplesPerRequest  int             `yaml:"max_samples_per_request"`
+	MaxInflightRequests   int             `yaml:"max_inflight_requests"`
+	MaxSampleFuture       Duration        `yaml:"max_sample_future"`
+	IndexCacheSize        int             `yaml:"index_cache_size"`
+	IndexWriteConcurrency int             `yaml:"index_write_concurrency"`
 }
 
 // FlusherConfig configures the tiering process.
@@ -292,6 +350,10 @@ func (c *Config) Validate() error {
 		}
 	}
 	check(c.Server.HTTPListenAddress != "", "server.http_listen_address must be set")
+	errs = append(errs, c.Server.TLS.validate("server.tls")...)
+	errs = append(errs, c.Server.Auth.Write.validate("server.auth.write")...)
+	errs = append(errs, c.Server.Auth.Read.validate("server.auth.read")...)
+	errs = append(errs, c.Ingester.GraphiteTLS.validate("ingester.graphite_tls")...)
 	switch strings.ToLower(c.Log.Level) {
 	case "debug", "info", "warn", "error":
 	default:

@@ -102,7 +102,18 @@ func New(ctx context.Context, target Target, cfg *config.Config, logger *slog.Lo
 	}
 	index := cassandra.NewIndex(a.session, retention, cfg.Querier.ReadConcurrency, cfg.Storage.IndexBuckets)
 
-	a.Server = server.New(cfg.Server.HTTPListenAddress, a.Registry, cfg.Server.EnablePprof, logger.With("component", "http"))
+	httpTLS, err := cfg.Server.TLS.Build()
+	if err != nil {
+		return nil, fmt.Errorf("server.tls: %w", err)
+	}
+	authFailures := server.AuthFailures(a.Registry)
+	readAuth := server.NewAuthenticator("read", cfg.Server.Auth.Read, authFailures)
+	writeAuth := server.NewAuthenticator("write", cfg.Server.Auth.Write, authFailures)
+	a.Server = server.New(cfg.Server.HTTPListenAddress, a.Registry, server.Options{
+		EnablePprof: cfg.Server.EnablePprof,
+		TLS:         httpTLS,
+		Ops:         readAuth.Wrap,
+	}, logger.With("component", "http"))
 	a.Server.AddCheck("redis", a.Hot.Ping)
 	a.Server.AddCheck("cassandra", cold.Ping)
 	a.Server.Mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -128,7 +139,7 @@ func New(ctx context.Context, target Target, cfg *config.Config, logger *slog.Lo
 			return nil, err
 		}
 		a.Server.Mux.Handle("POST /api/v1/write",
-			a.Server.Instrument("write", ingest.RemoteWriteHandler(w, ingest.RemoteWriteOptions{
+			a.Server.Instrument("write", writeAuth.Wrap(ingest.RemoteWriteHandler(w, ingest.RemoteWriteOptions{
 				MaxBodySize:         cfg.Ingester.MaxRequestBodySize,
 				MaxDecompressedSize: cfg.Ingester.MaxDecompressedSize,
 				MaxInflight:         cfg.Ingester.MaxInflightRequests,
@@ -136,10 +147,13 @@ func New(ctx context.Context, target Target, cfg *config.Config, logger *slog.Lo
 					MaxSeries:  cfg.Ingester.MaxSeriesPerRequest,
 					MaxSamples: cfg.Ingester.MaxSamplesPerRequest,
 				},
-			}, logger)))
+			}, logger))))
 		if cfg.Ingester.GraphiteListenAddress != "" {
 			a.Graphite = ingest.NewGraphiteServer(cfg.Ingester.GraphiteListenAddress, cfg.Ingester.GraphiteMaxConnections,
 				w, a.Registry, logger)
+			if a.Graphite.TLS, err = cfg.Ingester.GraphiteTLS.Build(); err != nil {
+				return nil, fmt.Errorf("ingester.graphite_tls: %w", err)
+			}
 		}
 	}
 
@@ -176,7 +190,7 @@ func New(ctx context.Context, target Target, cfg *config.Config, logger *slog.Lo
 			BuildInfo:            version.Info(),
 		})
 		api.Register(a.Server.Mux, func(h http.Handler) http.Handler {
-			return gzhttp.GzipHandler(a.Server.Instrument("query", h))
+			return gzhttp.GzipHandler(a.Server.Instrument("query", readAuth.Wrap(h)))
 		})
 	}
 

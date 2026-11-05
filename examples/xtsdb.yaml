@@ -14,6 +14,22 @@ server:
   http_listen_address: ":9201"
   graceful_shutdown_timeout: 30s
   enable_pprof: false
+  # HTTPS. Empty cert_file (the default) serves plain HTTP. The certificate
+  # is reloaded when its files change.
+  tls:
+    cert_file: ""
+    key_file: ""
+    client_ca_file: ""     # verify client certificates (mutual TLS)
+    client_auth_type: ""   # RequireAndVerifyClientCert (default) or VerifyClientCertIfGiven
+  # Credentials per scope; a scope without credentials is open, and
+  # /-/healthy and /-/ready are always open. Example:
+  #   write:
+  #     basic_auth: [{username: prometheus, password: "${XTSDB_WRITE_PASSWORD}"}]
+  #   read:
+  #     bearer_tokens: ["${XTSDB_READ_TOKEN}"]
+  auth:
+    write: {}   # /api/v1/write
+    read: {}    # query API, /metrics and /debug/pprof
 
 log:
   level: info      # debug, info, warn, error
@@ -79,6 +95,11 @@ ingester:
   # disables it.
   graphite_listen_address: ":2003"   # example
   graphite_max_connections: 1024
+  # Graphite over TLS on TCP (same fields as server.tls); UDP is then
+  # disabled. Use client_ca_file to authenticate senders.
+  graphite_tls:
+    cert_file: ""
+    key_file: ""
   # Remote write limits. Protobuf decoding inflates requests, so the number
   # of elements is checked before decoding.
   max_request_body_size: 10485760    # compressed bytes

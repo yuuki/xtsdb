@@ -3,6 +3,7 @@ package ingest
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -22,8 +24,10 @@ import (
 	"github.com/prometheus/prometheus/prompb"
 	writev2 "github.com/prometheus/prometheus/prompb/io/prometheus/write/v2"
 
+	"github.com/yuuki/xtsdb/internal/config"
 	"github.com/yuuki/xtsdb/internal/model"
 	"github.com/yuuki/xtsdb/internal/storage/storagetest"
+	"github.com/yuuki/xtsdb/internal/tlstest"
 )
 
 var testLayout = model.Layout{Shards: 4, ChunkRange: time.Hour.Milliseconds(), Grace: time.Minute.Milliseconds()}
@@ -236,6 +240,63 @@ func TestGraphiteServer(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("graphite samples were not stored")
+}
+
+// Over TLS with client certificates, only clients with a certificate from
+// the configured CA can write, and UDP is not served.
+func TestGraphiteServerTLS(t *testing.T) {
+	w, hot, _ := newTestWriter(t)
+	f := tlstest.Generate(t, t.TempDir())
+	g := NewGraphiteServer("127.0.0.1:0", 16, w, nil, slog.New(slog.DiscardHandler))
+	var err error
+	g.TLS, err = config.ServerTLSConfig{CertFile: f.ServerCert, KeyFile: f.ServerKey, ClientCAFile: f.CA}.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer g.Stop(context.Background())
+	if g.UDPAddr() != nil {
+		t.Fatal("UDP must be disabled with TLS")
+	}
+	now := time.Now().Unix()
+	send := func(withCert bool, host string) error {
+		conn, err := tls.Dial("tcp", g.Addr().String(), f.ClientConfig(t, withCert))
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+		if _, err := fmt.Fprintf(conn, "tls.metric;host=%s 1 %d\n", host, now); err != nil {
+			return err
+		}
+		// TLS 1.3 reports a rejected client certificate on the first read.
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+		_, err = conn.Read(make([]byte, 1))
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return nil
+		}
+		return err
+	}
+	if err := send(false, "anonymous"); err == nil {
+		t.Fatal("a client without a certificate must be refused")
+	}
+	if err := send(true, "trusted"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(readAll(t, hot, labels.FromStrings("__name__", "tls.metric", "host", "trusted"))) == 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(readAll(t, hot, labels.FromStrings("__name__", "tls.metric", "host", "trusted"))) != 1 {
+		t.Fatal("the sample sent over TLS was not stored")
+	}
+	if len(readAll(t, hot, labels.FromStrings("__name__", "tls.metric", "host", "anonymous"))) != 0 {
+		t.Fatal("the sample of the refused client was stored")
+	}
 }
 
 var testRWOptions = RemoteWriteOptions{

@@ -155,6 +155,45 @@ stateless and can be scaled horizontally:
   `storage.retention`; chunk and postings tables use
   `TimeWindowCompactionStrategy`.
 
+**Security.** By default xtsdb's own listeners are neither encrypted nor
+authenticated: anyone who can reach the HTTP port can write and query, and
+anyone who can reach the Graphite port can write. Either keep them on a
+trusted network or behind a reverse proxy that terminates TLS and
+authenticates clients, or use the built-in options:
+
+```yaml
+server:
+  tls:
+    cert_file: /etc/xtsdb/tls/server.pem   # reloaded when the files change
+    key_file: /etc/xtsdb/tls/server-key.pem
+    # client_ca_file: /etc/xtsdb/tls/ca.pem   # mutual TLS
+  auth:
+    write:   # /api/v1/write
+      basic_auth: [{username: prometheus, password: "${XTSDB_WRITE_PASSWORD}"}]
+    read:    # query API, /metrics and /debug/pprof
+      bearer_tokens: ["${XTSDB_READ_TOKEN}"]
+ingester:
+  graphite_tls:   # Graphite over TLS on TCP; UDP is then disabled
+    cert_file: /etc/xtsdb/tls/server.pem
+    key_file: /etc/xtsdb/tls/server-key.pem
+    client_ca_file: /etc/xtsdb/tls/ca.pem   # Graphite has no other way to authenticate
+```
+
+Each scope accepts any of its basic auth users and bearer tokens; a scope
+without credentials is open, and `/-/healthy` and `/-/ready` are always
+open. Prometheus sends the credentials with `basic_auth` or `authorization`
+in its `remote_write` section, Grafana with the data source's basic auth or
+a custom `Authorization` header. Rejected requests get 401 and are counted
+in `xtsdb_http_auth_failures_total{scope}`. With `client_ca_file`, clients
+must present a certificate signed by that CA
+(`client_auth_type: VerifyClientCertIfGiven` makes it optional, for example
+for HTTPS health checks). Use `-config.expand-env` to keep secrets out of
+the file; `xtsdb config` redacts them.
+
+A reverse proxy is the better choice when you need per-user accounts or
+single sign-on, rate limiting, or an existing certificate infrastructure;
+the built-in options suit a fixed set of senders and readers.
+
 **Monitoring.** Every role serves `/metrics`, `/-/healthy` and `/-/ready`.
 Watch in particular:
 
@@ -210,8 +249,8 @@ Cassandra 5.0.9, Prometheus 3.15.1 and Grafana 13.3.0.
 - Native histograms and exemplars are not supported yet. Requests that
   carry histograms store their float samples and answer 400, so Prometheus
   reports the dropped histograms instead of silently losing them.
-- No multi-tenancy, authentication, remote read, downsampling or recording
-  rules.
+- No multi-tenancy, remote read, downsampling or recording rules.
+  Authentication distinguishes writers from readers, not tenants.
 - Samples older than their closed chunk window are rejected, so large
   backfills are not possible.
 - A series can hold at most about two million samples per chunk window in
