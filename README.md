@@ -162,8 +162,16 @@ Watch in particular:
 | `xtsdb_flusher_lag_seconds` | How long the oldest closed chunk (pending or claimed) has been waiting. Should stay near zero. |
 | `xtsdb_hot_pending_chunks`, `xtsdb_hot_inflight_chunks` | Chunks held in Redis. |
 | `xtsdb_flusher_chunks_total{outcome="error"}` | Failed flushes; they are retried after the lease. |
+| `xtsdb_hot_quarantined_chunks`, `xtsdb_flusher_chunks_total{outcome="quarantined"}` | Undecodable chunks moved out of the way. Should stay at zero; inspect them with `xtsdb quarantine list`. |
 | `xtsdb_ingester_samples_total{outcome=...}` | Accepted samples and rejections: `too_old`, `too_new`, `invalid`, `chunk_full`, `unsupported` (histograms), `throttled`, `error`. |
 | `xtsdb_graphite_lines_total{outcome="dropped"}`, `xtsdb_graphite_connections_total{outcome="rejected"}` | Graphite overload. |
+
+**Quarantined chunks.** A chunk that Redis holds but that cannot be decoded
+is moved to a quarantine key instead of blocking flushing, and kept for
+`flusher.quarantine_ttl` (30 days by default). List them with
+`xtsdb quarantine list -config.file=...` and delete them with
+`xtsdb quarantine delete -config.file=... <key>...` (or `-all`). See
+[docs/architecture.md](docs/architecture.md#quarantined-chunks).
 
 **Configuration.** [examples/xtsdb.yaml](examples/xtsdb.yaml) documents every
 option with its default. `xtsdb config -config.file=...` prints the

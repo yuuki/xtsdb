@@ -2,6 +2,7 @@ package hot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"os"
@@ -66,6 +67,12 @@ func deleteKeys(t *testing.T, client redis.UniversalClient, prefix string) {
 }
 
 func nowMs() int64 { return time.Now().UnixMilli() }
+
+// load returns the loaded and missing chunks.
+func load(ctx context.Context, s *Store, refs []storage.ChunkRef) ([]storage.HotChunk, []storage.ChunkRef, error) {
+	res, err := s.Load(ctx, refs)
+	return res.Chunks, res.Missing, err
+}
 
 func TestAppendAndRead(t *testing.T) {
 	layout := model.Layout{Shards: 8, ChunkRange: time.Hour.Milliseconds(), Grace: time.Minute.Milliseconds()}
@@ -177,7 +184,7 @@ func TestFlushLifecycle(t *testing.T) {
 		t.Fatalf("late sample must be rejected, got %+v", res)
 	}
 
-	chunks, missing, err := s.Load(ctx, refs)
+	chunks, missing, err := load(ctx, s, refs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +239,7 @@ func TestCompleteIgnoresNewerIncarnation(t *testing.T) {
 		t.Fatal(err)
 	}
 	refs := waitClaim(t, s, 0)
-	chunks, _, err := s.Load(ctx, refs)
+	chunks, _, err := load(ctx, s, refs)
 	if err != nil || len(chunks) != 1 {
 		t.Fatalf("load: %v %v", chunks, err)
 	}
@@ -250,6 +257,7 @@ func TestCompleteIgnoresNewerIncarnation(t *testing.T) {
 func TestQuarantinesCorruptChunks(t *testing.T) {
 	layout := model.Layout{Shards: 1, ChunkRange: 300, Grace: 0}
 	s, client := newTestStore(t, layout, time.Minute)
+	s.quarantineTTL = time.Hour
 	ctx := context.Background()
 	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: 5, Samples: []model.Sample{{T: nowMs(), V: 1}}}}); err != nil {
 		t.Fatal(err)
@@ -257,15 +265,115 @@ func TestQuarantinesCorruptChunks(t *testing.T) {
 	refs := waitClaim(t, s, 0)
 	m := member(refs[0].Series, refs[0].Start)
 	client.Append(ctx, s.chunkKey(0, m), "x") // break record alignment
-	chunks, missing, err := s.Load(ctx, refs)
-	if err != nil || len(chunks) != 0 || len(missing) != 0 {
-		t.Fatalf("corrupt chunk must be skipped: %v %v %v", chunks, missing, err)
+	content := client.Get(ctx, s.chunkKey(0, m)).Val()
+	res, err := s.Load(ctx, refs)
+	if err != nil || len(res.Chunks) != 0 || len(res.Missing) != 0 || res.Quarantined != 1 {
+		t.Fatalf("corrupt chunk must be quarantined and skipped: %+v %v", res, err)
 	}
-	if client.Exists(ctx, s.quarantineKey(0, m)).Val() != 1 {
+	qkey := s.quarantineKey(0, m, []byte(content))
+	if client.Get(ctx, qkey).Val() != content {
 		t.Fatal("corrupt chunk was not quarantined")
 	}
-	if client.ZCard(ctx, s.inflightKey(0)).Val() != 0 {
+	if ttl := client.PTTL(ctx, qkey).Val(); ttl <= 0 || ttl > time.Hour {
+		t.Fatalf("quarantined chunk must expire after the TTL, got %v", ttl)
+	}
+	if client.ZCard(ctx, s.inflightKey(0)).Val() != 0 || client.ZCard(ctx, s.inflightDueKey(0)).Val() != 0 {
 		t.Fatal("quarantined chunk is still in flight")
+	}
+	if b, err := s.Backlog(ctx); err != nil || b.QuarantinedChunks != 1 {
+		t.Fatalf("backlog must count the quarantined chunk: %+v %v", b, err)
+	}
+	list, err := s.ListQuarantined(ctx)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("list: %+v %v", list, err)
+	}
+	if q := list[0]; q.Key != qkey || q.Series != 5 || q.Start != refs[0].Start || q.Bytes != int64(len(content)) ||
+		q.Header != content[:16] || q.Expires.IsZero() {
+		t.Fatalf("unexpected listing %+v", q)
+	}
+}
+
+// A second corrupt incarnation of the same window must not overwrite the
+// first one in quarantine.
+func TestQuarantineKeepsEveryIncarnation(t *testing.T) {
+	layout := model.Layout{Shards: 1, ChunkRange: 300, Grace: 0}
+	s, client := newTestStore(t, layout, time.Minute)
+	ctx := context.Background()
+	id := model.SeriesID(5)
+	var start int64
+	for i := range 2 {
+		now := nowMs()
+		if i == 1 {
+			now = start + 1 // same window as the first incarnation
+		}
+		key := s.chunkKey(0, member(id, layout.WindowStart(id, now)))
+		start = layout.WindowStart(id, now)
+		// Re-create the window as it would be after a restore, then corrupt it.
+		client.Set(ctx, key, fmt.Sprintf("%016d", 1000+i)+strings.Repeat("y", 17+i), 0)
+		client.ZAdd(ctx, s.inflightKey(0), redis.Z{Score: 0, Member: member(id, start)})
+		res, err := s.Load(ctx, []storage.ChunkRef{{Shard: 0, Series: id, Start: start}})
+		if err != nil || res.Quarantined != 1 {
+			t.Fatalf("incarnation %d: %+v %v", i, res, err)
+		}
+	}
+	list, err := s.ListQuarantined(ctx)
+	if err != nil || len(list) != 2 {
+		t.Fatalf("both incarnations must be kept, got %+v %v", list, err)
+	}
+	if !list[0].Expires.IsZero() || !list[1].Expires.IsZero() {
+		t.Fatal("without a TTL quarantined chunks must not expire")
+	}
+	n, err := s.DeleteQuarantined(ctx, []string{list[0].Key, list[1].Key})
+	if err != nil || n != 2 {
+		t.Fatalf("delete: %d %v", n, err)
+	}
+	if list, _ := s.ListQuarantined(ctx); len(list) != 0 {
+		t.Fatalf("deleted chunks still listed: %+v", list)
+	}
+	if b, _ := s.Backlog(ctx); b.QuarantinedChunks != 0 {
+		t.Fatalf("deleted chunks still counted: %+v", b)
+	}
+	if _, err := s.DeleteQuarantined(ctx, []string{s.chunkKey(0, member(id, start))}); err == nil {
+		t.Fatal("deleting a key that is not quarantined must be refused")
+	}
+}
+
+// Quarantine is fenced like Complete: a chunk that changed after it was
+// read (a newer incarnation) is not moved away.
+func TestQuarantineIsFenced(t *testing.T) {
+	layout := model.Layout{Shards: 1, ChunkRange: 300, Grace: 0}
+	s, client := newTestStore(t, layout, time.Minute)
+	ctx := context.Background()
+	ref := storage.ChunkRef{Shard: 0, Series: 5, Start: layout.WindowStart(5, nowMs())}
+	m := member(ref.Series, ref.Start)
+	key := s.chunkKey(0, m)
+	corrupt := []byte("0000000000001000x")
+	client.Set(ctx, key, "0000000000002000", 0) // healthy newer incarnation
+	client.ZAdd(ctx, s.inflightKey(0), redis.Z{Score: 0, Member: m})
+	if s.quarantine(ctx, ref, corrupt, errors.New("test")) {
+		t.Fatal("a newer incarnation must not be quarantined")
+	}
+	if client.Get(ctx, key).Val() != "0000000000002000" {
+		t.Fatal("the newer incarnation was moved away")
+	}
+	if client.ZCard(ctx, s.inflightKey(0)).Val() != 1 {
+		t.Fatal("the chunk must stay in flight to be retried after its lease")
+	}
+	// Same header, different length: samples were appended since the read.
+	client.Set(ctx, key, "0000000000001000xyz", 0)
+	if s.quarantine(ctx, ref, corrupt, errors.New("test")) {
+		t.Fatal("a chunk that grew must not be quarantined")
+	}
+	// A chunk that disappeared is released.
+	client.Del(ctx, key)
+	if s.quarantine(ctx, ref, corrupt, errors.New("test")) {
+		t.Fatal("a missing chunk cannot be quarantined")
+	}
+	if client.ZCard(ctx, s.inflightKey(0)).Val() != 0 {
+		t.Fatal("a missing chunk must be released")
+	}
+	if list, _ := s.ListQuarantined(ctx); len(list) != 0 {
+		t.Fatalf("nothing must be quarantined, got %+v", list)
 	}
 }
 
@@ -339,7 +447,7 @@ func TestCompleteKeepsChunkThatGrew(t *testing.T) {
 		t.Fatal(err)
 	}
 	refs := waitClaim(t, s, 0)
-	chunks, _, err := s.Load(ctx, refs)
+	chunks, _, err := load(ctx, s, refs)
 	if err != nil || len(chunks) != 1 {
 		t.Fatalf("load: %v %v", chunks, err)
 	}
@@ -355,7 +463,7 @@ func TestCompleteKeepsChunkThatGrew(t *testing.T) {
 	}
 	// It is handed out again after the lease and can then be completed.
 	again := waitClaim(t, s, 0)
-	chunks, _, err = s.Load(ctx, again)
+	chunks, _, err = load(ctx, s, again)
 	if err != nil || len(chunks) != 1 || len(chunks[0].Samples) != 2 {
 		t.Fatalf("reload: %v %v", chunks, err)
 	}
@@ -376,7 +484,7 @@ func TestReleaseMissingChunks(t *testing.T) {
 	}
 	refs := waitClaim(t, s, 0)
 	client.Del(ctx, s.chunkKey(0, member(refs[0].Series, refs[0].Start)))
-	chunks, missing, err := s.Load(ctx, refs)
+	chunks, missing, err := load(ctx, s, refs)
 	if err != nil || len(chunks) != 0 || len(missing) != 1 {
 		t.Fatalf("load: %v %v %v", chunks, missing, err)
 	}
@@ -441,7 +549,7 @@ func TestClaimWorksAtMaxmemory(t *testing.T) {
 	if err != nil || len(again) == 0 {
 		t.Fatalf("claim must work at maxmemory: %d refs, %v", len(again), err)
 	}
-	chunks, _, err := s.Load(ctx, again)
+	chunks, _, err := load(ctx, s, again)
 	if err != nil {
 		t.Fatal(err)
 	}

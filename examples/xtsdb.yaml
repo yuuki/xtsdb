@@ -89,6 +89,10 @@ flusher:
   batch_size: 128
   concurrency: 8
   lease_duration: 2m
+  # Undecodable chunks are moved to a quarantine key instead of blocking
+  # flushing, and kept this long for inspection (`xtsdb quarantine list`).
+  # 0 keeps them until they are deleted (`xtsdb quarantine delete`).
+  quarantine_ttl: 30d
 
 querier:
   lookback_delta: 5m

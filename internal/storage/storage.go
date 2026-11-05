@@ -41,12 +41,26 @@ type HotChunk struct {
 	Samples  []model.Sample
 }
 
+// LoadResult is the outcome of HotStore.Load.
+type LoadResult struct {
+	// Chunks are the claimed chunks that still exist and can be persisted.
+	Chunks []HotChunk
+	// Missing are the claimed chunks that no longer exist (completed by
+	// another flusher in the meantime). Their in-flight entries must be
+	// released.
+	Missing []ChunkRef
+	// Quarantined is the number of undecodable chunks that were moved out of
+	// the way. They are kept for inspection and are no longer in flight.
+	Quarantined int
+}
+
 // Backlog summarizes the chunks held by the hot tier.
 type Backlog struct {
-	PendingChunks  int64 // chunks not yet claimed, open or closed
-	InflightChunks int64 // chunks claimed by a flusher
-	OldestDue      int64 // earliest due time of any chunk in ms; 0 if none
-	OldestStart    int64 // window start of that chunk in ms; 0 if none
+	PendingChunks     int64 // chunks not yet claimed, open or closed
+	InflightChunks    int64 // chunks claimed by a flusher
+	QuarantinedChunks int64 // undecodable chunks kept for inspection
+	OldestDue         int64 // earliest due time of any chunk in ms; 0 if none
+	OldestStart       int64 // window start of that chunk in ms; 0 if none
 }
 
 // HotStore is the in-memory tier. Samples are appended to per-series time
@@ -56,9 +70,10 @@ type Backlog struct {
 type HotStore interface {
 	Append(ctx context.Context, batch []SeriesSamples) (AppendResult, error)
 	Claim(ctx context.Context, shard, limit int) ([]ChunkRef, error)
-	// Load returns the claimed chunks that still exist, and the refs of
-	// those that do not (completed by another flusher in the meantime).
-	Load(ctx context.Context, refs []ChunkRef) (chunks []HotChunk, missing []ChunkRef, err error)
+	// Load reads claimed chunks. Undecodable chunks are quarantined: moved
+	// out of the way, unless they changed since they were read, so that
+	// they do not block flushing.
+	Load(ctx context.Context, refs []ChunkRef) (LoadResult, error)
 	// Complete deletes persisted chunks. A chunk that changed since it was
 	// loaded is kept and re-processed after its lease expires.
 	Complete(ctx context.Context, chunks []HotChunk) error

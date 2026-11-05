@@ -117,6 +117,9 @@ type FlusherConfig struct {
 	BatchSize     int      `yaml:"batch_size"`
 	Concurrency   int      `yaml:"concurrency"`
 	LeaseDuration Duration `yaml:"lease_duration"`
+	// QuarantineTTL is how long undecodable chunks are kept in Redis for
+	// inspection. Zero keeps them until they are deleted.
+	QuarantineTTL Duration `yaml:"quarantine_ttl"`
 }
 
 // QuerierConfig configures the read path.
@@ -181,6 +184,7 @@ func Default() *Config {
 			BatchSize:     128,
 			Concurrency:   8,
 			LeaseDuration: Duration(2 * time.Minute),
+			QuarantineTTL: Duration(30 * 24 * time.Hour),
 		},
 		Querier: QuerierConfig{
 			LookbackDelta:     Duration(5 * time.Minute),
@@ -329,6 +333,8 @@ func (c *Config) Validate() error {
 	check(c.Flusher.BatchSize > 0, "flusher.batch_size must be positive")
 	check(c.Flusher.Concurrency > 0, "flusher.concurrency must be positive")
 	check(c.Flusher.LeaseDuration.D() >= time.Second, "flusher.lease_duration must be at least 1s")
+	check(c.Flusher.QuarantineTTL.D() == 0 || c.Flusher.QuarantineTTL.D() >= time.Hour,
+		"flusher.quarantine_ttl must be 0 (keep until deleted) or at least 1h")
 	check(c.Querier.LookbackDelta.D() > 0, "querier.lookback_delta must be positive")
 	check(c.Querier.Timeout.D() > 0, "querier.timeout must be positive")
 	check(c.Querier.MaxSamples > 0, "querier.max_samples must be positive")

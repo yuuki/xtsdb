@@ -7,7 +7,8 @@
 //	<prefix>:{N}:due                  sorted set: chunk member -> due time
 //	<prefix>:{N}:inf                  sorted set: chunk member -> lease expiry
 //	<prefix>:{N}:infdue               sorted set: in-flight member -> due time
-//	<prefix>:{N}:q:<series>:<window>  quarantined (undecodable) chunk
+//	<prefix>:{N}:q:<series>:<window>:<digest>  quarantined (undecodable) chunk
+//	<prefix>:{N}:qidx                 sorted set: quarantine key -> expiry time
 //	<prefix>:meta                     hash: layout parameters
 package hot
 
@@ -21,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/yuuki/xtsdb/internal/chunk"
@@ -85,6 +87,9 @@ type Options struct {
 	Layout        model.Layout
 	Lease         time.Duration
 	MaxChunkBytes int // DefaultMaxChunkBytes if zero
+	// QuarantineTTL is how long undecodable chunks are kept for inspection;
+	// zero keeps them until they are deleted.
+	QuarantineTTL time.Duration
 	Logger        *slog.Logger
 }
 
@@ -95,6 +100,7 @@ type Store struct {
 	layout        model.Layout
 	lease         time.Duration
 	maxChunkBytes int
+	quarantineTTL time.Duration
 	logger        *slog.Logger
 }
 
@@ -115,6 +121,7 @@ func New(ctx context.Context, client redis.UniversalClient, opts Options) (*Stor
 		layout:        opts.Layout,
 		lease:         opts.Lease,
 		maxChunkBytes: opts.MaxChunkBytes,
+		quarantineTTL: opts.QuarantineTTL,
 		logger:        opts.Logger,
 	}
 	if err := client.Ping(ctx).Err(); err != nil {
@@ -173,9 +180,13 @@ func (s *Store) chunkKey(shard int, member string) string {
 	return s.tag(shard) + ":c:" + member
 }
 
-func (s *Store) quarantineKey(shard int, member string) string {
-	return s.tag(shard) + ":q:" + member
+// quarantineKey names a quarantined chunk after its content, so that two
+// different chunks of the same window never share a quarantine key.
+func (s *Store) quarantineKey(shard int, member string, content []byte) string {
+	return fmt.Sprintf("%s:q:%s:%016x", s.tag(shard), member, xxhash.Sum64(content))
 }
+
+func (s *Store) quarantineIndexKey(shard int) string { return s.tag(shard) + ":qidx" }
 
 func member(id model.SeriesID, start int64) string {
 	return id.String() + ":" + strconv.FormatInt(start, 10)
@@ -364,46 +375,60 @@ func (s *Store) Claim(ctx context.Context, shard, limit int) ([]storage.ChunkRef
 }
 
 // Load reads claimed chunks. Undecodable chunks are quarantined and skipped.
-func (s *Store) Load(ctx context.Context, refs []storage.ChunkRef) ([]storage.HotChunk, []storage.ChunkRef, error) {
+func (s *Store) Load(ctx context.Context, refs []storage.ChunkRef) (storage.LoadResult, error) {
 	cmds := make([]*redis.StringCmd, len(refs))
 	if err := s.pipelined(ctx, len(refs), func(pipe redis.Pipeliner, i int) {
 		cmds[i] = pipe.Get(ctx, s.chunkKey(refs[i].Shard, member(refs[i].Series, refs[i].Start)))
 	}); err != nil {
-		return nil, nil, err
+		return storage.LoadResult{}, err
 	}
-	var (
-		out     = make([]storage.HotChunk, 0, len(refs))
-		missing []storage.ChunkRef
-	)
+	res := storage.LoadResult{Chunks: make([]storage.HotChunk, 0, len(refs))}
 	for i, cmd := range cmds {
 		b, err := cmd.Bytes()
 		if errors.Is(err, redis.Nil) {
-			missing = append(missing, refs[i])
+			res.Missing = append(res.Missing, refs[i])
 			continue
 		}
 		if err != nil {
-			return nil, nil, fmt.Errorf("load chunk: %w", err)
+			return storage.LoadResult{}, fmt.Errorf("load chunk: %w", err)
 		}
 		frag, samples, err := chunk.DecodeHot(b)
 		if err != nil {
-			s.quarantine(ctx, refs[i], err)
+			if s.quarantine(ctx, refs[i], b, err) {
+				res.Quarantined++
+			}
 			continue
 		}
-		out = append(out, storage.HotChunk{Ref: refs[i], Fragment: frag, Size: len(b), Samples: samples})
+		res.Chunks = append(res.Chunks, storage.HotChunk{Ref: refs[i], Fragment: frag, Size: len(b), Samples: samples})
 	}
-	return out, missing, nil
+	return res, nil
 }
 
-func (s *Store) quarantine(ctx context.Context, ref storage.ChunkRef, cause error) {
+// quarantine moves an undecodable chunk to a quarantine key, unless it
+// changed since it was read as content. It reports whether the chunk was
+// moved; otherwise it stays in flight and is retried after its lease.
+func (s *Store) quarantine(ctx context.Context, ref storage.ChunkRef, content []byte, cause error) bool {
 	m := member(ref.Series, ref.Start)
-	s.logger.Error("quarantining undecodable chunk", "shard", ref.Shard, "member", m, "err", cause)
-	err := quarantineScript.Run(ctx, s.client,
-		[]string{s.inflightKey(ref.Shard), s.inflightDueKey(ref.Shard), s.chunkKey(ref.Shard, m), s.quarantineKey(ref.Shard, m)},
-		m,
-	).Err()
-	if err != nil {
-		s.logger.Error("quarantine failed", "member", m, "err", err)
+	qkey := s.quarantineKey(ref.Shard, m, content)
+	head := content[:min(len(content), chunk.HeaderLen)]
+	res, err := quarantineScript.Run(ctx, s.client,
+		[]string{s.inflightKey(ref.Shard), s.inflightDueKey(ref.Shard), s.chunkKey(ref.Shard, m), qkey, s.quarantineIndexKey(ref.Shard)},
+		m, head, len(content), s.quarantineTTL.Milliseconds(),
+	).Int()
+	switch {
+	case err != nil:
+		s.logger.Error("quarantine failed; the chunk will be retried after its lease", "shard", ref.Shard, "member", m, "err", err)
+		return false
+	case res == 0:
+		s.logger.Warn("undecodable chunk changed since it was read; it will be retried after its lease",
+			"shard", ref.Shard, "member", m, "err", cause)
+		return false
+	case res < 0:
+		return false // gone: completed by another flusher
 	}
+	s.logger.Error("quarantined undecodable chunk", "shard", ref.Shard, "member", m, "key", qkey,
+		"bytes", len(content), "err", cause)
+	return true
 }
 
 // Complete deletes chunks that have been persisted, unless they changed
@@ -519,11 +544,14 @@ func (s *Store) Backlog(ctx context.Context) (storage.Backlog, error) {
 	n := s.layout.Shards
 	due := make([]*redis.IntCmd, n)
 	inf := make([]*redis.IntCmd, n)
+	quarantined := make([]*redis.IntCmd, n)
 	oldestDue := make([]*redis.ZSliceCmd, n)
 	oldestInf := make([]*redis.ZSliceCmd, n)
+	now := strconv.FormatInt(time.Now().UnixMilli(), 10)
 	err := s.pipelined(ctx, n, func(pipe redis.Pipeliner, i int) {
 		due[i] = pipe.ZCard(ctx, s.dueKey(i))
 		inf[i] = pipe.ZCard(ctx, s.inflightKey(i))
+		quarantined[i] = pipe.ZCount(ctx, s.quarantineIndexKey(i), "("+now, "+inf")
 		oldestDue[i] = pipe.ZRangeWithScores(ctx, s.dueKey(i), 0, 0)
 		oldestInf[i] = pipe.ZRangeWithScores(ctx, s.inflightDueKey(i), 0, 0)
 	})
@@ -534,6 +562,7 @@ func (s *Store) Backlog(ctx context.Context) (storage.Backlog, error) {
 	for i := range n {
 		b.PendingChunks += due[i].Val()
 		b.InflightChunks += inf[i].Val()
+		b.QuarantinedChunks += quarantined[i].Val()
 		for _, zs := range [][]redis.Z{oldestDue[i].Val(), oldestInf[i].Val()} {
 			if len(zs) > 0 {
 				if t := int64(zs[0].Score); b.OldestDue == 0 || t < b.OldestDue {

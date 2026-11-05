@@ -80,22 +80,8 @@ func New(ctx context.Context, target Target, cfg *config.Config, logger *slog.Lo
 		buildInfo(),
 	)
 
-	hot.SetLogger(logger)
-	a.redis, err = hot.NewClient(cfg.Redis)
-	if err != nil {
-		return nil, err
-	}
-	layout := model.Layout{
-		Shards:     cfg.Storage.Shards,
-		ChunkRange: cfg.Storage.ChunkRange.D().Milliseconds(),
-		Grace:      cfg.Storage.GracePeriod.D().Milliseconds(),
-	}
-	a.Hot, err = hot.New(ctx, a.redis, hot.Options{
-		Prefix: cfg.Storage.KeyPrefix,
-		Layout: layout,
-		Lease:  cfg.Flusher.LeaseDuration.D(),
-		Logger: logger.With("component", "redis"),
-	})
+	layout := Layout(cfg)
+	a.Hot, a.redis, err = OpenHot(ctx, cfg, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -200,6 +186,37 @@ func New(ctx context.Context, target Target, cfg *config.Config, logger *slog.Lo
 		}
 	}
 	return a, nil
+}
+
+// Layout returns the storage layout of a configuration.
+func Layout(cfg *config.Config) model.Layout {
+	return model.Layout{
+		Shards:     cfg.Storage.Shards,
+		ChunkRange: cfg.Storage.ChunkRange.D().Milliseconds(),
+		Grace:      cfg.Storage.GracePeriod.D().Milliseconds(),
+	}
+}
+
+// OpenHot connects to Redis and opens the hot tier. The caller closes the
+// returned client.
+func OpenHot(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*hot.Store, redis.UniversalClient, error) {
+	hot.SetLogger(logger)
+	client, err := hot.NewClient(cfg.Redis)
+	if err != nil {
+		return nil, nil, err
+	}
+	s, err := hot.New(ctx, client, hot.Options{
+		Prefix:        cfg.Storage.KeyPrefix,
+		Layout:        Layout(cfg),
+		Lease:         cfg.Flusher.LeaseDuration.D(),
+		QuarantineTTL: cfg.Flusher.QuarantineTTL.D(),
+		Logger:        logger.With("component", "redis"),
+	})
+	if err != nil {
+		_ = client.Close()
+		return nil, nil, err
+	}
+	return s, client, nil
 }
 
 // Run serves until ctx is cancelled, then shuts down gracefully and

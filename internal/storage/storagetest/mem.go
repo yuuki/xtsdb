@@ -105,24 +105,21 @@ func (h *Hot) Claim(_ context.Context, shard, limit int) ([]storage.ChunkRef, er
 }
 
 // Load implements storage.HotStore.
-func (h *Hot) Load(_ context.Context, refs []storage.ChunkRef) ([]storage.HotChunk, []storage.ChunkRef, error) {
+func (h *Hot) Load(_ context.Context, refs []storage.ChunkRef) (storage.LoadResult, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	var (
-		out     []storage.HotChunk
-		missing []storage.ChunkRef
-	)
+	var res storage.LoadResult
 	for _, ref := range refs {
 		c := h.chunks[ref]
 		if c == nil {
-			missing = append(missing, ref)
+			res.Missing = append(res.Missing, ref)
 			continue
 		}
-		out = append(out, storage.HotChunk{
+		res.Chunks = append(res.Chunks, storage.HotChunk{
 			Ref: ref, Fragment: c.fragment, Size: size(c), Samples: chunk.Normalize(slices.Clone(c.raw)),
 		})
 	}
-	return out, missing, nil
+	return res, nil
 }
 
 // Complete implements storage.HotStore.

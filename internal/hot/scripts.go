@@ -128,13 +128,42 @@ return done
 // quarantineScript moves an undecodable chunk out of the way so that it
 // does not block the flusher forever, while keeping it for inspection.
 //
+// It is fenced like completeScript: the chunk is moved only if its first 16
+// bytes and its length are still those that were read. A chunk that changed
+// (a newer incarnation of the window after a failover or a clock step) is
+// left in flight and re-processed after its lease. A chunk that no longer
+// exists is released.
+//
+// The quarantine key is named after the content of the chunk, so a later
+// quarantine of the same window never overwrites a different chunk. Every
+// quarantine key is recorded in the quarantine index with its expiry time
+// (+inf without a TTL); expired entries are pruned here.
+//
 // KEYS[1] = in-flight set, KEYS[2] = in-flight due set, KEYS[3] = chunk key,
-// KEYS[4] = quarantine key; ARGV[1] = member
-var quarantineScript = redis.NewScript(allowOOM + `
-if redis.call('EXISTS', KEYS[3]) == 1 then
-  redis.call('RENAME', KEYS[3], KEYS[4])
+// KEYS[4] = quarantine key, KEYS[5] = quarantine index
+// ARGV[1] = member, ARGV[2] = first 16 bytes as read, ARGV[3] = length as
+// read, ARGV[4] = TTL of the quarantine key in milliseconds (0: none)
+// Returns 1 if the chunk was quarantined, 0 if it changed and -1 if it no
+// longer exists.
+var quarantineScript = redis.NewScript(allowOOM + prelude + `
+local member, want, size, ttl = ARGV[1], ARGV[2], tonumber(ARGV[3]), tonumber(ARGV[4])
+if redis.call('EXISTS', KEYS[3]) == 0 then
+  redis.call('ZREM', KEYS[1], member)
+  redis.call('ZREM', KEYS[2], member)
+  return -1
 end
-redis.call('ZREM', KEYS[1], ARGV[1])
-redis.call('ZREM', KEYS[2], ARGV[1])
+if redis.call('GETRANGE', KEYS[3], 0, 15) ~= want or redis.call('STRLEN', KEYS[3]) ~= size then
+  return 0
+end
+redis.call('RENAME', KEYS[3], KEYS[4])
+local expiry = '+inf'
+if ttl > 0 then
+  redis.call('PEXPIRE', KEYS[4], ttl)
+  expiry = now + ttl
+end
+redis.call('ZREMRANGEBYSCORE', KEYS[5], '-inf', now)
+redis.call('ZADD', KEYS[5], expiry, KEYS[4])
+redis.call('ZREM', KEYS[1], member)
+redis.call('ZREM', KEYS[2], member)
 return 1
 `)

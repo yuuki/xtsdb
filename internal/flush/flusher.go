@@ -42,13 +42,14 @@ type Flusher struct {
 	opts Options
 	log  *slog.Logger
 
-	chunks     *prometheus.CounterVec
-	samples    prometheus.Counter
-	bytes      prometheus.Counter
-	batchTime  prometheus.Histogram
-	pending    prometheus.Gauge
-	inflight   prometheus.Gauge
-	lagSeconds prometheus.Gauge
+	chunks      *prometheus.CounterVec
+	samples     prometheus.Counter
+	bytes       prometheus.Counter
+	batchTime   prometheus.Histogram
+	pending     prometheus.Gauge
+	inflight    prometheus.Gauge
+	quarantined prometheus.Gauge
+	lagSeconds  prometheus.Gauge
 }
 
 // New creates a Flusher.
@@ -87,6 +88,10 @@ func New(hot storage.HotStore, cold storage.ColdStore, opts Options) *Flusher {
 		inflight: reg.NewGauge(prometheus.GaugeOpts{
 			Name: "xtsdb_hot_inflight_chunks",
 			Help: "Chunks claimed by flushers and not completed yet.",
+		}),
+		quarantined: reg.NewGauge(prometheus.GaugeOpts{
+			Name: "xtsdb_hot_quarantined_chunks",
+			Help: "Undecodable chunks kept in quarantine in the hot tier (see `xtsdb quarantine`).",
 		}),
 		lagSeconds: reg.NewGauge(prometheus.GaugeOpts{
 			Name: "xtsdb_flusher_lag_seconds",
@@ -176,14 +181,18 @@ func (f *Flusher) flushBatch(ctx context.Context, refs []storage.ChunkRef) int {
 	leaseEnd := start.Add(f.opts.Lease)
 
 	loadCtx, cancel := context.WithTimeout(work, f.opts.Lease)
-	chunks, missing, err := f.hot.Load(loadCtx, refs)
+	loaded, err := f.hot.Load(loadCtx, refs)
 	cancel()
 	if err != nil {
 		f.log.Error("load failed", "chunks", len(refs), "err", err)
 		f.chunks.WithLabelValues("error").Add(float64(len(refs)))
 		return 0
 	}
-	finished := 0
+	chunks, missing := loaded.Chunks, loaded.Missing
+	finished := loaded.Quarantined
+	if loaded.Quarantined > 0 {
+		f.chunks.WithLabelValues("quarantined").Add(float64(loaded.Quarantined))
+	}
 	if len(missing) > 0 {
 		rctx, cancel := context.WithTimeout(work, completeTimeout)
 		if err := f.hot.Release(rctx, missing); err != nil {
@@ -288,6 +297,7 @@ func (f *Flusher) reportBacklog(ctx context.Context) {
 		if err == nil {
 			f.pending.Set(float64(b.PendingChunks))
 			f.inflight.Set(float64(b.InflightChunks))
+			f.quarantined.Set(float64(b.QuarantinedChunks))
 			lag := 0.0
 			if b.OldestDue > 0 {
 				lag = max(0, float64(time.Now().UnixMilli()-b.OldestDue)/1000)

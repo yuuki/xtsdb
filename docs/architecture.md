@@ -53,7 +53,8 @@ A window is *due* at `start + chunk_range + grace_period`.
 <prefix>:{N}:due                   ZSET  member -> due time (ms), not yet claimed
 <prefix>:{N}:inf                   ZSET  member -> lease expiry (ms), claimed
 <prefix>:{N}:infdue                ZSET  member -> due time (ms), claimed
-<prefix>:{N}:q:<series>:<window>   quarantined chunk (undecodable)
+<prefix>:{N}:q:<series>:<window>:<digest>  quarantined chunk (undecodable)
+<prefix>:{N}:qidx                  ZSET  quarantine key -> expiry time (ms)
 <prefix>:meta                      HASH  layout parameters (shards, chunk range)
 ```
 
@@ -143,6 +144,11 @@ Invariants:
   chunk was loaded (possible only after a failover to a lagging replica)
   are not deleted: the chunk is re-processed after its lease.
 - **No leaks.** In-flight entries whose chunk no longer exists are released.
+- **Fenced quarantine.** A chunk that cannot be decoded is moved to a
+  quarantine key so that it does not block flushing, but only if its first
+  16 bytes and its length are still those that were read, exactly like
+  `complete`. A healthy newer incarnation of the window is never moved
+  away. See [Quarantined chunks](#quarantined-chunks).
 - **Flushing works when Redis is full.** claim, complete and quarantine are
   flagged `allow-oom`; with `noeviction`, flushing is the only way memory is
   freed, so it must not be refused.
@@ -165,11 +171,37 @@ left data in Redis forever.
 | Redis out of memory (`noeviction`) | Appends are refused (503, clients retry); claim and complete keep working, so flushing frees memory. |
 | Redis restart / `SCRIPT FLUSH` | Scripts are reloaded automatically. Unflushed data loss is bounded by the Redis persistence settings. |
 | Redis restored from an older snapshot, or failover to a lagging replica | Chunks flushed since the snapshot may be flushed again with less data; they are stored as separate versions and never overwrite the complete one. |
-| Undecodable chunk | Moved to a quarantine key and logged; it does not block flushing. |
+| Undecodable chunk | Moved to a quarantine key (fenced, see below), logged and counted; it does not block flushing. |
 | Very large chunk | Persisted in parts of 100,000 samples, below Cassandra's mutation limit. |
 | Sample for a closed window | Rejected and counted (`outcome="too_old"`); remote write returns 400. |
 | Redis clock moves backwards | A claimed chunk still rejects appends (the in-flight check). A chunk re-created after completion is a new fragment and is stored as a separate version; reads merge versions. |
 | Index write fails | The batch fails with 503 before any sample is stored; the client retries. |
+
+### Quarantined chunks
+
+A chunk that cannot be decoded (its length is not a whole number of
+records, or its header is not a timestamp) can only be the result of a bug
+or of tampering with Redis, but it must neither block flushing nor be lost
+silently:
+
+- It is renamed to `<prefix>:{N}:q:<series>:<window>:<digest>`, where
+  `digest` is the xxhash64 of its content. Different chunks of the same
+  window therefore never overwrite each other in quarantine.
+- The rename is fenced on the first 16 bytes and the length that were read.
+  If the chunk changed since (a newer incarnation after a failover or a
+  clock step), it stays in flight and is read again after its lease.
+- The quarantine key is recorded in `<prefix>:{N}:qidx` and expires after
+  `flusher.quarantine_ttl` (30 days by default; 0 keeps it until it is
+  deleted).
+- `xtsdb_flusher_chunks_total{outcome="quarantined"}` counts quarantines and
+  `xtsdb_hot_quarantined_chunks` reports how many are held. Queries do not
+  read quarantined chunks.
+
+`xtsdb quarantine list` shows every quarantined chunk with its series ID,
+window, size, header and expiry; `redis-cli GET <key>` returns the raw
+content (16-byte header followed by 16-byte big-endian records of
+timestamp and IEEE-754 value). `xtsdb quarantine delete <key>...` or
+`xtsdb quarantine delete -all` deletes them.
 
 ## Cold tier (Cassandra)
 
