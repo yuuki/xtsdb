@@ -12,6 +12,7 @@ import (
 	"github.com/cespare/xxhash/v2"
 	"github.com/prometheus/prometheus/model/labels"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/yuuki/xtsdb/internal/model"
 	"github.com/yuuki/xtsdb/internal/storage"
@@ -34,6 +35,9 @@ type Index struct {
 	readConcurrency int
 	buckets         int
 	now             func() time.Time
+	// reads bounds the bucket queries in flight across all lookups, which
+	// callers already run in parallel.
+	reads *semaphore.Weighted
 }
 
 // indexSlack is how much longer index entries live than samples.
@@ -47,7 +51,14 @@ var (
 // NewIndex creates an Index with the given number of buckets, which must
 // match the one the index was written with (see CheckLayout).
 func NewIndex(s *gocql.Session, retention time.Duration, readConcurrency, buckets int) *Index {
-	return &Index{session: s, retention: retention, readConcurrency: readConcurrency, buckets: max(buckets, 1), now: time.Now}
+	return &Index{
+		session:         s,
+		retention:       retention,
+		readConcurrency: readConcurrency,
+		buckets:         max(buckets, 1),
+		now:             time.Now,
+		reads:           semaphore.NewWeighted(int64(max(readConcurrency, 1))),
+	}
 }
 
 // dayTTL returns the TTL of the entries of a day, and false if the samples
@@ -146,7 +157,7 @@ func (x *Index) WriteLabelName(ctx context.Context, day int32, name string) erro
 
 // Postings returns the series that had the label pair on a day.
 func (x *Index) Postings(ctx context.Context, day int32, name, value string) ([]model.SeriesID, error) {
-	return readBuckets(ctx, x.buckets, func(ctx context.Context, bucket int16) ([]model.SeriesID, error) {
+	return readBuckets(ctx, x.reads, x.buckets, func(ctx context.Context, bucket int16) ([]model.SeriesID, error) {
 		iter := x.session.Query(`SELECT series_id FROM postings WHERE day = ? AND name = ? AND value = ? AND bucket = ?`,
 			day, name, value, bucket).Idempotent(true).PageSize(10000).IterContext(ctx)
 		var (
@@ -165,7 +176,7 @@ func (x *Index) Postings(ctx context.Context, day int32, name, value string) ([]
 
 // LabelValues returns the values of a label name seen on a day, sorted.
 func (x *Index) LabelValues(ctx context.Context, day int32, name string) ([]string, error) {
-	vals, err := readBuckets(ctx, x.buckets, func(ctx context.Context, bucket int16) ([]string, error) {
+	vals, err := readBuckets(ctx, x.reads, x.buckets, func(ctx context.Context, bucket int16) ([]string, error) {
 		return x.strings(ctx, `SELECT value FROM label_values WHERE day = ? AND name = ? AND bucket = ?`, day, name, bucket)
 	})
 	if err != nil {
@@ -175,17 +186,25 @@ func (x *Index) LabelValues(ctx context.Context, day int32, name string) ([]stri
 	return vals, nil
 }
 
-// readBuckets reads every bucket in parallel and concatenates the results.
-// Buckets are disjoint, so there is nothing to de-duplicate.
-func readBuckets[T any](ctx context.Context, buckets int, read func(context.Context, int16) ([]T, error)) ([]T, error) {
+// readBuckets reads every bucket in parallel, at most as many at a time as
+// sem allows, and concatenates the results. Buckets are disjoint, so there
+// is nothing to de-duplicate.
+func readBuckets[T any](ctx context.Context, sem *semaphore.Weighted, buckets int, read func(context.Context, int16) ([]T, error)) ([]T, error) {
+	readOne := func(ctx context.Context, b int16) ([]T, error) {
+		if err := sem.Acquire(ctx, 1); err != nil {
+			return nil, err
+		}
+		defer sem.Release(1)
+		return read(ctx, b)
+	}
 	if buckets == 1 {
-		return read(ctx, 0)
+		return readOne(ctx, 0)
 	}
 	parts := make([][]T, buckets)
 	g, ctx := errgroup.WithContext(ctx)
 	for b := range buckets {
 		g.Go(func() (err error) {
-			parts[b], err = read(ctx, int16(b))
+			parts[b], err = readOne(ctx, int16(b))
 			return err
 		})
 	}

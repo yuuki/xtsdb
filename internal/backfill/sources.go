@@ -174,7 +174,8 @@ func (im *Importer) ImportBlock(ctx context.Context, dir string, concurrency int
 }
 
 // DefaultMaxBuffered bounds the samples ImportOpenMetrics holds in memory
-// (about 16 bytes each) before importing what it has read so far.
+// (about 32 bytes each, with their share of the per-series buffers) before
+// importing what it has read so far.
 const DefaultMaxBuffered = 10_000_000
 
 // ImportOpenMetrics imports OpenMetrics text in which every sample has a

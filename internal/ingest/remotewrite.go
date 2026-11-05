@@ -251,5 +251,8 @@ func describeRejections(res Result) string {
 	if res.Collision > 0 {
 		parts = append(parts, fmt.Sprintf("%d samples of series whose ID collides with another series", res.Collision))
 	}
+	if res.ChunkFull > 0 {
+		parts = append(parts, fmt.Sprintf("%d samples whose chunk window reached its maximum size", res.ChunkFull))
+	}
 	return fmt.Sprintf("accepted %d samples, rejected %s", res.Accepted, strings.Join(parts, ", "))
 }

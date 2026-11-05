@@ -46,7 +46,10 @@ type Options struct {
 
 // Stats counts what an import did.
 type Stats struct {
-	Series     atomic.Int64 // series with at least one sample imported
+	// Series counts series imports with at least one sample: a series
+	// imported from several blocks, or from OpenMetrics input imported in
+	// several slices, counts once per block or slice.
+	Series     atomic.Int64
 	Samples    atomic.Int64 // samples imported
 	Chunks     atomic.Int64 // chunk window versions written
 	Bytes      atomic.Int64 // compressed bytes written

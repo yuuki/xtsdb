@@ -149,6 +149,10 @@ func TestWindowIndexIsBuiltForExistingChunks(t *testing.T) {
 		client.Del(ctx, s.windowsKey(layout.Shard(id), id))
 	}
 	client.HDel(ctx, s.prefix+":meta", windowIndexField)
+	// A chunk completed while the index is built leaves no entry behind.
+	gone := model.SeriesID(0x1234)
+	goneShard := layout.Shard(gone)
+	client.ZAdd(ctx, s.dueKey(goneShard), redis.Z{Score: 1, Member: member(gone, 1000)})
 	if got, _ := s.Read(ctx, ids, now-1, now+1); len(got) != 0 {
 		t.Fatalf("precondition: unindexed chunks are not read, got %d series", len(got))
 	}
@@ -158,6 +162,9 @@ func TestWindowIndexIsBuiltForExistingChunks(t *testing.T) {
 	}
 	if got, err := s2.Read(ctx, ids, now-1, now+1); err != nil || len(got) != len(ids) {
 		t.Fatalf("read %d series after the index was built, want %d (%v)", len(got), len(ids), err)
+	}
+	if client.Exists(ctx, s.windowsKey(goneShard, gone)).Val() != 0 {
+		t.Fatal("a chunk that does not exist was indexed")
 	}
 }
 

@@ -195,3 +195,21 @@ redis.call('ZREM', KEYS[2], member)
 redis.call('ZREM', KEYS[6], ARGV[5])
 return 1
 `)
+
+// indexScript registers existing chunks in the window index of their
+// series, for chunks written before window indexes existed. The existence
+// check and the registration are atomic, so a chunk completed at the same
+// time leaves no stale entry.
+//
+// KEYS = (chunk key, window index) for every chunk; ARGV = window starts
+// Returns the number of chunks registered.
+var indexScript = redis.NewScript(allowOOM + `
+local n = 0
+for c = 0, #KEYS / 2 - 1 do
+  if redis.call('EXISTS', KEYS[1 + 2 * c]) == 1 then
+    redis.call('ZADD', KEYS[2 + 2 * c], ARGV[1 + c], ARGV[1 + c])
+    n = n + 1
+  end
+end
+return n
+`)

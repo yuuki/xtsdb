@@ -190,14 +190,29 @@ func (s *Store) buildWindowIndex(ctx context.Context) error {
 			}
 			members = append(members, m...)
 		}
-		if err := s.pipelined(ctx, len(members), func(pipe redis.Pipeliner, i int) {
-			if id, start, err := parseMember(members[i]); err == nil {
-				pipe.ZAdd(ctx, s.windowsKey(shard, id), redis.Z{Score: float64(start), Member: start})
+		var calls []scriptCall
+		for len(members) > 0 {
+			batch := members[:min(len(members), maxChunksPerCall)]
+			members = members[len(batch):]
+			var call scriptCall
+			for _, m := range batch {
+				if id, start, err := parseMember(m); err == nil {
+					call.keys = append(call.keys, s.chunkKey(shard, m), s.windowsKey(shard, id))
+					call.args = append(call.args, start)
+				}
 			}
-		}); err != nil {
+			if len(call.keys) > 0 {
+				calls = append(calls, call)
+			}
+		}
+		results, err := s.runScripts(ctx, indexScript, calls)
+		if err != nil {
 			return fmt.Errorf("build window index: %w", err)
 		}
-		n += len(members)
+		for _, r := range results {
+			k, _ := r.Int()
+			n += k
+		}
 	}
 	if err := s.client.HSet(ctx, key, windowIndexField, "1").Err(); err != nil {
 		return fmt.Errorf("redis meta: %w", err)

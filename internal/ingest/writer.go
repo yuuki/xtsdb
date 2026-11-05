@@ -39,12 +39,14 @@ type Result struct {
 	// Collision counts samples of series whose ID is already used by a
 	// different label set.
 	Collision int
+	// ChunkFull counts samples whose chunk reached its maximum size.
+	ChunkFull int
 	// FirstInvalid describes the first invalid series, if any.
 	FirstInvalid error
 }
 
 // Rejected returns the number of samples that were not stored.
-func (r Result) Rejected() int { return r.TooOld + r.TooNew + r.Invalid + r.Collision }
+func (r Result) Rejected() int { return r.TooOld + r.TooNew + r.Invalid + r.Collision + r.ChunkFull }
 
 // Merge adds the counts of o to r.
 func (r *Result) Merge(o Result) {
@@ -54,6 +56,7 @@ func (r *Result) Merge(o Result) {
 	r.TooNew += o.TooNew
 	r.Invalid += o.Invalid
 	r.Collision += o.Collision
+	r.ChunkFull += o.ChunkFull
 	if r.FirstInvalid == nil {
 		r.FirstInvalid = o.FirstInvalid
 	}
@@ -318,6 +321,7 @@ func (w *Writer) Write(ctx context.Context, batch []Series) (Result, error) {
 		res.Accepted += ar.Accepted
 		res.AcceptedHistograms += ar.AcceptedHistograms
 		res.TooOld += ar.TooOld
+		res.ChunkFull += ar.ChunkFull
 	}
 
 	w.samples.WithLabelValues("accepted").Add(float64(res.Accepted))
@@ -325,6 +329,7 @@ func (w *Writer) Write(ctx context.Context, batch []Series) (Result, error) {
 	w.samples.WithLabelValues("too_new").Add(float64(res.TooNew))
 	w.samples.WithLabelValues("invalid").Add(float64(res.Invalid))
 	w.samples.WithLabelValues("collision").Add(float64(res.Collision))
+	w.samples.WithLabelValues("chunk_full").Add(float64(res.ChunkFull))
 	return res, nil
 }
 

@@ -409,9 +409,13 @@ window instead would cost `(range / chunk_range) + 1` commands per series,
 for example 361 with a 6 hour range and a one minute `chunk_range`, and more
 while flushing lags. Chunks written by builds that predate the window index
 are registered once, from the `due` and `inf` sets, when xtsdb starts and
-`<prefix>:meta` has no `window_index` field. Chunks created by such builds
-while they still run (during a rolling upgrade) are not indexed: upgrade
-the ingesters first, or all processes at once.
+`<prefix>:meta` has no `window_index` field; a chunk is registered only if
+it still exists, atomically, so a chunk completed meanwhile leaves no entry.
+Chunks that such builds create while they still run (during a rolling
+upgrade) are not indexed, so queries miss their samples until they are
+flushed to Cassandra: at most `chunk_range` + `grace_period` after the last
+older ingester stopped. Stop the older ingesters before starting new ones to
+avoid that gap.
 
 ## Changes from 0.x
 

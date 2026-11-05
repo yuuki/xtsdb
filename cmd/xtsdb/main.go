@@ -104,7 +104,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fs.StringVar(&imp.stateFile, "state-file", "", "File recording the blocks and files imported completely; they are skipped when the import is run again.")
 		fs.IntVar(&imp.concurrency, "concurrency", 16, "Series imported at a time.")
 		fs.IntVar(&imp.maxBuffered, "max-buffered-samples", 10_000_000,
-			"OpenMetrics: samples held in memory before they are imported (about 16 bytes each).")
+			"OpenMetrics: samples held in memory before they are imported (about 32 bytes each).")
 		fs.Usage = func() {
 			fmt.Fprint(stderr, importUsage)
 			fs.PrintDefaults()

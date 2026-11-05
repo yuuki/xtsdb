@@ -646,3 +646,27 @@ func TestFragmentsSurviveClockStep(t *testing.T) {
 		}
 	}
 }
+
+// Quarantine keys of earlier builds (<prefix>:{N}:q:<series>:<window>, not
+// in the quarantine index) are listed and deleted too.
+func TestListsUnindexedQuarantineKeys(t *testing.T) {
+	layout := model.Layout{Shards: 4, ChunkRange: 300, Grace: 0}
+	s, client := newTestStore(t, layout, time.Minute)
+	ctx := context.Background()
+	old := s.tag(2) + ":q:" + member(0x2a, 1_700_000_000_000)
+	client.Set(ctx, old, "0000000000000001xyz", time.Hour)
+	list, err := s.ListQuarantined(ctx)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("list: %+v %v", list, err)
+	}
+	if c := list[0]; c.Key != old || c.Shard != 2 || c.Series != 0x2a || c.Start != 1_700_000_000_000 ||
+		c.Bytes != 19 || c.Expires.IsZero() {
+		t.Fatalf("unexpected listing %+v", c)
+	}
+	if n, err := s.DeleteQuarantined(ctx, []string{old}); err != nil || n != 1 {
+		t.Fatalf("delete: %d %v", n, err)
+	}
+	if globEscape(`a*b?[c]\`) != `a\*b\?\[c\]\\` {
+		t.Fatalf("glob escaping is wrong: %s", globEscape(`a*b?[c]\`))
+	}
+}

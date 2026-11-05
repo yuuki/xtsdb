@@ -114,6 +114,29 @@ func TestWriterDoesNotStoreUnindexedSamples(t *testing.T) {
 	}
 }
 
+// Samples beyond the maximum chunk size are rejected and reported, so that
+// remote write answers 400 instead of dropping them silently.
+func TestWriterReportsFullChunks(t *testing.T) {
+	w, hot, _ := newTestWriter(t)
+	hot.MaxChunk = 2
+	h := RemoteWriteHandler(w, testRWOptions, slog.New(slog.DiscardHandler))
+	now := time.Now().UnixMilli()
+	req := &prompb.WriteRequest{Timeseries: []prompb.TimeSeries{{
+		Labels:  []prompb.Label{{Name: "__name__", Value: "busy"}},
+		Samples: []prompb.Sample{{Timestamp: now, Value: 1}, {Timestamp: now + 1, Value: 2}, {Timestamp: now + 2, Value: 3}},
+	}}}
+	body, _ := req.Marshal()
+	rec := post(t, h, "", body)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "maximum size") {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	res, err := w.Write(context.Background(), []Series{{Labels: labels.FromStrings("__name__", "busy"),
+		Samples: []model.Sample{{T: now + 3, V: 4}}}})
+	if err != nil || res.ChunkFull != 1 || res.Rejected() != 1 {
+		t.Fatalf("result %+v %v", res, err)
+	}
+}
+
 // Two label sets with the same series ID: the one recorded first keeps the
 // ID, samples of the other are rejected and none of its index entries are
 // written.
