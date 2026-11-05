@@ -8,6 +8,8 @@ LDFLAGS  := -s -w \
 # Backends started by `make deps` (see compose.yaml).
 export XTSDB_TEST_REDIS_ADDRS     ?= 127.0.0.1:6379
 export XTSDB_TEST_CASSANDRA_HOSTS ?= 127.0.0.1:9042
+# The TiKV cluster started by `make deps-tikv`.
+TIKV_PD ?= 127.0.0.1:2379
 
 .PHONY: all
 all: lint test build
@@ -18,15 +20,28 @@ build:
 
 .PHONY: test
 test: ## Unit tests (integration tests are skipped without backends)
-	env -u XTSDB_TEST_REDIS_ADDRS -u XTSDB_TEST_CASSANDRA_HOSTS $(GO) test -race ./...
+	env -u XTSDB_TEST_REDIS_ADDRS -u XTSDB_TEST_CASSANDRA_HOSTS -u XTSDB_TEST_TIKV_PD $(GO) test -race ./...
 
 .PHONY: test-integration
 test-integration: deps ## All tests against Redis and Cassandra from compose.yaml
 	$(GO) test -race -count=1 ./...
 
+.PHONY: test-tikv
+test-tikv: deps-tikv ## TiKV backend tests against Redis and TiKV from compose.yaml (Linux)
+	docker compose up -d --wait redis
+	env -u XTSDB_TEST_CASSANDRA_HOSTS XTSDB_TEST_TIKV_PD=$(TIKV_PD) \
+		$(GO) test -race -count=1 ./internal/tikv/ ./internal/app/ ./cmd/xtsdb/
+
 .PHONY: deps
 deps:
 	docker compose up -d --wait redis cassandra
+
+.PHONY: deps-tikv
+deps-tikv:
+	docker compose --profile tikv up -d pd tikv
+	@for i in $$(seq 120); do \
+		curl -sf http://$(TIKV_PD)/pd/api/v1/stores | grep -q '"state_name": "Up"' && exit 0; sleep 1; \
+	done; echo "TiKV did not start" >&2; exit 1
 
 .PHONY: lint
 lint:

@@ -2,7 +2,8 @@
 
 xtsdb is a horizontally scalable time series database that tiers data
 across two kinds of key-value stores: recent samples live in **Redis** (or
-Valkey) and older samples are compressed and moved to **Apache Cassandra**.
+Valkey) and older samples are compressed and moved to **Apache Cassandra**
+or **TiKV**.
 It speaks the Prometheus Remote Write and Graphite protocols and serves the
 Prometheus HTTP API, so Prometheus and Grafana work with it out of the box.
 
@@ -14,9 +15,10 @@ use each store for what it is good at, and scale each tier independently.
 
 ## Features
 
-- **No data loss in the hand-off.** Samples move from Redis to Cassandra
-  with an at-least-once protocol based on leases and content-idempotent
-  writes, keep working when Redis is full or Cassandra is slow, and stay
+- **No data loss in the hand-off.** Samples move from Redis to the
+  persistent tier with an at-least-once protocol based on leases and
+  content-idempotent writes, keep working when Redis is full or the
+  persistent tier is slow, and stay
   visible to queries throughout. No Redis keyspace notifications are used.
 - **Prometheus compatible.** Remote Write 1.0 and 2.0 for ingestion, with
   native histograms (exponential and custom buckets); PromQL
@@ -26,7 +28,10 @@ use each store for what it is good at, and scale each tier independently.
   are supported.
 - **Graphite plaintext** over TCP and UDP, including tags
   (`cpu.user;host=web01 12.5 1700000000`).
-- **Series index** in Cassandra, partitioned by day, so label matchers
+- **Two persistent backends:** Apache Cassandra (or ScyllaDB), and TiKV
+  through its RawKV API (`storage.backend`). Both hold the compressed chunks
+  and the series index, with the same semantics.
+- **Series index** partitioned by day, so label matchers
   (`=`, `!=`, `=~`, `!~`) work on any time range.
 - **Gorilla compression** in the persistent tier (Prometheus XOR and float
   histogram chunks).
@@ -44,7 +49,7 @@ use each store for what it is good at, and scale each tier independently.
 flowchart LR
     P[Prometheus<br/>remote_write] --> I
     G[Graphite clients] --> I
-    I[ingester] -- index --> C[(Cassandra<br/>index + chunks)]
+    I[ingester] -- index --> C[(Cassandra or TiKV<br/>index + chunks)]
     I -- append samples --> R[(Redis / Valkey<br/>open chunks)]
     F[flusher] -- claim closed chunks --> R
     F -- compressed chunks --> C
@@ -57,7 +62,7 @@ flowchart LR
    in the index, and appends samples to per-series time windows in Redis.
 2. When a window closes (`chunk_range` + `grace_period` after it starts),
    a **flusher** claims it under a lease, compresses it, writes it to
-   Cassandra and only then deletes it from Redis.
+   the persistent tier and only then deletes it from Redis.
 3. The **querier** resolves label matchers through the index and merges
    samples from both tiers, preferring the most recent write.
 
@@ -148,8 +153,8 @@ visible in the metrics below and in the logs.
 
 ## Importing history
 
-`xtsdb import` writes historical samples directly into Cassandra, as the
-flusher would, and indexes them for every day they cover. Use it to migrate
+`xtsdb import` writes historical samples directly into the persistent tier,
+as the flusher would, and indexes them for every day they cover. Use it to migrate
 from Prometheus, to re-ingest data lost in an outage longer than the grace
 period, or to load data exported from 0.x.
 
@@ -175,8 +180,9 @@ xtsdb import -config.file=xtsdb.yaml -format=openmetrics history.om
   expire `storage.retention` after their timestamp, like ingested ones.
 - Native histograms are imported. A series whose ID collides
   with another series is skipped and logged.
-- Only Cassandra is needed; the import checks that `storage.chunk_range` and
-  `storage.index_buckets` match the values the data was written with.
+- Only the persistent tier is needed (Cassandra or TiKV); the import checks
+  that `storage.chunk_range` (and, with Cassandra, `storage.index_buckets`)
+  match the values the data was written with.
   `-concurrency` (16) sets how many series are written at a time.
 
 ## Querying
@@ -223,6 +229,22 @@ stateless and can be scaled horizontally:
   `storage.retention` (counted from the time of the data, so `retention` must
   be 0 or at least a day); chunk and postings tables use
   `TimeWindowCompactionStrategy`.
+
+**TiKV** (`storage.backend: tikv`)
+- Run TiKV with `storage.api-version = 2` (`tikv.api_version: v2`, the
+  default), or with `api-version = 1` and `storage.enable-ttl = true`
+  (`tikv.api_version: v1ttl`): entries expire through RawKV TTLs, with the
+  same rules as in Cassandra. [deploy/tikv.toml](deploy/tikv.toml) has the
+  settings for a development node.
+- There is no schema: `xtsdb migrate` only checks that TiKV can be reached.
+  Keys start with `storage.key_prefix`, so several deployments can share a
+  cluster or an API v2 keyspace (`tikv.keyspace`).
+- xtsdb uses the atomic mode of RawKV, which compare-and-swap requires. No
+  other client should write xtsdb's keys.
+- Production needs at least 3 PD and 3 TiKV nodes. `storage.index_buckets`
+  does not apply: TiKV splits large key ranges over regions by itself.
+- TLS: `tikv.tls` with `ca_file` (and `cert_file`/`key_file` for mutual
+  TLS) is used for both PD and TiKV.
 
 **Security.** By default xtsdb's own listeners are neither encrypted nor
 authenticated: anyone who can reach the HTTP port can write and query, and
@@ -289,8 +311,8 @@ effective configuration. With `-config.expand-env`, `${VAR}` and
 `${VAR:-default}` are replaced by environment variables. `storage.key_prefix`,
 `storage.shards`, `storage.chunk_range` and `storage.index_buckets` must not
 change once data exists; xtsdb refuses to start if `shards` or `chunk_range`
-differ from the values recorded in Redis, or `index_buckets` from the value
-recorded in Cassandra.
+differ from the values recorded in Redis, or `chunk_range` and
+`index_buckets` from the values recorded in the persistent tier.
 
 ## Building and testing
 
@@ -300,6 +322,7 @@ Requires Go 1.27.
 make build              # bin/xtsdb
 make test               # unit tests
 make test-integration   # starts Redis and Cassandra with Docker Compose, then runs all tests
+make test-tikv          # starts Redis and a single-node TiKV (Linux), then runs the TiKV tests
 make lint               # go vet + golangci-lint
 make docker             # container image
 make snapshot           # release archives in dist/, without publishing
@@ -310,8 +333,12 @@ Releases are made by pushing a version tag; see
 
 Integration tests run against the servers named by
 `XTSDB_TEST_REDIS_ADDRS` (comma separated; set `XTSDB_TEST_REDIS_CLUSTER=1`
-for Redis Cluster) and `XTSDB_TEST_CASSANDRA_HOSTS`, and are skipped when
-those are unset. `XTSDB_TEST_STRESS=1` also runs a stress test that indexes
+for Redis Cluster), `XTSDB_TEST_CASSANDRA_HOSTS` and `XTSDB_TEST_TIKV_PD`
+(PD addresses; `XTSDB_TEST_TIKV_API_VERSION=v1ttl` for API v1 with TTLs),
+and are skipped when those are unset. Both persistent backends run the same
+conformance tests (`internal/storage/storagetest`); the TiKV backend also
+runs them against an in-memory RawKV without a cluster. The TiKV tests use
+PD and TiKV 8.5.8. `XTSDB_TEST_STRESS=1` also runs a stress test that indexes
 a million series sharing one label pair.
 
 Tested with Go 1.27.3, Redis 8.10.3 (standalone and Cluster), Valkey 9.1.3,
@@ -333,12 +360,15 @@ Cassandra 5.0.9, Prometheus 3.15.1 and Grafana 13.3.0.
 - Series are identified by a 64-bit hash of their labels. Collisions are
   detected: the series that was indexed first keeps the ID and samples of
   the other one are rejected (`outcome="collision"`).
-- Index partitions grow with the number of series sharing a label pair (or
-  values of a label) on one day, divided by `storage.index_buckets` (16 by
-  default): about 62,500 rows per partition for a million series.
-- Only Redis/Valkey and Cassandra are implemented, but the tiers sit behind
-  interfaces (`internal/storage`) so that other stores such as DynamoDB,
-  Bigtable or object storage can be added.
+- With Cassandra, index partitions grow with the number of series sharing a
+  label pair (or values of a label) on one day, divided by
+  `storage.index_buckets` (16 by default): about 62,500 rows per partition
+  for a million series.
+- The hot tier is Redis/Valkey; the persistent tier is Cassandra or TiKV.
+  The tiers sit behind interfaces (`internal/storage`) with a conformance
+  suite, so that other stores such as DynamoDB, Bigtable or object storage
+  can be added.
+- The TiKV client roughly doubles the size of the binary (about 45 MB).
 
 ## Upgrading from 0.x
 

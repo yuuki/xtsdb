@@ -48,6 +48,12 @@ key prefix. Versions before 2.0.0 were not released.
 - Release process: version tags, this changelog, binaries for Linux and
   macOS attached to GitHub releases and multi-architecture images on
   `ghcr.io/yuuki/xtsdb` (#11).
+- TiKV as a second backend of the persistent tier and the series index,
+  through the RawKV API (API v2, or v1 with TTLs): `storage.backend: tikv`
+  and the `tikv` section. Ingestion, flushing, queries, `xtsdb import` and
+  collision detection work as with Cassandra. A conformance suite in
+  `internal/storage/storagetest` defines the semantics both backends
+  provide (#10).
 
 ### Changed
 
@@ -63,8 +69,9 @@ key prefix. Versions before 2.0.0 were not released.
   the time of writing; `storage.retention` must be 0 or at least a day (#9).
 - `ingester.max_sample_future` must be at most a day, so that series rows
   outlive their samples.
-- `storage.chunk_range` and `storage.index_buckets` are recorded in Cassandra,
-  and xtsdb refuses to start when they change (#6, #9).
+- `storage.chunk_range` and `storage.index_buckets` are recorded in Cassandra
+  (`storage.chunk_range` in TiKV), and xtsdb refuses to start when they
+  change (#6, #9, #10).
 
 ### Fixed
 

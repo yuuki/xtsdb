@@ -51,7 +51,8 @@ redis:
   tls:
     enabled: false
 
-# Persistent tier and series index.
+# Persistent tier and series index on Cassandra (or ScyllaDB), used with
+# storage.backend: cassandra.
 cassandra:
   hosts: [${XTSDB_CASSANDRA_HOSTS:-127.0.0.1:9042}]  # example: from the environment
   keyspace: xtsdb
@@ -71,23 +72,40 @@ cassandra:
   replication_factor: 1
   # datacenters: {dc1: 3, dc2: 3}     # for NetworkTopologyStrategy
 
+# Persistent tier and series index on TiKV (RawKV), used with
+# storage.backend: tikv. TiKV must run with storage.api-version = 2; with
+# api_version v1ttl, with api-version = 1 and storage.enable-ttl = true.
+# Keys start with storage.key_prefix. There is no schema to create.
+tikv:
+  pd_endpoints: [${XTSDB_TIKV_PD_ENDPOINTS:-127.0.0.1:2379}]  # example: from the environment
+  api_version: v2   # or v1ttl
+  keyspace: ""      # API v2 keyspace; empty: the default keyspace
+  timeout: 10s      # per request, retries included
+  connect_timeout: 10s
+  # TLS to PD and TiKV: ca_file is required, cert_file and key_file for
+  # mutual TLS.
+  tls:
+    enabled: false
+
 # Storage layout. key_prefix, shards, chunk_range and index_buckets must not
 # change once data exists; xtsdb refuses to start if shards or chunk_range
-# differ from the values recorded in Redis, or index_buckets from the value
-# recorded in Cassandra.
+# differ from the values recorded in Redis, or chunk_range and index_buckets
+# from the values recorded in the persistent tier.
 storage:
-  key_prefix: xt
+  backend: cassandra   # persistent tier and index: cassandra or tikv
+  key_prefix: xt       # of Redis keys, and of TiKV keys with the tikv backend
   shards: 256
   # Samples are grouped per series into windows of chunk_range. A window
   # accepts samples until chunk_range + grace_period after its start; then
-  # it is flushed to Cassandra. Later samples for it are rejected.
+  # it is flushed to the persistent tier. Later samples for it are rejected.
   chunk_range: 1h
   grace_period: 10m
   retention: 90d   # 0 keeps data forever (max 20y minus 2d)
   # The series of a label pair (and the values of a label) are spread over
   # this many Cassandra partitions per day, so that a pair shared by
   # millions of series does not make one huge partition. Every index lookup
-  # reads all of them in parallel. 1 disables bucketing.
+  # reads all of them in parallel. 1 disables bucketing. Cassandra only:
+  # TiKV splits large ranges by itself.
   index_buckets: 16
 
 ingester:

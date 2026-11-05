@@ -90,6 +90,57 @@ jobs:
           XTSDB_TEST_REDIS_CLUSTER: "1"
           XTSDB_TEST_CASSANDRA_HOSTS: 127.0.0.1:9042
 
+  test-tikv:
+    name: test-tikv (${{ matrix.api }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        api: [v2, v1ttl]
+    services:
+      redis:
+        image: redis:8.10.3
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Start PD and TiKV
+        env:
+          API: ${{ matrix.api }}
+        run: |
+          conf="$PWD/deploy/tikv.toml"
+          if [ "$API" = v1ttl ]; then
+            sed 's/^api-version = 2$/api-version = 1/' deploy/tikv.toml > "$RUNNER_TEMP/tikv.toml"
+            conf="$RUNNER_TEMP/tikv.toml"
+          fi
+          docker run -d --network host --name pd pingcap/pd:v8.5.8 \
+            --name=pd --data-dir=/data --client-urls=http://127.0.0.1:2379 --peer-urls=http://127.0.0.1:2380
+          docker run -d --network host --name tikv -v "$conf:/etc/tikv/tikv.toml:ro" pingcap/tikv:v8.5.8 \
+            --pd-endpoints=127.0.0.1:2379 --addr=127.0.0.1:20160 --status-addr=127.0.0.1:20180 \
+            --data-dir=/data --config=/etc/tikv/tikv.toml
+          for _ in $(seq 120); do
+            if curl -sf http://127.0.0.1:2379/pd/api/v1/stores | grep -q '"state_name": "Up"'; then exit 0; fi
+            sleep 1
+          done
+          echo "TiKV did not start"
+          exit 1
+      - name: Test
+        run: go test -race -count=1 ./internal/tikv/ ./internal/app/ ./cmd/xtsdb/
+        env:
+          XTSDB_TEST_REDIS_ADDRS: 127.0.0.1:6379
+          XTSDB_TEST_TIKV_PD: 127.0.0.1:2379
+          XTSDB_TEST_TIKV_API_VERSION: ${{ matrix.api }}
+      - name: Logs
+        if: failure()
+        run: |
+          docker logs pd 2>&1 | tail -50
+          docker logs tikv 2>&1 | tail -100
+
   docker:
     runs-on: ubuntu-latest
     steps:

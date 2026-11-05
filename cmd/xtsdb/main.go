@@ -1,5 +1,5 @@
 // Command xtsdb is a time series database that tiers data between Redis
-// and Cassandra.
+// and a persistent store, Cassandra or TiKV.
 package main
 
 import (
@@ -19,7 +19,6 @@ import (
 	yaml "go.yaml.in/yaml/v4"
 
 	"github.com/yuuki/xtsdb/internal/app"
-	"github.com/yuuki/xtsdb/internal/cassandra"
 	"github.com/yuuki/xtsdb/internal/config"
 	"github.com/yuuki/xtsdb/internal/version"
 )
@@ -29,9 +28,9 @@ const usage = `Usage: xtsdb <command> [flags]
 Commands:
   all        Run the ingester, flusher and querier in one process
   ingester   Accept writes (Prometheus remote write, Graphite)
-  flusher    Move closed chunks from Redis to Cassandra
+  flusher    Move closed chunks from Redis to the persistent tier
   querier    Serve the Prometheus-compatible query API
-  migrate    Create or update the Cassandra schema and exit
+  migrate    Create or update the Cassandra schema (or check TiKV) and exit
   import     Import historical data (Prometheus TSDB blocks, OpenMetrics)
   quarantine Inspect or delete undecodable chunks kept in Redis
   config     Print the effective configuration and exit
@@ -42,7 +41,8 @@ Run 'xtsdb <command> -h' for the flags of a command.
 
 const importUsage = `Usage: xtsdb import [flags] <path>...
 
-Imports historical samples directly into Cassandra, bypassing Redis.
+Imports historical samples directly into the persistent tier (Cassandra or
+TiKV), bypassing Redis.
 With -format=tsdb, each path is a Prometheus data directory or a block
 directory; with -format=openmetrics, each path is an OpenMetrics text file
 in which every sample has a timestamp ("-" reads standard input). Importing
@@ -167,7 +167,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		_, _ = stdout.Write(out)
 		return 0
 	case "migrate":
-		if err := cassandra.Migrate(ctx, cfg.Cassandra, logger); err != nil {
+		if err := app.Migrate(ctx, cfg, logger); err != nil {
 			logger.Error("migration failed", "err", err)
 			return 1
 		}
