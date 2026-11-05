@@ -203,3 +203,49 @@ func TestTypedRoundTrip(t *testing.T) {
 		t.Fatalf("expected ErrCorrupt, got %v", err)
 	}
 }
+
+// Invalid histograms in a hot chunk are corruption: they must be reported,
+// so that the chunk is quarantined, instead of making the cold encoder
+// panic in the flusher.
+func TestDecodeHotRejectsInvalidHistograms(t *testing.T) {
+	bad := []*histogram.FloatHistogram{
+		{Schema: 0, Count: 1, PositiveSpans: []histogram.Span{{Length: 2}}, PositiveBuckets: []float64{1}},
+		{Schema: 100, Count: 1},
+		{Schema: histogram.CustomBucketsSchema, Count: 2, PositiveSpans: []histogram.Span{{Length: 2}}, PositiveBuckets: []float64{1, 1}}, // no bounds
+	}
+	for i, h := range bad {
+		b := AppendRaw([]byte("0000000000000001"), []model.Sample{{T: 1000, V: 1}, {T: 2000, H: h}})
+		if _, _, _, err := DecodeHot(b); !errors.Is(err, ErrCorrupt) {
+			t.Errorf("case %d: expected ErrCorrupt, got %v", i, err)
+		}
+		// Even if one got through, encoding must fail instead of panicking.
+		if _, _, err := Encode([]model.Sample{{T: 1000, H: testHistogram(1, false)}, {T: 2000, H: h}}); err == nil && i == 0 {
+			t.Errorf("case %d: encoding an invalid histogram must fail", i)
+		}
+	}
+	// A header that parses as a number but is not 16 digits.
+	if _, _, _, err := DecodeHot([]byte("+000000000000001")); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("expected ErrCorrupt for a signed header, got %v", err)
+	}
+}
+
+// The largest histogram accepted fits comfortably in one cold-tier row
+// (4 MiB) and in a hot chunk.
+func TestLargestHistogramFits(t *testing.T) {
+	h := &histogram.FloatHistogram{Schema: 0, PositiveSpans: []histogram.Span{{Length: model.MaxHistogramBuckets}},
+		PositiveBuckets: make([]float64, model.MaxHistogramBuckets)}
+	for i := range h.PositiveBuckets {
+		h.PositiveBuckets[i] = float64(i*7919%1000) + 0.5 // poorly compressible
+		h.Count += h.PositiveBuckets[i]
+	}
+	if err := model.ValidateHistogram(h); err != nil {
+		t.Fatal(err)
+	}
+	_, b, err := Encode([]model.Sample{{T: 1, H: h}})
+	if err != nil || len(b) > 1<<20 {
+		t.Fatalf("encoded %d bytes (%v), want at most 1 MiB", len(b), err)
+	}
+	if raw := AppendRaw(nil, []model.Sample{{T: 1, H: h}}); len(raw) > 1<<20 {
+		t.Fatalf("hot record of %d bytes", len(raw))
+	}
+}

@@ -36,7 +36,8 @@ type Index struct {
 	buckets         int
 	now             func() time.Time
 	// reads bounds the bucket queries in flight across all lookups, which
-	// callers already run in parallel.
+	// callers already run in parallel: read_concurrency lookups can each
+	// read all their buckets at once.
 	reads *semaphore.Weighted
 }
 
@@ -57,7 +58,7 @@ func NewIndex(s *gocql.Session, retention time.Duration, readConcurrency, bucket
 		readConcurrency: readConcurrency,
 		buckets:         max(buckets, 1),
 		now:             time.Now,
-		reads:           semaphore.NewWeighted(int64(max(readConcurrency, 1))),
+		reads:           semaphore.NewWeighted(int64(max(readConcurrency, 1) * max(buckets, 1))),
 	}
 }
 

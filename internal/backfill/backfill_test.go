@@ -329,6 +329,15 @@ func TestImportBlock(t *testing.T) {
 	if _, err := Blocks(t.TempDir()); err == nil {
 		t.Fatal("a directory without blocks must be an error")
 	}
+	if HasHead(dir) {
+		t.Fatal("no head yet")
+	}
+	if err := os.Mkdir(filepath.Join(dir, "wal"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if !HasHead(dir) {
+		t.Fatal("a data directory with wal/ has a head that is not imported")
+	}
 }
 
 func TestState(t *testing.T) {

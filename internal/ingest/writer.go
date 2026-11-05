@@ -206,7 +206,7 @@ func (w *Writer) Write(ctx context.Context, batch []Series) (Result, error) {
 		minS, maxS := int64(0), int64(0)
 		for _, smp := range s.Samples {
 			if smp.H != nil {
-				if err := smp.H.Validate(); err != nil {
+				if err := model.ValidateHistogram(smp.H); err != nil {
 					res.Invalid++
 					if res.FirstInvalid == nil {
 						res.FirstInvalid = fmt.Errorf("histogram of %s at %d: %w", lset, smp.T, err)

@@ -116,13 +116,13 @@ func New(ctx context.Context, target Target, cfg *config.Config, logger *slog.Lo
 	}, logger.With("component", "http"))
 	a.Server.AddCheck("redis", a.Hot.Ping)
 	a.Server.AddCheck("cassandra", cold.Ping)
-	a.Server.Mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	a.Server.Mux.Handle("/", readAuth.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
 			return
 		}
 		fmt.Fprintf(w, "xtsdb %s (%s)\n", version.Version, target)
-	})
+	})))
 
 	if target.runs(TargetIngester) {
 		w, err := ingest.NewWriter(a.Hot, index, ingest.WriterOptions{

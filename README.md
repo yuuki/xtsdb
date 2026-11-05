@@ -122,8 +122,11 @@ remote_write:
 ```
 
 Native histograms are stored as float histograms, which represent integer
-histograms exactly, and are returned by PromQL like in Prometheus.
-Exemplars and metadata are accepted and dropped.
+histograms exactly, and are returned by PromQL like in Prometheus; a
+histogram may have at most 16,384 buckets. Exemplars and metadata are
+accepted and dropped: keep `send_exemplars` off (the default), because with
+Remote Write 2.0 Prometheus counts a batch that carried only exemplars as
+failed when the receiver reports none written.
 
 **Graphite** plaintext on port 2003 (TCP and UDP):
 `<path>[;tag=value...] <value> [<unix timestamp>]`. The path becomes
@@ -151,9 +154,11 @@ from Prometheus, to re-ingest data lost in an outage longer than the grace
 period, or to load data exported from 0.x.
 
 ```bash
-# Prometheus TSDB blocks: a data directory or a single block. Take a
-# snapshot (POST /api/v1/admin/tsdb/snapshot) or stop Prometheus first, so
-# that its head is written as a block.
+# Prometheus TSDB blocks: a data directory or a single block. Import a
+# snapshot (POST /api/v1/admin/tsdb/snapshot, with --web.enable-admin-api):
+# it writes the head, the most recent two to three hours, as a block. The
+# head of a data directory is not a block, even after Prometheus stopped,
+# and is not imported (xtsdb import warns about it).
 xtsdb import -config.file=xtsdb.yaml -state-file=import.state /prometheus/snapshots/20261105T161114Z-756e151f4435217b
 
 # OpenMetrics text in which every sample has a timestamp, the input format of

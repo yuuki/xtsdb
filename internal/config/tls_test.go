@@ -81,6 +81,9 @@ func TestValidateSecurity(t *testing.T) {
 		"client_auth_type":               func(c *Config) { c.Server.TLS.ClientAuthType = "NoClientCert" },
 		"server.auth.write.basic_auth":   func(c *Config) { c.Server.Auth.Write.BasicAuth = []BasicAuthUser{{Username: "u"}} },
 		"server.auth.read.bearer_tokens": func(c *Config) { c.Server.Auth.Read.BearerTokens = []string{""} },
+		"unexpanded": func(c *Config) {
+			c.Server.Auth.Write.BasicAuth = []BasicAuthUser{{Username: "u", Password: "${XTSDB_WRITE_PASSWORD}"}}
+		},
 	}
 	for field, mutate := range cases {
 		cfg := Default()

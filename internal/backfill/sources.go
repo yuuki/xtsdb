@@ -31,8 +31,9 @@ func asCollision(err error) (*storage.SeriesCollisionError, bool) {
 
 // Blocks returns the Prometheus TSDB blocks in dir: dir itself if it is a
 // block, otherwise its subdirectories that are blocks, in name (ULID, hence
-// time) order. The head of a running Prometheus (its WAL) is not a block;
-// take a snapshot or stop Prometheus first.
+// time) order. The head of a Prometheus data directory (its WAL, about the
+// last two to three hours) is not a block, even after Prometheus stopped;
+// a snapshot writes it as a block. See HasHead.
 func Blocks(dir string) ([]string, error) {
 	if isBlock(dir) {
 		return []string{dir}, nil
@@ -52,6 +53,13 @@ func Blocks(dir string) ([]string, error) {
 	}
 	slices.Sort(out)
 	return out, nil
+}
+
+// HasHead reports whether dir is a Prometheus data directory with a head
+// (wal/) that Blocks does not return.
+func HasHead(dir string) bool {
+	st, err := os.Stat(filepath.Join(dir, "wal"))
+	return err == nil && st.IsDir()
 }
 
 func isBlock(dir string) bool {

@@ -126,7 +126,7 @@ func (im *Importer) Import(ctx context.Context, lset labels.Labels, samples []mo
 	kept := samples[:0]
 	for _, s := range samples {
 		switch {
-		case s.H != nil && s.H.Validate() != nil:
+		case s.H != nil && model.ValidateHistogram(s.H) != nil:
 			im.Stats.Invalid.Add(1)
 		case s.T < minT:
 			im.Stats.TooOld.Add(1)

@@ -546,6 +546,10 @@ func TestClaimWorksAtMaxmemory(t *testing.T) {
 		!strings.Contains(err.Error(), "OOM") {
 		t.Fatalf("precondition: append must be refused at maxmemory, got %v", err)
 	}
+	// A flusher that starts now must be able to open the store.
+	if _, err := New(ctx, client, Options{Prefix: s.prefix, Layout: layout, Lease: 300 * time.Millisecond}); err != nil {
+		t.Fatalf("opening the store must work at maxmemory once the layout is recorded: %v", err)
+	}
 	again, err := s.Claim(ctx, 0, 100)
 	if err != nil || len(again) == 0 {
 		t.Fatalf("claim must work at maxmemory: %d refs, %v", len(again), err)

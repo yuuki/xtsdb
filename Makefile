@@ -1,5 +1,5 @@
 GO       ?= go
-VERSION  ?= $(shell git describe --tags --always --dirty 2>/dev/null | sed 's/^v//' || echo dev)
+VERSION  ?= $(shell (git describe --tags --always --dirty 2>/dev/null || echo dev) | sed 's/^v//')
 REVISION ?= $(shell git rev-parse HEAD 2>/dev/null)
 LDFLAGS  := -s -w \
 	-X github.com/yuuki/xtsdb/internal/version.Version=$(VERSION) \

@@ -142,6 +142,9 @@ func New(ctx context.Context, client redis.UniversalClient, opts Options) (*Stor
 // checkLayout records the layout on first use and refuses to run with a
 // different one: changing the shard count or the chunk range would make
 // existing chunks unreachable.
+//
+// Once the layout is recorded this only reads, so that a flusher can start
+// while Redis is out of memory: flushing is what frees it.
 func (s *Store) checkLayout(ctx context.Context) error {
 	key := s.prefix + ":meta"
 	fields := []struct{ name, value, option string }{
@@ -149,10 +152,13 @@ func (s *Store) checkLayout(ctx context.Context) error {
 		{"chunk_range_ms", strconv.FormatInt(s.layout.ChunkRange, 10), "storage.chunk_range"},
 	}
 	for _, f := range fields {
-		if err := s.client.HSetNX(ctx, key, f.name, f.value).Err(); err != nil {
-			return fmt.Errorf("redis meta: %w", err)
-		}
 		got, err := s.client.HGet(ctx, key, f.name).Result()
+		if errors.Is(err, redis.Nil) {
+			if err := s.client.HSetNX(ctx, key, f.name, f.value).Err(); err != nil {
+				return fmt.Errorf("redis meta: %w", err)
+			}
+			got, err = s.client.HGet(ctx, key, f.name).Result()
+		}
 		if err != nil {
 			return fmt.Errorf("redis meta: %w", err)
 		}

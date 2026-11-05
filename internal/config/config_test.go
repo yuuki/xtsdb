@@ -108,6 +108,7 @@ func TestValidate(t *testing.T) {
 		"redis.addrs":           func(c *Config) { c.Redis.Addrs = []string{""} },
 		"max_request_body_size": func(c *Config) { c.Ingester.MaxRequestBodySize = 1 << 62 },
 		"index_buckets":         func(c *Config) { c.Storage.IndexBuckets = 0 },
+		"max_sample_future":     func(c *Config) { c.Ingester.MaxSampleFuture = Duration(72 * time.Hour) },
 		"quarantine_ttl":        func(c *Config) { c.Flusher.QuarantineTTL = Duration(time.Minute) },
 	}
 	for field, mutate := range cases {

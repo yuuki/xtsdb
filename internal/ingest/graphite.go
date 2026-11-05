@@ -129,7 +129,7 @@ func NewGraphiteServer(addr string, maxConns int, w *Writer, reg prometheus.Regi
 		}, []string{"outcome"}),
 		connections: f.NewCounterVec(prometheus.CounterOpts{
 			Name: "xtsdb_graphite_connections_total",
-			Help: "Graphite TCP connections, by outcome (accepted, rejected).",
+			Help: "Graphite TCP connections, by outcome (accepted, rejected, tls_failed).",
 		}, []string{"outcome"}),
 	}
 }
@@ -244,6 +244,13 @@ func (g *GraphiteServer) acceptLoop() {
 		go func() {
 			defer g.wg.Done()
 			defer func() { <-sem }()
+			if tc, ok := c.(*tls.Conn); ok && !g.handshake(tc) {
+				g.mu.Lock()
+				delete(g.conns, c)
+				g.mu.Unlock()
+				c.Close()
+				return
+			}
 			g.serveConn(c)
 			g.mu.Lock()
 			delete(g.conns, c)
@@ -255,6 +262,23 @@ func (g *GraphiteServer) acceptLoop() {
 
 // serveConn reads lines and writes them in batches. A line waits at most
 // graphiteFlushInterval in a batch, whether or not more data arrives.
+// graphiteHandshakeTimeout bounds the TLS handshake, so that clients without
+// a valid certificate cannot hold connection slots for the idle timeout
+// (like ReadHeaderTimeout for HTTP). A variable for tests.
+var graphiteHandshakeTimeout = 10 * time.Second
+
+// handshake completes the TLS handshake within graphiteHandshakeTimeout.
+func (g *GraphiteServer) handshake(c *tls.Conn) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), graphiteHandshakeTimeout)
+	defer cancel()
+	if err := c.HandshakeContext(ctx); err != nil {
+		g.connections.WithLabelValues("tls_failed").Inc()
+		g.logger.Debug("graphite TLS handshake failed", "remote", c.RemoteAddr(), "err", err)
+		return false
+	}
+	return true
+}
+
 func (g *GraphiteServer) serveConn(c net.Conn) {
 	r := bufio.NewReaderSize(c, 64<<10)
 	var (

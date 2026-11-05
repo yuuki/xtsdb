@@ -10,6 +10,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -111,14 +113,18 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 		checks[k] = v
 	}
 	s.mu.Unlock()
-	var errs []error
+	// The endpoint is unauthenticated: name the failing checks, but keep
+	// their errors (addresses, backend messages) in the log.
+	var failed []string
 	for name, c := range checks {
 		if err := c(ctx); err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", name, err))
+			failed = append(failed, name)
+			s.logger.Warn("readiness check failed", "check", name, "err", err)
 		}
 	}
-	if err := errors.Join(errs...); err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+	if len(failed) > 0 {
+		slices.Sort(failed)
+		http.Error(w, "not ready: "+strings.Join(failed, ", ")+" unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	_, _ = w.Write([]byte("Ready\n"))

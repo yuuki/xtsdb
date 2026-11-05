@@ -90,6 +90,13 @@ func DecodeHot(b []byte) (fragment int64, samples []model.Sample, records int, e
 	if len(b) < HeaderLen || (len(b)-HeaderLen)%RecordLen != 0 {
 		return 0, nil, 0, fmt.Errorf("%w: length %d", ErrCorrupt, len(b))
 	}
+	// Only 16 ASCII digits: the fragment is re-rendered that way to fence
+	// completion, so any other spelling could never be completed.
+	for _, c := range b[:HeaderLen] {
+		if c < '0' || c > '9' {
+			return 0, nil, 0, fmt.Errorf("%w: header %q", ErrCorrupt, b[:HeaderLen])
+		}
+	}
 	fragment, err = strconv.ParseInt(string(b[:HeaderLen]), 10, 64)
 	if err != nil {
 		return 0, nil, 0, fmt.Errorf("%w: header: %w", ErrCorrupt, err)
@@ -125,7 +132,13 @@ func DecodeRaw(b []byte) ([]model.Sample, error) {
 		if err := h.Unmarshal(b[:n]); err != nil {
 			return nil, fmt.Errorf("%w: histogram: %w", ErrCorrupt, err)
 		}
-		out = append(out, model.Sample{T: t, H: h.ToFloatHistogram()})
+		fh := h.ToFloatHistogram()
+		// Only valid histograms are written; anything else is corruption,
+		// and would make the encoders of the cold tier panic.
+		if err := model.ValidateHistogram(fh); err != nil {
+			return nil, fmt.Errorf("%w: histogram at %d: %w", ErrCorrupt, t, err)
+		}
+		out = append(out, model.Sample{T: t, H: fh})
 		b = b[padded:]
 	}
 	return out, nil
@@ -224,7 +237,17 @@ const (
 const maxSamplesPerChunk = 16384
 
 // Encode compresses sorted, de-duplicated samples.
-func Encode(samples []model.Sample) (Encoding, []byte, error) {
+//
+// The Prometheus chunk encoders panic on some invalid histograms. Samples
+// are validated when they are written, but a panic here would take down the
+// flusher, and with it every flusher that claims the chunk after it, so it
+// is returned as an error instead.
+func Encode(samples []model.Sample) (enc Encoding, b []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			enc, b, err = 0, nil, fmt.Errorf("%w: encode: %v", ErrCorrupt, r)
+		}
+	}()
 	if !slices.ContainsFunc(samples, model.Sample.IsHistogram) {
 		b, err := EncodeXOR(samples)
 		return EncodingXOR, b, err

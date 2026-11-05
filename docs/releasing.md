@@ -28,8 +28,10 @@ configuration file and the command line:
   minor version keeps working;
 - a **patch** version only fixes bugs.
 
-Pre-releases are tagged `vX.Y.Z-rc.N`; GitHub marks them as pre-releases and
-the image is not tagged `latest`, `X.Y` or `X`.
+Pre-releases are tagged `vX.Y.Z-rc.N` and need their own CHANGELOG.md
+section (`## [X.Y.Z-rc.N] - YYYY-MM-DD`); GitHub marks them as pre-releases
+and the image is not tagged `latest`, `X.Y` or `X`. A release candidate can
+be promoted by tagging the same commit `vX.Y.Z`.
 
 The tags are not Go module versions: xtsdb is an application, and its module
 path has no `/v2` suffix, so `go install github.com/yuuki/xtsdb/cmd/xtsdb@vX.Y.Z`
@@ -58,9 +60,11 @@ checkout of the tag with `make build`.
    git push origin vX.Y.Z
    ```
 
-4. Watch the workflow. If it fails before anything is published, fix the
-   cause, delete the tag (`git push --delete origin vX.Y.Z`, `git tag -d
-   vX.Y.Z`) and tag again. Never move a tag that was published.
+4. Watch the workflow. The image is pushed only after the GitHub release
+   was created. If the workflow fails before the release exists, nothing
+   was published: fix the cause, delete the tag (`git push --delete origin
+   vX.Y.Z`, `git tag -d vX.Y.Z`) and tag again. If it fails after, re-run the
+   failed job. Never move a tag that was published.
 5. The first time an image is pushed, the `xtsdb` package on ghcr.io is
    private: make it public in the package settings
    (<https://github.com/users/yuuki/packages/container/xtsdb/settings>).

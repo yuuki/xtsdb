@@ -3,9 +3,9 @@ name: Release
 # Pushing a tag vX.Y.Z (or vX.Y.Z-rc.N) publishes:
 # - a GitHub release with binaries for Linux and macOS (amd64, arm64),
 #   checksums, and the CHANGELOG.md section of the version as notes;
-# - the container image ghcr.io/yuuki/xtsdb for linux/amd64 and linux/arm64,
-#   tagged X.Y.Z, X.Y and X (and latest for releases that are not
-#   pre-releases).
+# - then, only if the release was created, the container image
+#   ghcr.io/yuuki/xtsdb for linux/amd64 and linux/arm64, tagged X.Y.Z, X.Y
+#   and X (and latest for releases that are not pre-releases).
 
 on:
   push:
@@ -27,12 +27,12 @@ jobs:
       - name: Release notes
         run: |
           version="${GITHUB_REF_NAME#v}"
-          scripts/release-notes.sh "$version" > release-notes.md
-          cat release-notes.md
+          scripts/release-notes.sh "$version" > "$RUNNER_TEMP/release-notes.md"
+          cat "$RUNNER_TEMP/release-notes.md"
       - uses: actions/upload-artifact@v7
         with:
           name: release-notes
-          path: release-notes.md
+          path: ${{ runner.temp }}/release-notes.md
 
   binaries:
     needs: check
@@ -46,19 +46,25 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+      # Outside the checkout: GoReleaser refuses a dirty working tree.
       - uses: actions/download-artifact@v8
         with:
           name: release-notes
+          path: ${{ runner.temp }}/notes
       - uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
           version: "~> v2"
-          args: release --clean --release-notes=release-notes.md
+          args: release --clean --release-notes=${{ runner.temp }}/notes/release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The pushed tag, even if another tag points at the same commit
+          # (for example a release candidate that is promoted).
+          GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
 
   image:
-    needs: check
+    # After the release: a failed release must not leave a published image.
+    needs: binaries
     runs-on: ubuntu-latest
     permissions:
       contents: read

@@ -323,6 +323,48 @@ func TestGraphiteServerTLS(t *testing.T) {
 	}
 }
 
+// Clients that connect without completing the TLS handshake give their
+// connection slot back after the handshake timeout, so that they cannot
+// lock out senders with valid certificates.
+func TestGraphiteTLSHandshakeTimeout(t *testing.T) {
+	defer func(d time.Duration) { graphiteHandshakeTimeout = d }(graphiteHandshakeTimeout)
+	graphiteHandshakeTimeout = 200 * time.Millisecond
+	w, hot, _ := newTestWriter(t)
+	f := tlstest.Generate(t, t.TempDir())
+	const maxConns = 2
+	g := NewGraphiteServer("127.0.0.1:0", maxConns, w, nil, slog.New(slog.DiscardHandler))
+	var err error
+	g.TLS, err = config.ServerTLSConfig{CertFile: f.ServerCert, KeyFile: f.ServerKey, ClientCAFile: f.CA}.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer g.Stop(context.Background())
+	for range maxConns { // idle connections that never send a ClientHello
+		c, err := net.Dial("tcp", g.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+	}
+	time.Sleep(graphiteHandshakeTimeout + 300*time.Millisecond)
+	conn, err := tls.Dial("tcp", g.Addr().String(), f.ClientConfig(t, true))
+	if err != nil {
+		t.Fatalf("a trusted client must be served once idle handshakes time out: %v", err)
+	}
+	fmt.Fprintf(conn, "tls.slots 1 %d\n", time.Now().Unix())
+	conn.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && len(readAll(t, hot, labels.FromStrings("__name__", "tls.slots"))) == 0 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(readAll(t, hot, labels.FromStrings("__name__", "tls.slots"))) != 1 {
+		t.Fatal("the trusted client's sample was not stored")
+	}
+}
+
 var testRWOptions = RemoteWriteOptions{
 	MaxBodySize:         1 << 20,
 	MaxDecompressedSize: 4 << 20,
@@ -654,5 +696,41 @@ func TestGraphiteStopIsPromptAndFlushes(t *testing.T) {
 	}
 	if countStored(t, hot, "pending") != 1 {
 		t.Fatal("buffered line was not written on shutdown")
+	}
+}
+
+// A histogram with millions of buckets is a few bytes per bucket on the
+// wire; it is refused before it is decoded, and a large one that gets
+// through is rejected instead of creating a chunk that cannot be flushed.
+func TestRemoteWriteBoundsHistogramBuckets(t *testing.T) {
+	w, hot, _ := newTestWriter(t)
+	h := RemoteWriteHandler(w, testRWOptions, slog.New(slog.DiscardHandler))
+	now := time.Now().UnixMilli()
+	big := func(buckets int) *histogram.Histogram {
+		return &histogram.Histogram{Schema: 0, PositiveSpans: []histogram.Span{{Length: uint32(buckets)}},
+			PositiveBuckets: make([]int64, buckets)}
+	}
+	post1 := func(hist *histogram.Histogram) *httptest.ResponseRecorder {
+		req := &prompb.WriteRequest{Timeseries: []prompb.TimeSeries{{
+			Labels: []prompb.Label{{Name: "__name__", Value: "big"}}, Histograms: []prompb.Histogram{prompb.FromIntHistogram(now, hist)},
+		}}}
+		body, _ := req.Marshal()
+		return post(t, h, "", body)
+	}
+	// Beyond the element limit of the request: refused on the wire.
+	if rec := post1(big(testRWOptions.Limits.MaxSamples + 1)); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	// Within the request limits but beyond MaxHistogramBuckets: invalid.
+	res, err := w.Write(context.Background(), []Series{{Labels: labels.FromStrings("__name__", "big"),
+		Samples: []model.Sample{{T: now, H: big(model.MaxHistogramBuckets + 1).ToFloat(nil)}}}})
+	if err != nil || res.Invalid != 1 || !strings.Contains(fmt.Sprint(res.FirstInvalid), "buckets") {
+		t.Fatalf("result %+v %v", res, err)
+	}
+	if got := readAll(t, hot, labels.FromStrings("__name__", "big")); len(got) != 0 {
+		t.Fatalf("the oversized histogram was stored: %d samples", len(got))
+	}
+	if rec := post1(big(100)); rec.Code != http.StatusNoContent {
+		t.Fatalf("a normal histogram must be accepted: %d %s", rec.Code, rec.Body)
 	}
 }

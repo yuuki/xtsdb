@@ -27,6 +27,26 @@ type Sample struct {
 // IsHistogram reports whether the sample is a native histogram.
 func (s Sample) IsHistogram() bool { return s.H != nil }
 
+// MaxHistogramBuckets bounds the buckets, spans and custom bounds of one
+// native histogram (Prometheus histograms have at most a few hundred
+// buckets), so that a single histogram stays far below the size limits of a
+// hot chunk and of a cold-tier row. A larger one could be stored in Redis
+// but never flushed.
+const MaxHistogramBuckets = 16384
+
+// ValidateHistogram checks that a histogram is consistent and not too large.
+func ValidateHistogram(h *histogram.FloatHistogram) error {
+	switch {
+	case len(h.PositiveBuckets)+len(h.NegativeBuckets) > MaxHistogramBuckets:
+		return fmt.Errorf("histogram has %d buckets, more than %d", len(h.PositiveBuckets)+len(h.NegativeBuckets), MaxHistogramBuckets)
+	case len(h.PositiveSpans)+len(h.NegativeSpans) > MaxHistogramBuckets:
+		return fmt.Errorf("histogram has %d spans, more than %d", len(h.PositiveSpans)+len(h.NegativeSpans), MaxHistogramBuckets)
+	case len(h.CustomValues) > MaxHistogramBuckets:
+		return fmt.Errorf("histogram has %d custom bounds, more than %d", len(h.CustomValues), MaxHistogramBuckets)
+	}
+	return h.Validate()
+}
+
 // MetricName is the label that holds the metric name.
 const MetricName = pmodel.MetricNameLabel
 

@@ -27,7 +27,8 @@ key prefix. Versions before 2.0.0 were not released.
   distroless container image (#1).
 - Native histograms: Remote Write 1.0 histograms and Remote Write 2.0
   integer, float and custom-bucket histograms are stored and queried like
-  in Prometheus. Exemplars are accepted and dropped (#7).
+  in Prometheus, with at most 16,384 buckets per histogram. Exemplars are
+  accepted and dropped (#7).
 - `xtsdb import` loads history from Prometheus TSDB blocks or timestamped
   OpenMetrics text directly into Cassandra. Imports are idempotent and can
   be resumed with `-state-file`; imported samples never override samples
@@ -60,6 +61,8 @@ key prefix. Versions before 2.0.0 were not released.
 - Samples expire `storage.retention` after their timestamp, and index entries
   of a day two days after the samples of that day, instead of counting from
   the time of writing; `storage.retention` must be 0 or at least a day (#9).
+- `ingester.max_sample_future` must be at most a day, so that series rows
+  outlive their samples.
 - `storage.chunk_range` and `storage.index_buckets` are recorded in Cassandra,
   and xtsdb refuses to start when they change (#6, #9).
 

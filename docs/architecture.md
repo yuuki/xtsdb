@@ -88,7 +88,12 @@ order, so an append never reads the chunk:
   and a series may change between floats and histograms.
 
 Integer histograms are stored as float histograms, which represent them
-exactly; remote write validates them as integer histograms first. A chunk is limited to 32 MiB (about two million
+exactly; remote write validates them as integer histograms first. A
+histogram may have at most 16,384 buckets, spans and custom bounds each
+(`outcome="invalid"` otherwise), and the buckets of a remote write request
+count towards `ingester.max_samples_per_request` before it is decoded. A hot
+record that does not decode into a valid histogram is treated as corruption
+and quarantined. A chunk is limited to 32 MiB (about two million
 samples); samples beyond that are rejected (`outcome="chunk_full"`) rather
 than creating a chunk that cannot be flushed.
 
@@ -200,7 +205,7 @@ left data in Redis forever.
 | Redis restart / `SCRIPT FLUSH` | Scripts are reloaded automatically. Unflushed data loss is bounded by the Redis persistence settings. |
 | Redis restored from an older snapshot, or failover to a lagging replica | Chunks flushed since the snapshot may be flushed again with less data; they are stored as separate versions and never overwrite the complete one. |
 | Undecodable chunk | Moved to a quarantine key (fenced, see below), logged and counted; it does not block flushing. |
-| Very large chunk | Persisted in parts of 100,000 samples, below Cassandra's mutation limit. |
+| Very large chunk | Persisted in parts of at most 100,000 samples and 4 MiB, below Cassandra's mutation limit. A single native histogram is limited to 16,384 buckets (about 130 KB), so every part fits. |
 | Sample for a closed window | Rejected and counted (`outcome="too_old"`); remote write returns 400. |
 | Redis clock moves backwards | A claimed chunk still rejects appends (the in-flight check). A chunk re-created after completion gets a larger fragment from the shard clock and is stored as a separate version that takes precedence; reads merge versions. |
 | Index write fails | The batch fails with 503 before any sample is stored; the client retries. |
@@ -414,8 +419,10 @@ it still exists, atomically, so a chunk completed meanwhile leaves no entry.
 Chunks that such builds create while they still run (during a rolling
 upgrade) are not indexed, so queries miss their samples until they are
 flushed to Cassandra: at most `chunk_range` + `grace_period` after the last
-older ingester stopped. Stop the older ingesters before starting new ones to
-avoid that gap.
+older ingester stopped. Older flushers do not remove window index entries,
+and older builds cannot read native histogram records. When upgrading from
+an earlier v2 build, stop all its processes (ingesters and flushers) before
+starting the new ones.
 
 ## Changes from 0.x
 

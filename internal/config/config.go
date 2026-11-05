@@ -75,14 +75,24 @@ func (c Credentials) Redacted() Credentials {
 
 func (c Credentials) validate(field string) []error {
 	var errs []error
+	// A secret that still reads ${VAR} was not expanded (the process was
+	// started without -config.expand-env): it would make the reference
+	// itself, as written in examples, a valid credential.
+	unexpanded := func(s string) bool { return strings.Contains(s, "${") }
 	for i, u := range c.BasicAuth {
 		if u.Username == "" || u.Password == "" || strings.Contains(u.Username, ":") {
 			errs = append(errs, fmt.Errorf("%s.basic_auth[%d] needs a username without ':' and a non-empty password", field, i))
+		}
+		if unexpanded(u.Password) {
+			errs = append(errs, fmt.Errorf("%s.basic_auth[%d].password contains an unexpanded ${...} reference; start xtsdb with -config.expand-env", field, i))
 		}
 	}
 	for i, t := range c.BearerTokens {
 		if t == "" {
 			errs = append(errs, fmt.Errorf("%s.bearer_tokens[%d] must not be empty", field, i))
+		}
+		if unexpanded(t) {
+			errs = append(errs, fmt.Errorf("%s.bearer_tokens[%d] contains an unexpanded ${...} reference; start xtsdb with -config.expand-env", field, i))
 		}
 	}
 	return errs
@@ -394,7 +404,10 @@ func (c *Config) Validate() error {
 	check(c.Ingester.MaxSamplesPerRequest > 0, "ingester.max_samples_per_request must be positive")
 	check(c.Ingester.MaxInflightRequests > 0, "ingester.max_inflight_requests must be positive")
 	check(c.Ingester.GraphiteMaxConnections > 0, "ingester.graphite_max_connections must be positive")
-	check(c.Ingester.MaxSampleFuture.D() > 0, "ingester.max_sample_future must be positive")
+	// Series rows live two days longer than they were last written, so
+	// samples further in the future than that would outlive their series.
+	check(c.Ingester.MaxSampleFuture.D() > 0 && c.Ingester.MaxSampleFuture.D() <= 24*time.Hour,
+		"ingester.max_sample_future must be positive and at most 1d")
 	check(c.Ingester.IndexCacheSize > 0, "ingester.index_cache_size must be positive")
 	check(c.Ingester.IndexWriteConcurrency > 0, "ingester.index_write_concurrency must be positive")
 	check(c.Flusher.PollInterval.D() > 0, "flusher.poll_interval must be positive")

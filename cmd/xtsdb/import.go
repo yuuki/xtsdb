@@ -8,6 +8,8 @@ import (
 	"os"
 	"time"
 
+	"github.com/prometheus/prometheus/tsdb/fileutil"
+
 	"github.com/yuuki/xtsdb/internal/app"
 	"github.com/yuuki/xtsdb/internal/backfill"
 	"github.com/yuuki/xtsdb/internal/cassandra"
@@ -76,6 +78,11 @@ func runImport(ctx context.Context, cfg *config.Config, logger *slog.Logger, opt
 			if err != nil {
 				return err
 			}
+			if backfill.HasHead(p) {
+				logger.Warn("the head of this Prometheus data directory (wal/) is not a block and is not imported: "+
+					"the most recent hours of data are missing; import a snapshot instead "+
+					"(POST /api/v1/admin/tsdb/snapshot writes the head as a block)", "dir", p)
+			}
 			for _, b := range blocks {
 				id, err := backfill.BlockID(b)
 				if err != nil {
@@ -110,18 +117,26 @@ func runImport(ctx context.Context, cfg *config.Config, logger *slog.Logger, opt
 	return nil
 }
 
+// importOpenMetrics imports a file, mapped into memory rather than read, so
+// that its size is not bounded by the memory available. Standard input has
+// to be read completely.
 func importOpenMetrics(ctx context.Context, im *backfill.Importer, path string, opts importOptions) error {
-	var (
-		data []byte
-		err  error
-	)
 	if path == "-" {
-		data, err = io.ReadAll(os.Stdin)
-	} else {
-		data, err = os.ReadFile(path)
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return err
+		}
+		return im.ImportOpenMetrics(ctx, data, opts.concurrency, opts.maxBuffered)
 	}
+	if st, err := os.Stat(path); err != nil {
+		return err
+	} else if st.Size() == 0 {
+		return im.ImportOpenMetrics(ctx, nil, opts.concurrency, opts.maxBuffered)
+	}
+	f, err := fileutil.OpenMmapFile(path)
 	if err != nil {
 		return err
 	}
-	return im.ImportOpenMetrics(ctx, data, opts.concurrency, opts.maxBuffered)
+	defer f.Close()
+	return im.ImportOpenMetrics(ctx, f.Bytes(), opts.concurrency, opts.maxBuffered)
 }

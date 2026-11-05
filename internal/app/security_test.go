@@ -106,6 +106,7 @@ func TestSecurity(t *testing.T) {
 		want                  int
 	}{
 		{"healthy is open", http.MethodGet, "/-/healthy", "", "", "", http.StatusOK},
+		{"root page needs read credentials", http.MethodGet, "/", "", "", "", http.StatusUnauthorized},
 		{"ready is open", http.MethodGet, "/-/ready", "", "", "", http.StatusOK},
 		{"write without credentials", http.MethodPost, "/api/v1/write", "", "", "", http.StatusUnauthorized},
 		{"write with a wrong password", http.MethodPost, "/api/v1/write", "prometheus", "nope", "", http.StatusUnauthorized},
