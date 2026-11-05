@@ -178,9 +178,11 @@ is moved to a quarantine key instead of blocking flushing, and kept for
 **Configuration.** [examples/xtsdb.yaml](examples/xtsdb.yaml) documents every
 option with its default. `xtsdb config -config.file=...` prints the
 effective configuration. With `-config.expand-env`, `${VAR}` and
-`${VAR:-default}` are replaced by environment variables. `storage.key_prefix`
-and `storage.shards` must not change once data exists; xtsdb refuses to
-start if `shards` differs from the value recorded in Redis.
+`${VAR:-default}` are replaced by environment variables. `storage.key_prefix`,
+`storage.shards`, `storage.chunk_range` and `storage.index_buckets` must not
+change once data exists; xtsdb refuses to start if `shards` or `chunk_range`
+differ from the values recorded in Redis, or `index_buckets` from the value
+recorded in Cassandra.
 
 ## Building and testing
 
@@ -197,7 +199,8 @@ make docker             # container image
 Integration tests run against the servers named by
 `XTSDB_TEST_REDIS_ADDRS` (comma separated; set `XTSDB_TEST_REDIS_CLUSTER=1`
 for Redis Cluster) and `XTSDB_TEST_CASSANDRA_HOSTS`, and are skipped when
-those are unset.
+those are unset. `XTSDB_TEST_STRESS=1` also runs a stress test that indexes
+a million series sharing one label pair.
 
 Tested with Go 1.27.3, Redis 8.10.3 (standalone and Cluster), Valkey 9.1.3,
 Cassandra 5.0.9, Prometheus 3.15.1 and Grafana 13.3.0.
@@ -218,8 +221,9 @@ Cassandra 5.0.9, Prometheus 3.15.1 and Grafana 13.3.0.
 - Series are identified by a 64-bit hash of their labels. Collisions are
   detected: the series that was indexed first keeps the ID and samples of
   the other one are rejected (`outcome="collision"`).
-- Very high-cardinality label pairs (millions of series sharing one value on
-  one day) produce large Cassandra partitions in the index.
+- Index partitions grow with the number of series sharing a label pair (or
+  values of a label) on one day, divided by `storage.index_buckets` (16 by
+  default): about 62,500 rows per partition for a million series.
 - Only Redis/Valkey and Cassandra are implemented, but the tiers sit behind
   interfaces (`internal/storage`) so that other stores such as DynamoDB,
   Bigtable or object storage can be added.

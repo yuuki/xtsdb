@@ -107,6 +107,8 @@ func TestValidate(t *testing.T) {
 		"pool_size":             func(c *Config) { c.Redis.PoolSize = -1 },
 		"redis.addrs":           func(c *Config) { c.Redis.Addrs = []string{""} },
 		"max_request_body_size": func(c *Config) { c.Ingester.MaxRequestBodySize = 1 << 62 },
+		"index_buckets":         func(c *Config) { c.Storage.IndexBuckets = 0 },
+		"quarantine_ttl":        func(c *Config) { c.Flusher.QuarantineTTL = Duration(time.Minute) },
 	}
 	for field, mutate := range cases {
 		cfg := Default()

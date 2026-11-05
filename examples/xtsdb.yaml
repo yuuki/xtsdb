@@ -55,9 +55,10 @@ cassandra:
   replication_factor: 1
   # datacenters: {dc1: 3, dc2: 3}     # for NetworkTopologyStrategy
 
-# Storage layout. key_prefix, shards and chunk_range must not change once
-# data exists; xtsdb refuses to start if shards or chunk_range differ from
-# the values recorded in Redis.
+# Storage layout. key_prefix, shards, chunk_range and index_buckets must not
+# change once data exists; xtsdb refuses to start if shards or chunk_range
+# differ from the values recorded in Redis, or index_buckets from the value
+# recorded in Cassandra.
 storage:
   key_prefix: xt
   shards: 256
@@ -67,6 +68,11 @@ storage:
   chunk_range: 1h
   grace_period: 10m
   retention: 90d   # 0 keeps data forever (max 20y minus 2d)
+  # The series of a label pair (and the values of a label) are spread over
+  # this many Cassandra partitions per day, so that a pair shared by
+  # millions of series does not make one huge partition. Every index lookup
+  # reads all of them in parallel. 1 disables bucketing.
+  index_buckets: 16
 
 ingester:
   # Graphite plaintext protocol over TCP and UDP; empty (the default)

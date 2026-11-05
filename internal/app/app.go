@@ -97,7 +97,10 @@ func New(ctx context.Context, target Target, cfg *config.Config, logger *slog.Lo
 	}
 	retention := cfg.Storage.Retention.D()
 	cold := cassandra.NewChunkStore(a.session, retention, layout.ChunkRange, cfg.Querier.ReadConcurrency, logger)
-	index := cassandra.NewIndex(a.session, retention, cfg.Querier.ReadConcurrency)
+	if err := cassandra.CheckLayout(ctx, a.session, cfg.Storage.IndexBuckets); err != nil {
+		return nil, err
+	}
+	index := cassandra.NewIndex(a.session, retention, cfg.Querier.ReadConcurrency, cfg.Storage.IndexBuckets)
 
 	a.Server = server.New(cfg.Server.HTTPListenAddress, a.Registry, cfg.Server.EnablePprof, logger.With("component", "http"))
 	a.Server.AddCheck("redis", a.Hot.Ping)

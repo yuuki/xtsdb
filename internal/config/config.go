@@ -87,14 +87,18 @@ type CassandraConfig struct {
 }
 
 // StorageConfig holds settings that define the on-storage layout. Changing
-// key_prefix or shards on an existing deployment orphans the data written
-// with the previous values, so xtsdb refuses to start when shards changes.
+// key_prefix, shards, chunk_range or index_buckets on an existing deployment
+// orphans the data written with the previous values, so xtsdb refuses to
+// start when shards, chunk_range or index_buckets change.
 type StorageConfig struct {
 	KeyPrefix   string   `yaml:"key_prefix"`
 	Shards      int      `yaml:"shards"`
 	ChunkRange  Duration `yaml:"chunk_range"`
 	GracePeriod Duration `yaml:"grace_period"`
 	Retention   Duration `yaml:"retention"`
+	// IndexBuckets is the number of Cassandra partitions per day over which
+	// the series of a label pair, and the values of a label, are spread.
+	IndexBuckets int `yaml:"index_buckets"`
 }
 
 // IngesterConfig configures the write path.
@@ -161,11 +165,12 @@ func Default() *Config {
 			ReplicationFactor: 1,
 		},
 		Storage: StorageConfig{
-			KeyPrefix:   "xt",
-			Shards:      256,
-			ChunkRange:  Duration(time.Hour),
-			GracePeriod: Duration(10 * time.Minute),
-			Retention:   Duration(90 * 24 * time.Hour),
+			KeyPrefix:    "xt",
+			Shards:       256,
+			ChunkRange:   Duration(time.Hour),
+			GracePeriod:  Duration(10 * time.Minute),
+			Retention:    Duration(90 * 24 * time.Hour),
+			IndexBuckets: 16,
 		},
 		Ingester: IngesterConfig{
 			GraphiteListenAddress:  "",
@@ -314,6 +319,7 @@ func (c *Config) Validate() error {
 		"storage.chunk_range must be between 1s and 24h")
 	check(c.Storage.ChunkRange.D()%time.Millisecond == 0, "storage.chunk_range must be a whole number of milliseconds")
 	check(c.Storage.GracePeriod.D() >= 0, "storage.grace_period must not be negative")
+	check(c.Storage.IndexBuckets >= 1 && c.Storage.IndexBuckets <= 256, "storage.index_buckets must be in [1, 256]")
 	// Index entries live two days longer than samples, within Cassandra's
 	// 20 year TTL limit.
 	check(c.Storage.Retention.D() >= 0 && c.Storage.Retention.D() <= 20*365*24*time.Hour-48*time.Hour,

@@ -267,9 +267,10 @@ restored or its clock steps.
 
 ```sql
 series       (series_id) -> labels map
-postings     ((day, name, value), series_id)
-label_values ((day, name), value)
+postings     ((day, name, value, bucket), series_id)   bucket = series_id mod B
+label_values ((day, name, bucket), value)              bucket = xxhash64(value) mod B
 label_names  (day, name)
+meta         (name) -> value                           index_buckets = B
 ```
 
 The ingester writes the entries of a series once per UTC day it has samples
@@ -277,6 +278,25 @@ on, guarded by an LRU cache and de-duplicated within a batch. Index rows
 live two days longer than samples. Day partitions keep postings bounded and
 make lookups time aware: a series that disappeared last month is not a
 candidate for today's queries.
+
+**Buckets.** A label pair shared by many series, such as the metric name of
+a large metric, would otherwise put all of them in one partition per day
+(a million series make a partition of a million rows), which Cassandra warns
+about and which slows down compaction, repair and every query using that
+matcher. Postings and label values are therefore spread over
+B = `storage.index_buckets` partitions (16 by default): a write goes to one
+bucket, and a lookup reads all B buckets in parallel and concatenates them
+(buckets are disjoint). B is recorded in the `meta` table on first start and
+xtsdb refuses to start with a different value, because entries would then be
+looked up in the wrong buckets. With B = 1 every lookup reads one partition,
+as before; larger values bound partitions further at the cost of more,
+smaller reads per lookup. A stress test (`XTSDB_TEST_STRESS=1`) indexes a
+million series sharing one pair: the largest partition holds about 63,000
+rows and reading all postings back takes about 1.5 s on one local node.
+
+Keyspaces created by builds without buckets cannot be migrated in place
+(the partition key of `postings` and `label_values` changed): `xtsdb
+migrate` refuses them and explains how to proceed.
 
 **Collision detection.** The `series` row is written with one lightweight
 transaction per series and day:
@@ -310,9 +330,9 @@ impossible, but would change the storage format.
    `querier.max_concurrent_queries` queries run at once, each bounded by
    `querier.timeout`, including the series and label endpoints.
 2. **Resolve matchers** for each day of the range. Matchers that do not
-   match the empty string select postings: `=` reads one partition, `=~` with
-   a literal alternation reads one partition per alternative, other matchers
-   filter `label_values` first. Cheap matchers run first; once 1,024 or fewer
+   match the empty string select postings: `=` reads one pair (its B
+   buckets), `=~` with a literal alternation reads one pair per alternative,
+   other matchers filter `label_values` first. Cheap matchers run first; once 1,024 or fewer
    candidates remain, expensive matchers are not resolved through the index
    but applied to the labels. Postings are intersected across matchers and
    unioned across days. Selectors without such a matcher are rejected, as in
