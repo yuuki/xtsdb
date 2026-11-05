@@ -1,0 +1,101 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestDefaultIsValid(t *testing.T) {
+	if err := Default().Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadExampleConfig(t *testing.T) {
+	cfg, err := Load(filepath.Join("..", "..", "examples", "xtsdb.yaml"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Storage.ChunkRange.D() != time.Hour {
+		t.Fatalf("chunk_range = %v", cfg.Storage.ChunkRange)
+	}
+}
+
+func TestLoadOverridesDefaultsAndExpandsEnv(t *testing.T) {
+	t.Setenv("XT_REDIS", "redis-0:6379")
+	path := filepath.Join(t.TempDir(), "c.yaml")
+	err := os.WriteFile(path, []byte(`
+redis:
+  addrs: ["${XT_REDIS}"]
+storage:
+  retention: 30d
+  chunk_range: 30m
+`), 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Redis.Addrs[0] != "redis-0:6379" {
+		t.Fatalf("env not expanded: %v", cfg.Redis.Addrs)
+	}
+	if cfg.Storage.Retention.D() != 30*24*time.Hour || cfg.Storage.ChunkRange.D() != 30*time.Minute {
+		t.Fatalf("durations not parsed: %+v", cfg.Storage)
+	}
+	if cfg.Storage.Shards != 256 {
+		t.Fatal("defaults must be kept for unset fields")
+	}
+}
+
+func TestExpandEnvDefaults(t *testing.T) {
+	t.Setenv("XT_SET", "v")
+	t.Setenv("XT_EMPTY", "")
+	got := ExpandEnv("${XT_SET:-d} ${XT_EMPTY:-d} ${XT_UNSET:-a:b} $XT_SET ${XT_UNSET}")
+	if got != "v d a:b v " {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestLoadRejectsUnknownFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.yaml")
+	if err := os.WriteFile(path, []byte("storage:\n  shard: 3\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path, false); err == nil {
+		t.Fatal("typo in a field name must be an error")
+	}
+}
+
+func TestEmptyFileUsesDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.yaml")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path, false); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidate(t *testing.T) {
+	cases := map[string]func(*Config){
+		"shards":       func(c *Config) { c.Storage.Shards = 0 },
+		"key_prefix":   func(c *Config) { c.Storage.KeyPrefix = "a{b}" },
+		"chunk_range":  func(c *Config) { c.Storage.ChunkRange = Duration(48 * time.Hour) },
+		"hot_lookback": func(c *Config) { c.Querier.HotLookback = Duration(time.Minute) },
+		"log.level":    func(c *Config) { c.Log.Level = "verbose" },
+		"retention":    func(c *Config) { c.Storage.Retention = Duration(30 * 365 * 24 * time.Hour) },
+	}
+	for field, mutate := range cases {
+		cfg := Default()
+		mutate(cfg)
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), field) {
+			t.Errorf("%s: expected validation error, got %v", field, err)
+		}
+	}
+}

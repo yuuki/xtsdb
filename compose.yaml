@@ -1,0 +1,75 @@
+# Quickstart stack: xtsdb with Redis and Cassandra, a Prometheus that
+# remote-writes into xtsdb, and Grafana with xtsdb as its data source.
+#
+#   docker compose up -d --build
+#   open http://localhost:3000  (Grafana)
+#
+# `docker compose up -d --wait redis cassandra` starts only the backends,
+# which is what `make test-integration` uses.
+name: xtsdb
+
+services:
+  redis:
+    image: redis:8.10.3
+    # AOF limits data loss on restart; noeviction prevents Redis from
+    # silently dropping samples that have not been flushed yet.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    ports: ["6379:6379"]
+    volumes: ["redis-data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+
+  cassandra:
+    image: cassandra:5.0.9
+    environment:
+      MAX_HEAP_SIZE: 1G
+      HEAP_NEWSIZE: 256M
+      CASSANDRA_CLUSTER_NAME: xtsdb
+    ports: ["9042:9042"]
+    volumes: ["cassandra-data:/var/lib/cassandra"]
+    healthcheck:
+      test: ["CMD", "cqlsh", "-e", "DESCRIBE KEYSPACES"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+
+  xtsdb:
+    build: .
+    image: xtsdb:dev
+    command: ["all", "-config.file=/etc/xtsdb/xtsdb.yaml", "-config.expand-env"]
+    environment:
+      XTSDB_REDIS_ADDR: redis:6379
+      XTSDB_CASSANDRA_HOSTS: cassandra:9042
+    ports:
+      - "9201:9201"
+      - "2003:2003"
+      - "2003:2003/udp"
+    depends_on:
+      redis:
+        condition: service_healthy
+      cassandra:
+        condition: service_healthy
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    volumes: ["./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["9090:9090"]
+    depends_on: [xtsdb]
+
+  grafana:
+    image: grafana/grafana:13.3.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes: ["./deploy/grafana-datasource.yaml:/etc/grafana/provisioning/datasources/xtsdb.yaml:ro"]
+    ports: ["3000:3000"]
+    depends_on: [xtsdb]
+
+volumes:
+  redis-data:
+  cassandra-data:

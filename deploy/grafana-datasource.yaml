@@ -1,0 +1,10 @@
+apiVersion: 1
+datasources:
+  - name: xtsdb
+    type: prometheus
+    access: proxy
+    url: http://xtsdb:9201
+    isDefault: true
+    jsonData:
+      httpMethod: POST
+      prometheusType: Prometheus

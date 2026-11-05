@@ -1,0 +1,18 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+  - job_name: xtsdb
+    static_configs:
+      - targets: ["xtsdb:9201"]
+
+remote_write:
+  - url: http://xtsdb:9201/api/v1/write
+    # Remote Write 2.0; use prometheus.WriteRequest for 1.0.
+    protobuf_message: io.prometheus.write.v2.Request
+    # Remote Write 2.0 always carries metadata.
+    metadata_config:
+      send: false

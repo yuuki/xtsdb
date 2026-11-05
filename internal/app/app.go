@@ -1,0 +1,258 @@
+// Package app wires the xtsdb components together for each role.
+package app
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"time"
+
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
+	"github.com/klauspost/compress/gzhttp"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/yuuki/xtsdb/internal/cassandra"
+	"github.com/yuuki/xtsdb/internal/config"
+	"github.com/yuuki/xtsdb/internal/flush"
+	"github.com/yuuki/xtsdb/internal/hot"
+	"github.com/yuuki/xtsdb/internal/ingest"
+	"github.com/yuuki/xtsdb/internal/model"
+	"github.com/yuuki/xtsdb/internal/query"
+	"github.com/yuuki/xtsdb/internal/server"
+	"github.com/yuuki/xtsdb/internal/version"
+)
+
+// Target selects the roles a process runs.
+type Target string
+
+// Supported targets.
+const (
+	TargetAll      Target = "all"
+	TargetIngester Target = "ingester"
+	TargetFlusher  Target = "flusher"
+	TargetQuerier  Target = "querier"
+)
+
+func (t Target) runs(role Target) bool { return t == TargetAll || t == role }
+
+// ParseTarget validates a target name.
+func ParseTarget(s string) (Target, error) {
+	switch t := Target(s); t {
+	case TargetAll, TargetIngester, TargetFlusher, TargetQuerier:
+		return t, nil
+	}
+	return "", fmt.Errorf("unknown target %q", s)
+}
+
+// App is a running xtsdb process.
+type App struct {
+	cfg    *config.Config
+	target Target
+	logger *slog.Logger
+
+	Registry *prometheus.Registry
+	Server   *server.Server
+	Graphite *ingest.GraphiteServer
+	Flusher  *flush.Flusher
+	Hot      *hot.Store
+
+	redis   redis.UniversalClient
+	session *gocql.Session
+}
+
+// New connects to the storage backends and builds the components of the
+// target. The HTTP listener is opened so that its address is known.
+func New(ctx context.Context, target Target, cfg *config.Config, logger *slog.Logger) (_ *App, err error) {
+	a := &App{cfg: cfg, target: target, logger: logger, Registry: prometheus.NewRegistry()}
+	defer func() {
+		if err != nil {
+			a.close()
+		}
+	}()
+	a.Registry.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		buildInfo(),
+	)
+
+	a.redis, err = hot.NewClient(cfg.Redis)
+	if err != nil {
+		return nil, err
+	}
+	layout := model.Layout{
+		Shards:     cfg.Storage.Shards,
+		ChunkRange: cfg.Storage.ChunkRange.D().Milliseconds(),
+		Grace:      cfg.Storage.GracePeriod.D().Milliseconds(),
+	}
+	a.Hot, err = hot.New(ctx, a.redis, hot.Options{
+		Prefix: cfg.Storage.KeyPrefix,
+		Layout: layout,
+		Lease:  cfg.Flusher.LeaseDuration.D(),
+		Logger: logger.With("component", "redis"),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if cfg.Cassandra.AutoMigrate {
+		if err := cassandra.Migrate(ctx, cfg.Cassandra, logger); err != nil {
+			return nil, fmt.Errorf("migrate: %w", err)
+		}
+	}
+	a.session, err = cassandra.NewSession(cfg.Cassandra, logger, true)
+	if err != nil {
+		return nil, err
+	}
+	retention := cfg.Storage.Retention.D()
+	cold := cassandra.NewChunkStore(a.session, retention, layout.ChunkRange, cfg.Querier.ReadConcurrency, logger)
+	index := cassandra.NewIndex(a.session, retention, cfg.Querier.ReadConcurrency)
+
+	a.Server = server.New(cfg.Server.HTTPListenAddress, a.Registry, cfg.Server.EnablePprof, logger.With("component", "http"))
+	a.Server.AddCheck("redis", a.Hot.Ping)
+	a.Server.AddCheck("cassandra", cold.Ping)
+	a.Server.Mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprintf(w, "xtsdb %s (%s)\n", version.Version, target)
+	})
+
+	if target.runs(TargetIngester) {
+		w, err := ingest.NewWriter(a.Hot, index, ingest.WriterOptions{
+			MaxSampleFuture:       cfg.Ingester.MaxSampleFuture.D(),
+			IndexCacheSize:        cfg.Ingester.IndexCacheSize,
+			IndexWriteConcurrency: cfg.Ingester.IndexWriteConcurrency,
+			Registerer:            a.Registry,
+			Logger:                logger,
+		})
+		if err != nil {
+			return nil, err
+		}
+		a.Server.Mux.Handle("POST /api/v1/write",
+			a.Server.Instrument("write", ingest.RemoteWriteHandler(w, cfg.Ingester.MaxRequestBodySize, logger)))
+		if cfg.Ingester.GraphiteListenAddress != "" {
+			a.Graphite = ingest.NewGraphiteServer(cfg.Ingester.GraphiteListenAddress, w, a.Registry, logger)
+		}
+	}
+
+	if target.runs(TargetFlusher) {
+		a.Flusher = flush.New(a.Hot, cold, flush.Options{
+			PollInterval: cfg.Flusher.PollInterval.D(),
+			BatchSize:    cfg.Flusher.BatchSize,
+			Concurrency:  cfg.Flusher.Concurrency,
+			Lease:        cfg.Flusher.LeaseDuration.D(),
+			Registerer:   a.Registry,
+			Logger:       logger,
+		})
+	}
+
+	if target.runs(TargetQuerier) {
+		q, err := query.NewQueryable(a.Hot, cold, index, query.Options{
+			HotLookback:       cfg.Querier.HotLookback.D(),
+			Retention:         retention,
+			MaxSeriesPerQuery: cfg.Querier.MaxSeriesPerQuery,
+			SeriesCacheSize:   cfg.Querier.SeriesCacheSize,
+			ReadConcurrency:   cfg.Querier.ReadConcurrency,
+		})
+		if err != nil {
+			return nil, err
+		}
+		api := query.NewAPI(q, query.APIOptions{
+			LookbackDelta: cfg.Querier.LookbackDelta.D(),
+			Timeout:       cfg.Querier.Timeout.D(),
+			MaxSamples:    cfg.Querier.MaxSamples,
+			Registerer:    a.Registry,
+			Logger:        logger,
+			BuildInfo:     version.Info(),
+		})
+		api.Register(a.Server.Mux, func(h http.Handler) http.Handler {
+			return gzhttp.GzipHandler(a.Server.Instrument("query", h))
+		})
+	}
+
+	if err := a.Server.Listen(); err != nil {
+		return nil, err
+	}
+	if a.Graphite != nil {
+		if err := a.Graphite.Start(); err != nil {
+			return nil, err
+		}
+	}
+	return a, nil
+}
+
+// Run serves until ctx is cancelled, then shuts down gracefully and
+// releases all resources.
+func (a *App) Run(ctx context.Context) error {
+	defer a.close()
+	timeout := a.cfg.Server.GracefulShutdownTimeout.D()
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error { return a.Server.Serve(gctx, timeout) })
+	if a.Flusher != nil {
+		g.Go(func() error { return a.Flusher.Run(gctx) })
+	}
+	if a.Graphite != nil {
+		g.Go(func() error {
+			<-gctx.Done()
+			sctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+			a.Graphite.Stop(sctx)
+			return nil
+		})
+	}
+	a.logger.Info("xtsdb started", "target", a.target, "version", version.Version)
+	err := g.Wait()
+	a.logger.Info("xtsdb stopped")
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
+}
+
+func (a *App) close() {
+	if a.Server != nil {
+		_ = a.Server.Close()
+	}
+	if a.session != nil {
+		a.session.Close()
+	}
+	if a.redis != nil {
+		_ = a.redis.Close()
+	}
+}
+
+func buildInfo() prometheus.Collector {
+	info := version.Info()
+	g := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "xtsdb_build_info",
+		Help: "Build information of the running xtsdb binary.",
+		ConstLabels: prometheus.Labels{
+			"version":   info["version"],
+			"revision":  info["revision"],
+			"goversion": info["goVersion"],
+		},
+	})
+	g.Set(1)
+	return g
+}
+
+// WaitReady blocks until all readiness checks pass or ctx expires. It is
+// mostly useful for tests.
+func (a *App) WaitReady(ctx context.Context) error {
+	for {
+		if a.Hot.Ping(ctx) == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}

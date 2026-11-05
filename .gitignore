@@ -1,1 +1,6 @@
-/xtsdb-*
+/bin/
+/dist/
+/xtsdb
+*.test
+*.out
+coverage.*
