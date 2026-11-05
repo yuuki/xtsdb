@@ -1,0 +1,7 @@
+.git
+.github
+bin
+dist
+*.test
+*.out
+coverage.*

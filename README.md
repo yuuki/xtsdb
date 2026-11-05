@@ -1,55 +1,229 @@
-# Xtsdb
+# xtsdb
 
-Xtsdb is a scalable time series database on two tiers of Redis and Cassandra.
+xtsdb is a horizontally scalable time series database that tiers data
+across two kinds of key-value stores: recent samples live in **Redis** (or
+Valkey) and older samples are compressed and moved to **Apache Cassandra**.
+It speaks the Prometheus Remote Write and Graphite protocols and serves the
+Prometheus HTTP API, so Prometheus and Grafana work with it out of the box.
+
+xtsdb implements the ideas of the HeteroTSDB paper (see [Papers](#papers)):
+use each store for what it is good at, and scale each tier independently.
+
+> **Status:** v2 is a ground-up rewrite. The storage format is not
+> compatible with 0.x, and there is no tagged release yet.
+
+## Features
+
+- **No data loss in the hand-off.** Samples move from Redis to Cassandra
+  with an at-least-once protocol based on leases and content-idempotent
+  writes, keep working when Redis is full or Cassandra is slow, and stay
+  visible to queries throughout. No Redis keyspace notifications are used.
+- **Prometheus compatible.** Remote Write 1.0 and 2.0 for ingestion; PromQL
+  through `/api/v1/query`, `/api/v1/query_range`, `/api/v1/series`,
+  `/api/v1/labels` and `/api/v1/label/<name>/values`, evaluated by the
+  Prometheus 3 engine. UTF-8 metric names such as `{"servers.web01.cpu"}`
+  are supported.
+- **Graphite plaintext** over TCP and UDP, including tags
+  (`cpu.user;host=web01 12.5 1700000000`).
+- **Series index** in Cassandra, partitioned by day, so label matchers
+  (`=`, `!=`, `=~`, `!~`) work on any time range.
+- **Gorilla compression** in the persistent tier (Prometheus XOR chunks).
+- **Redis 7.0+ standalone, Sentinel or Cluster; Valkey 7.2+** as a drop-in
+  replacement. Every Redis script touches a single cluster slot.
+- **One binary, four roles** (`ingester`, `flusher`, `querier`, or `all`)
+  that scale independently.
+- **Operable:** YAML configuration with environment expansion, Prometheus
+  metrics, health and readiness endpoints, structured logs, graceful
+  shutdown, distroless container image.
 
 ## Architecture
 
-<img alt="xtsdb-architecture" src="https://github.com/yuuki/xtsdb/raw/master/docs/images/architecture.png" width="800">
-
-## Requirements
-
-- Memory-based KVS
-  - Redis 5.0+
-- Disk-based KVS
-  - Apache Cassandra 3.0+
-  - Apache HBase (To be added)
-  - Amazon DynamoDB (To be added)
-  - Amazon S3 (To be added)
-  - Google BigTable (To be added)
-  - Google Cloud Storage (To be added)
-
-## Building Binaries
-
-### Using Docker (AMD64)
-
-To build AMD64 binaries using Docker, follow these steps:
-
-1. Build the binaries using the provided Dockerfile:
-```bash
-docker build --platform linux/amd64 -t xtsdb-builder .
+```mermaid
+flowchart LR
+    P[Prometheus<br/>remote_write] --> I
+    G[Graphite clients] --> I
+    I[ingester] -- index --> C[(Cassandra<br/>index + chunks)]
+    I -- append samples --> R[(Redis / Valkey<br/>open chunks)]
+    F[flusher] -- claim closed chunks --> R
+    F -- compressed chunks --> C
+    Q[querier<br/>PromQL] -- recent --> R
+    Q -- history + index --> C
+    Gr[Grafana] --> Q
 ```
 
-2. Extract the binaries from the container:
+1. The **ingester** validates and canonicalizes labels, records the series
+   in the index, and appends samples to per-series time windows in Redis.
+2. When a window closes (`chunk_range` + `grace_period` after it starts),
+   a **flusher** claims it under a lease, compresses it, writes it to
+   Cassandra and only then deletes it from Redis.
+3. The **querier** resolves label matchers through the index and merges
+   samples from both tiers, preferring the most recent write.
+
+See [docs/architecture.md](docs/architecture.md) for the data layout, the
+hand-off protocol and its failure handling.
+
+## Quickstart
+
+Requires Docker with Compose v2.
+
 ```bash
-docker create --name temp-container xtsdb-builder
-docker cp temp-container:/app/xtsdb-ingester .
-docker cp temp-container:/app/xtsdb-flusher .
-docker cp temp-container:/app/xtsdb-querier .
-docker rm temp-container
+docker compose up -d --build
 ```
 
-This will create three AMD64 binaries in your current directory:
-- `xtsdb-ingester`: The ingestion service
-- `xtsdb-flusher`: The flushing service
-- `xtsdb-querier`: The query service
+This starts Redis 8.10, Cassandra 5.0, xtsdb, a Prometheus that
+remote-writes into xtsdb, and Grafana with xtsdb as its default data source
+at <http://localhost:3000>. Cassandra takes about a minute to become ready.
+Nothing in this stack is authenticated, so all ports are published on
+127.0.0.1 only.
 
-## Experiments
+Send a Graphite sample and query it back:
 
-[xtsdb-experiments](https://github.com/yuuki/xtsdb-experiments)
+```bash
+echo "servers.web01.load;dc=tokyo 0.75 $(date +%s)" | nc -w1 localhost 2003
+curl -s 'http://localhost:9201/api/v1/query' --data-urlencode 'query={"servers.web01.load"}'
+curl -s 'http://localhost:9201/api/v1/query' --data-urlencode 'query=rate(prometheus_http_requests_total[5m])'
+```
+
+Stop and remove everything with `docker compose down -v`.
+
+## Sending data
+
+**Prometheus** (Remote Write 2.0 shown; omit `protobuf_message` for 1.0):
+
+```yaml
+remote_write:
+  - url: http://xtsdb:9201/api/v1/write
+    protobuf_message: io.prometheus.write.v2.Request
+```
+
+**Graphite** plaintext on port 2003 (TCP and UDP):
+`<path>[;tag=value...] <value> [<unix timestamp>]`. The path becomes
+`__name__` and tags become labels. A missing or negative timestamp means
+"now"; `nan` values are skipped.
+
+Samples are accepted until their chunk window closes. Older samples are
+rejected (remote write answers `400` with a description), which bounds
+backfill to `chunk_range` + `grace_period`. Remote write requests are limited
+in size and number of elements, and at most
+`ingester.max_inflight_requests` are processed at once (others get 503 and
+are retried by Prometheus); see [examples/xtsdb.yaml](examples/xtsdb.yaml).
+
+Graphite lines are written at most one second after they arrive. Graphite
+cannot report errors to its clients, so rejected and dropped lines are only
+visible in the metrics below and in the logs.
+
+## Querying
+
+Point any Prometheus client at `http://<querier>:9201`. In Grafana, add a
+*Prometheus* data source with that URL. Besides the endpoints listed above,
+`/api/v1/status/buildinfo` is implemented, and the rules, alerts, metadata
+and exemplar endpoints return empty results so that Grafana works without
+warnings.
+
+`/api/v1/series` and the label endpoints default to the last 24 hours when
+no `start` is given.
+
+## Running in production
+
+Run `xtsdb <role> -config.file=xtsdb.yaml -config.expand-env` (drop
+`-config.expand-env` if your file has no `${VAR}` references). All roles are
+stateless and can be scaled horizontally:
+
+| Role       | Scales with                         | Notes |
+|------------|-------------------------------------|-------|
+| `ingester` | write throughput                    | Put a load balancer in front of `/api/v1/write` and port 2003. |
+| `flusher`  | number of closing chunks            | Flushers coordinate through Redis leases; any number can run. |
+| `querier`  | query load                          | |
+
+**Redis / Valkey**
+- Use `maxmemory-policy noeviction`. Eviction would drop samples that are not
+  flushed yet; xtsdb logs a warning at startup otherwise.
+- Enable AOF (`appendonly yes`) and replicas: the hot tier holds the most
+  recent `chunk_range` + `grace_period` of data.
+- Memory needed is roughly 16 bytes per sample held in Redis.
+- Redis 7.0 or later (Valkey 7.2 or later) is required. No
+  keyspace-notification or other special configuration is needed.
+
+**Cassandra**
+- Create the schema with `xtsdb migrate -config.file=...` (or set
+  `cassandra.auto_migrate: true`). Use `NetworkTopologyStrategy` in
+  production, and keep `cassandra.consistency` at `LOCAL_QUORUM` (or
+  `QUORUM`): reads must see what flushers wrote, otherwise queries can miss
+  data while it moves between tiers.
+- Samples and index entries expire through TTLs set from
+  `storage.retention`; chunk and postings tables use
+  `TimeWindowCompactionStrategy`.
+
+**Monitoring.** Every role serves `/metrics`, `/-/healthy` and `/-/ready`.
+Watch in particular:
+
+| Metric | Meaning |
+|--------|---------|
+| `xtsdb_flusher_lag_seconds` | How long the oldest closed chunk (pending or claimed) has been waiting. Should stay near zero. |
+| `xtsdb_hot_pending_chunks`, `xtsdb_hot_inflight_chunks` | Chunks held in Redis. |
+| `xtsdb_flusher_chunks_total{outcome="error"}` | Failed flushes; they are retried after the lease. |
+| `xtsdb_ingester_samples_total{outcome=...}` | Accepted samples and rejections: `too_old`, `too_new`, `invalid`, `chunk_full`, `unsupported` (histograms), `throttled`, `error`. |
+| `xtsdb_graphite_lines_total{outcome="dropped"}`, `xtsdb_graphite_connections_total{outcome="rejected"}` | Graphite overload. |
+
+**Configuration.** [examples/xtsdb.yaml](examples/xtsdb.yaml) documents every
+option with its default. `xtsdb config -config.file=...` prints the
+effective configuration. With `-config.expand-env`, `${VAR}` and
+`${VAR:-default}` are replaced by environment variables. `storage.key_prefix`
+and `storage.shards` must not change once data exists; xtsdb refuses to
+start if `shards` differs from the value recorded in Redis.
+
+## Building and testing
+
+Requires Go 1.27.
+
+```bash
+make build              # bin/xtsdb
+make test               # unit tests
+make test-integration   # starts Redis and Cassandra with Docker Compose, then runs all tests
+make lint               # go vet + golangci-lint
+make docker             # container image
+```
+
+Integration tests run against the servers named by
+`XTSDB_TEST_REDIS_ADDRS` (comma separated; set `XTSDB_TEST_REDIS_CLUSTER=1`
+for Redis Cluster) and `XTSDB_TEST_CASSANDRA_HOSTS`, and are skipped when
+those are unset.
+
+Tested with Go 1.27.3, Redis 8.10.3 (standalone and Cluster), Valkey 9.1.3,
+Cassandra 5.0.9, Prometheus 3.15.1 and Grafana 13.3.0.
+
+## Limitations
+
+- Native histograms and exemplars are not supported yet. Requests that
+  carry histograms store their float samples and answer 400, so Prometheus
+  reports the dropped histograms instead of silently losing them.
+- No multi-tenancy, authentication, remote read, downsampling or recording
+  rules.
+- Samples older than their closed chunk window are rejected, so large
+  backfills are not possible.
+- A series can hold at most about two million samples per chunk window in
+  Redis (32 MiB); more are rejected as `chunk_full`.
+- Queries reach back at most `storage.retention`, or
+  `querier.max_query_lookback` (default one year) when retention is 0.
+- Series are identified by a 64-bit hash of their labels.
+- Very high-cardinality label pairs (millions of series sharing one value on
+  one day) produce large Cassandra partitions in the index.
+- Only Redis/Valkey and Cassandra are implemented, but the tiers sit behind
+  interfaces (`internal/storage`) so that other stores such as DynamoDB,
+  Bigtable or object storage can be added.
+
+## Upgrading from 0.x
+
+0.x stored data in a different layout (`datapoint` table) that is not read
+by v2. There is no migration tool; run v2 against a new keyspace and Redis
+key prefix.
 
 ## Papers
 
 1. <u>坪内佑樹</u>, 脇坂朝人, 濱田健, 松木雅幸, 小林隆浩, 阿部博, 松本亮介, **[HeteroTSDB: 異種分散KVS間の自動階層化による高性能な時系列データベース](http://id.nii.ac.jp/1001/00210244/)**, 情報処理学会論文誌, Vol.62, No.3, pp.818-828, 2021年3月. [[paper](https://yuuk.io/papers/2021/heterotsdb_ipsj_journal.pdf)] [[code](https://github.com/yuuki/xtsdb)]
+
+Experiments for the paper: [xtsdb-experiments](https://github.com/yuuki/xtsdb-experiments)
+(they used the 0.x implementation).
 
 ## License
 

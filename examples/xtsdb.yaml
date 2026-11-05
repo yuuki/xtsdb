@@ -1,0 +1,106 @@
+# Example xtsdb configuration, used by the container image.
+#
+# Every field is optional. Values are the defaults, except where a comment
+# says "example". Run `xtsdb config -config.file=<file> -config.expand-env`
+# to print the effective configuration.
+#
+# Start xtsdb with -config.expand-env to replace ${VAR}, ${VAR:-default} and
+# ${VAR-default} with environment variables ("$$" is a literal "$").
+# Expansion is textual and happens before YAML parsing: the unquoted lists
+# below accept comma separated values such as "redis-0:6379, redis-1:6379",
+# and values that may contain YAML syntax (passwords) should be quoted.
+
+server:
+  http_listen_address: ":9201"
+  graceful_shutdown_timeout: 30s
+  enable_pprof: false
+
+log:
+  level: info      # debug, info, warn, error
+  format: logfmt   # logfmt, json
+
+# In-memory tier (Redis >= 7.0 or Valkey >= 7.2). One address: standalone.
+# Several addresses or cluster_mode: Redis Cluster. master_name: Sentinel.
+redis:
+  addrs: [${XTSDB_REDIS_ADDRS:-127.0.0.1:6379}]  # example: from the environment
+  cluster_mode: false
+  master_name: ""
+  username: ""
+  password: "${XTSDB_REDIS_PASSWORD:-}"          # example: from the environment
+  db: 0
+  pool_size: 0     # 0: go-redis default (10 per CPU)
+  dial_timeout: 5s
+  read_timeout: 3s
+  write_timeout: 3s
+  tls:
+    enabled: false
+
+# Persistent tier and series index.
+cassandra:
+  hosts: [${XTSDB_CASSANDRA_HOSTS:-127.0.0.1:9042}]  # example: from the environment
+  keyspace: xtsdb
+  local_dc: ""
+  # Reads and writes use this level. With replication, use LOCAL_QUORUM (or
+  # QUORUM) so that queries always see chunks the flusher has written.
+  consistency: LOCAL_QUORUM
+  username: ""
+  password: "${XTSDB_CASSANDRA_PASSWORD:-}"     # example: from the environment
+  timeout: 10s
+  connect_timeout: 10s
+  num_conns: 2
+  # example (default false): create the keyspace and tables on startup.
+  # In production run `xtsdb migrate` with a NetworkTopologyStrategy instead.
+  auto_migrate: true
+  replication_class: SimpleStrategy   # or NetworkTopologyStrategy
+  replication_factor: 1
+  # datacenters: {dc1: 3, dc2: 3}     # for NetworkTopologyStrategy
+
+# Storage layout. key_prefix, shards and chunk_range must not change once
+# data exists; xtsdb refuses to start if shards or chunk_range differ from
+# the values recorded in Redis.
+storage:
+  key_prefix: xt
+  shards: 256
+  # Samples are grouped per series into windows of chunk_range. A window
+  # accepts samples until chunk_range + grace_period after its start; then
+  # it is flushed to Cassandra. Later samples for it are rejected.
+  chunk_range: 1h
+  grace_period: 10m
+  retention: 90d   # 0 keeps data forever (max 20y minus 2d)
+
+ingester:
+  # Graphite plaintext protocol over TCP and UDP; empty (the default)
+  # disables it.
+  graphite_listen_address: ":2003"   # example
+  graphite_max_connections: 1024
+  # Remote write limits. Protobuf decoding inflates requests, so the number
+  # of elements is checked before decoding.
+  max_request_body_size: 10485760    # compressed bytes
+  max_decompressed_size: 33554432
+  max_series_per_request: 100000
+  max_samples_per_request: 1000000
+  max_inflight_requests: 16          # more concurrent requests get 503
+  max_sample_future: 10m
+  index_cache_size: 2000000
+  index_write_concurrency: 64
+
+flusher:
+  poll_interval: 1s
+  batch_size: 128
+  concurrency: 8
+  lease_duration: 2m
+
+querier:
+  lookback_delta: 5m
+  timeout: 2m
+  max_samples: 50000000
+  max_series_per_query: 100000
+  max_concurrent_queries: 20
+  # How far back queries may reach when storage.retention is 0; 0 means 1y.
+  max_query_lookback: 0s
+  # Minimum span read from Redis; must be at least chunk_range +
+  # grace_period. Chunks that are older but not flushed yet are found
+  # automatically.
+  hot_lookback: 6h
+  series_cache_size: 1000000
+  read_concurrency: 64
