@@ -41,9 +41,6 @@ type Index struct {
 	reads *semaphore.Weighted
 }
 
-// indexSlack is how much longer index entries live than samples.
-const indexSlack = 48 * time.Hour
-
 var (
 	_ storage.IndexWriter = (*Index)(nil)
 	_ storage.IndexReader = (*Index)(nil)
@@ -66,7 +63,7 @@ func NewIndex(s *gocql.Session, retention time.Duration, readConcurrency, bucket
 // of that day have expired.
 func (x *Index) dayTTL(day int32) (int, bool) {
 	end := time.UnixMilli((int64(day) + 1) * model.DayMillis)
-	return ttlUntil(x.retention, end.Add(x.retention+indexSlack), x.now())
+	return ttlUntil(x.retention, end.Add(x.retention+storage.IndexSlack), x.now())
 }
 
 // seriesTTL is the TTL of a series row, refreshed every day the series is
@@ -75,7 +72,7 @@ func (x *Index) seriesTTL() int {
 	if x.retention <= 0 {
 		return 0
 	}
-	return TTLSeconds(x.retention + indexSlack)
+	return TTLSeconds(x.retention + storage.IndexSlack)
 }
 
 // postingsBucket and valueBucket place index entries in buckets. They are

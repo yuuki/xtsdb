@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/prometheus/prometheus/model/labels"
 
@@ -155,6 +156,12 @@ func (e *SeriesCollisionError) Error() string {
 // Unwrap returns ErrSeriesCollision.
 func (e *SeriesCollisionError) Unwrap() error { return ErrSeriesCollision }
 
+// IndexSlack is how much longer index entries are kept than samples: the
+// entries of a day expire IndexSlack after the samples of the end of that
+// day, and series rows IndexSlack after their last write. Entries of days
+// whose samples have already expired are not written.
+const IndexSlack = 48 * time.Hour
+
 // IndexWriter records which series and label values exist on a given day.
 // All writes are idempotent.
 type IndexWriter interface {
@@ -172,4 +179,11 @@ type IndexReader interface {
 	LabelValues(ctx context.Context, day int32, name string) ([]string, error)
 	LabelNames(ctx context.Context, day int32) ([]string, error)
 	SeriesLabels(ctx context.Context, ids []model.SeriesID) (map[model.SeriesID]labels.Labels, error)
+}
+
+// Index is the series index, written by ingesters and imports and read by
+// queriers.
+type Index interface {
+	IndexWriter
+	IndexReader
 }
