@@ -12,3 +12,11 @@ reserve-space = "0MB"
 
 [storage.block-cache]
 capacity = "512MB"
+
+# TiKV refuses to start unless the open file limit exceeds the sum of these
+# plus 1000 (with the defaults of 40960, more than many hosts allow).
+[rocksdb]
+max-open-files = 4096
+
+[raftdb]
+max-open-files = 4096

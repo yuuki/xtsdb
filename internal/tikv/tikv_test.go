@@ -215,7 +215,17 @@ func TestLargestKeysFit(t *testing.T) {
 // Reads never ask for more than TiKV sends in one response, however large
 // the parts are.
 func TestReadsFitInResponses(t *testing.T) {
-	db, kv := newMemDB(t)
+	t.Run("Memory", func(t *testing.T) {
+		db, kv := newMemDB(t)
+		testReadsFitInResponses(t, db)
+		if kv.Scans < 2 {
+			t.Fatalf("14 MiB were read in %d scans", kv.Scans)
+		}
+	})
+	t.Run("TiKV", func(t *testing.T) { testReadsFitInResponses(t, newTestDB(t)) })
+}
+
+func testReadsFitInResponses(t *testing.T, db *DB) {
 	const minute = int64(time.Minute / time.Millisecond)
 	store := NewChunkStore(db, 0, minute, 8, nil)
 	ctx := context.Background()
@@ -225,7 +235,7 @@ func TestReadsFitInResponses(t *testing.T) {
 	const windows = 200 // about 14 MiB in total
 	for w := range windows {
 		ws := start + int64(w)*minute
-		samples := make([]model.Sample, 9000) // incompressible: 2 segments
+		samples := make([]model.Sample, 9000) // incompressible: several segments
 		for i := range samples {
 			samples[i] = model.Sample{T: ws + int64(i), V: rng.NormFloat64()}
 		}
@@ -248,9 +258,6 @@ func TestReadsFitInResponses(t *testing.T) {
 	}
 	if !slices.EqualFunc(got[1], want, func(a, b model.Sample) bool { return a.T == b.T && a.V == b.V }) {
 		t.Fatalf("got %d samples, want %d", len(got[1]), len(want))
-	}
-	if kv.Scans < 2 {
-		t.Fatalf("14 MiB were read in %d scans", kv.Scans)
 	}
 }
 
@@ -693,5 +700,44 @@ func TestIndexKeysSpread(t *testing.T) {
 	}
 	if !bytes.Equal(k.labelValues(1, "job")[:table+2], k.labelValues(2, "job")[:table+2]) {
 		t.Fatal("the values of a label must share their hash on every day")
+	}
+}
+
+// The TTL semantics the stores rely on, on a real cluster: entries expire,
+// expired entries are absent for compare-and-swap, and CheckTTL passes.
+func TestTiKVTTLSemantics(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	if err := db.CheckTTL(ctx); err != nil {
+		t.Fatal(err)
+	}
+	key := db.keys.meta("ttl_probe")
+	if err := db.put(ctx, key, []byte("old"), 1); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := db.get(ctx, key); err != nil || string(v) != "old" {
+		t.Fatalf("get before expiry: %q %v", v, err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		v, err := db.get(ctx, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("an entry with a TTL of 1s did not expire")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	prev, swapped, err := db.compareAndSwap(ctx, key, nil, []byte("new"))
+	if err != nil || !swapped || prev != nil {
+		t.Fatalf("an expired entry must be absent for compare-and-swap: %q %v %v", prev, swapped, err)
+	}
+	prev, swapped, err = db.compareAndSwap(ctx, key, nil, []byte("other"))
+	if err != nil || swapped || string(prev) != "new" {
+		t.Fatalf("compare-and-swap of a live entry: %q %v %v", prev, swapped, err)
 	}
 }

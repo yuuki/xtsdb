@@ -346,12 +346,12 @@ for Redis Cluster), `XTSDB_TEST_CASSANDRA_HOSTS` and `XTSDB_TEST_TIKV_PD`
 (PD addresses; `XTSDB_TEST_TIKV_API_VERSION=v2` for API v2),
 and are skipped when those are unset. Both persistent backends run the same
 conformance tests (`internal/storage/storagetest`); the TiKV backend also
-runs them against an in-memory RawKV without a cluster. The TiKV tests use
-PD and TiKV 8.5.8. `XTSDB_TEST_STRESS=1` also runs a stress test that indexes
+runs them against an in-memory RawKV without a cluster. `XTSDB_TEST_STRESS=1` also runs a stress test that indexes
 a million series sharing one label pair.
 
 Tested with Go 1.27.3, Redis 8.10.3 (standalone and Cluster), Valkey 9.1.3,
-Cassandra 5.0.9, Prometheus 3.15.1 and Grafana 13.3.0.
+Cassandra 5.0.9, PD and TiKV 8.5.8 (API v1 with TTLs and API v2),
+Prometheus 3.15.1 and Grafana 13.3.0.
 
 ## Limitations
 
