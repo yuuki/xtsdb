@@ -19,6 +19,7 @@ import (
 	"slices"
 	"strconv"
 
+	"github.com/prometheus/prometheus/model/histogram"
 	writev2 "github.com/prometheus/prometheus/prompb/io/prometheus/write/v2"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 
@@ -328,7 +329,7 @@ const (
 )
 
 // maxSamplesPerChunk stays well below the 16-bit sample counter of a
-// Prometheus chunk.
+// Prometheus chunk. Decoding refuses chunks with more samples.
 const maxSamplesPerChunk = 16384
 
 // Encode compresses sorted, de-duplicated samples.
@@ -393,27 +394,46 @@ func xorChunks(samples []model.Sample) ([]chunkenc.Chunk, error) {
 
 // histogramChunks encodes float histograms. The appender cuts a new chunk
 // on a counter reset or an incompatible bucket layout, and re-encodes the
-// current one when buckets are added.
+// current one when buckets are added. The layout of a chunk is then the
+// union of the layouts of its histograms; when that would no longer be a
+// layout that decoding accepts (more than model.MaxHistogramBuckets spans,
+// or offsets that overflow, for example), a new chunk is cut instead.
 func histogramChunks(samples []model.Sample) ([]chunkenc.Chunk, error) {
 	var (
 		out []chunkenc.Chunk
-		cur chunkenc.Chunk = chunkenc.NewFloatHistogramChunk()
+		cur chunkenc.Chunk
+		app chunkenc.Appender
 	)
-	app, err := cur.Appender()
-	if err != nil {
+	cut := func() (err error) {
+		if cur != nil {
+			out = append(out, cur)
+		}
+		cur = chunkenc.NewFloatHistogramChunk()
+		app, err = cur.Appender()
+		return err
+	}
+	if err := cut(); err != nil {
 		return nil, err
 	}
 	for _, s := range samples {
 		if cur.NumSamples() >= maxSamplesPerChunk {
-			out = append(out, cur)
-			cur = chunkenc.NewFloatHistogramChunk()
-			if app, err = cur.Appender(); err != nil {
+			if err := cut(); err != nil {
 				return nil, err
 			}
 		}
-		next, recoded, nextApp, err := app.AppendFloatHistogram(nil, 0, s.T, s.H, false)
+		// The appender modifies the histograms it is given.
+		next, recoded, nextApp, err := app.AppendFloatHistogram(nil, 0, s.T, s.H.Copy(), false)
 		if err != nil {
 			return nil, fmt.Errorf("encode histogram at %d: %w", s.T, err)
+		}
+		if recoded && checkHistogramChunk(next.Bytes()) != nil {
+			if err := cut(); err != nil {
+				return nil, err
+			}
+			if _, _, app, err = app.AppendFloatHistogram(nil, 0, s.T, s.H.Copy(), false); err != nil {
+				return nil, fmt.Errorf("encode histogram at %d: %w", s.T, err)
+			}
+			continue
 		}
 		if next != nil {
 			if !recoded {
@@ -423,7 +443,15 @@ func histogramChunks(samples []model.Sample) ([]chunkenc.Chunk, error) {
 		}
 		app = nextApp
 	}
-	return append(out, cur), nil
+	out = append(out, cur)
+	// Never write what decoding refuses, even if an invalid histogram got
+	// this far.
+	for _, c := range out {
+		if err := checkHistogramChunk(c.Bytes()); err != nil {
+			return nil, fmt.Errorf("encode histograms: %w", err)
+		}
+	}
+	return out, nil
 }
 
 // EncodeXOR compresses sorted, de-duplicated float samples.
@@ -440,12 +468,16 @@ func EncodeXOR(samples []model.Sample) ([]byte, error) {
 	return out, nil
 }
 
+// MaxBlobSamples is the largest number of samples in a cold-tier blob: a
+// version of a window is stored in parts of at most this many samples (see
+// flush.WriteCold), and Decode refuses blobs with more.
+const MaxBlobSamples = 100_000
+
 // DecodeXOR decompresses a blob produced by EncodeXOR.
 func DecodeXOR(b []byte) ([]model.Sample, error) { return decodeXOR(b, -1) }
 
-// decodeXOR decompresses a blob produced by EncodeXOR. It fails as soon as
-// it has decoded more than limit samples, unless limit is negative. The
-// sample count of a segment is checked before the segment is decoded.
+// decodeXOR decompresses a blob produced by EncodeXOR. It fails before it
+// decodes more than limit samples, unless limit is negative.
 func decodeXOR(b []byte, limit int) ([]model.Sample, error) {
 	var out []model.Sample
 	var it chunkenc.Iterator
@@ -455,11 +487,8 @@ func decodeXOR(b []byte, limit int) ([]model.Sample, error) {
 			return nil, fmt.Errorf("%w: bad segment length", ErrCorrupt)
 		}
 		b = b[sz:]
-		if limit >= 0 && n >= 2 && len(out)+int(binary.BigEndian.Uint16(b)) > limit {
-			return nil, fmt.Errorf("%w: more than %d samples", ErrCorrupt, limit)
-		}
 		var err error
-		if out, it, err = decodeChunk(out, it, chunkenc.EncXOR, b[:n]); err != nil {
+		if out, it, err = decodeChunk(out, it, chunkenc.EncXOR, b[:n], limit); err != nil {
 			return nil, err
 		}
 		b = b[n:]
@@ -467,8 +496,9 @@ func decodeXOR(b []byte, limit int) ([]model.Sample, error) {
 	return out, nil
 }
 
-// decodeTyped decompresses a blob produced by Encode with EncodingTyped.
-func decodeTyped(b []byte) ([]model.Sample, error) {
+// decodeTyped decompresses a blob produced by Encode with EncodingTyped. It
+// fails before it decodes more than limit samples, unless limit is negative.
+func decodeTyped(b []byte, limit int) ([]model.Sample, error) {
 	var out []model.Sample
 	var it chunkenc.Iterator
 	for len(b) > 0 {
@@ -482,7 +512,7 @@ func decodeTyped(b []byte) ([]model.Sample, error) {
 		}
 		b = b[1+sz:]
 		var err error
-		if out, it, err = decodeChunk(out, it, enc, b[:n]); err != nil {
+		if out, it, err = decodeChunk(out, it, enc, b[:n], limit); err != nil {
 			return nil, err
 		}
 		b = b[n:]
@@ -490,21 +520,44 @@ func decodeTyped(b []byte) ([]model.Sample, error) {
 	return out, nil
 }
 
-// decodeChunk appends the samples of a Prometheus chunk to out. The
-// chunkenc iterators trust their input and panic on some corrupt chunks;
-// the data comes from Redis or the persistent tier, so a panic is returned
-// as ErrCorrupt, and the iterator must not be reused after an error.
-func decodeChunk(out []model.Sample, it chunkenc.Iterator, enc chunkenc.Encoding, b []byte) (
+// decodeChunk appends the samples of a Prometheus chunk to out, failing
+// before out holds more than limit samples unless limit is negative.
+//
+// The chunkenc iterators trust their input. Chunks are therefore checked
+// first against what the encoder writes, so that corrupt data cannot make
+// decoding take much more memory than valid data of the same size (see
+// checkHistogramChunk), and a panic on corrupt data is returned as
+// ErrCorrupt. The iterator must not be reused after an error.
+func decodeChunk(out []model.Sample, it chunkenc.Iterator, enc chunkenc.Encoding, b []byte, limit int) (
 	res []model.Sample, iter chunkenc.Iterator, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			res, iter, err = nil, nil, fmt.Errorf("%w: decode: %v", ErrCorrupt, r)
 		}
 	}()
+	// Both encodings start with the sample count, a big-endian uint16.
+	if len(b) < 2 {
+		return nil, it, fmt.Errorf("%w: chunk of %d bytes", ErrCorrupt, len(b))
+	}
+	switch n := int(binary.BigEndian.Uint16(b)); {
+	case n > maxSamplesPerChunk:
+		return nil, it, fmt.Errorf("%w: chunk of %d samples", ErrCorrupt, n)
+	case limit >= 0 && len(out)+n > limit:
+		return nil, it, fmt.Errorf("%w: more than %d samples", ErrCorrupt, limit)
+	}
+	if enc == chunkenc.EncFloatHistogram {
+		if err := checkHistogramChunk(b); err != nil {
+			return nil, it, err
+		}
+	}
 	c, err := chunkenc.FromData(enc, b)
 	if err != nil {
 		return nil, it, fmt.Errorf("%w: %w", ErrCorrupt, err)
 	}
+	var (
+		fh     histogram.FloatHistogram // overwritten by every histogram
+		layout sharedLayout
+	)
 	it = c.Iterator(it)
 	for vt := it.Next(); vt != chunkenc.ValNone; vt = it.Next() {
 		switch vt {
@@ -512,7 +565,10 @@ func decodeChunk(out []model.Sample, it chunkenc.Iterator, enc chunkenc.Encoding
 			t, v := it.At()
 			out = append(out, model.Sample{T: t, V: v})
 		case chunkenc.ValFloatHistogram:
-			t, h := it.AtFloatHistogram(nil)
+			t, h := it.AtFloatHistogram(&fh)
+			if h == &fh { // stale markers come as a new histogram
+				h = layout.histogram(h)
+			}
 			out = append(out, model.Sample{T: t, H: h})
 		default:
 			return nil, it, fmt.Errorf("%w: unexpected value type %v", ErrCorrupt, vt)
@@ -524,13 +580,14 @@ func decodeChunk(out []model.Sample, it chunkenc.Iterator, enc chunkenc.Encoding
 	return out, it, nil
 }
 
-// Decode decodes a cold-tier blob of the given encoding.
+// Decode decodes a cold-tier blob of the given encoding. Corrupt data is
+// reported as ErrCorrupt.
 func Decode(enc Encoding, b []byte) ([]model.Sample, error) {
 	switch enc {
 	case EncodingXOR:
-		return DecodeXOR(b)
+		return decodeXOR(b, MaxBlobSamples)
 	case EncodingTyped:
-		return decodeTyped(b)
+		return decodeTyped(b, MaxBlobSamples)
 	default:
 		return nil, fmt.Errorf("%w: unknown encoding %d", ErrCorrupt, enc)
 	}

@@ -357,7 +357,7 @@ func (f *Flusher) flushBatch(ctx context.Context, refs []storage.ChunkRef) int {
 // below the Cassandra mutation size limit even for incompressible values and
 // large native histograms.
 const (
-	samplesPerPart = 100_000
+	samplesPerPart = chunk.MaxBlobSamples
 	bytesPerPart   = 4 << 20
 )
 

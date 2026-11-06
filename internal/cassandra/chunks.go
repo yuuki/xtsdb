@@ -140,23 +140,27 @@ func (c *ChunkStore) readSeries(ctx context.Context, id model.SeriesID, days []i
 		pending = nil
 	}
 	for _, day := range days {
-		iter := c.session.Query(`SELECT start_ms, fragment, total, digest, encoding, data FROM chunks
+		iter := c.session.Query(`SELECT start_ms, fragment, total, digest, part, encoding, data FROM chunks
 			WHERE series_id = ? AND day = ? AND start_ms >= ? AND start_ms <= ?`,
 			int64(id), day, from, maxt,
 		).Idempotent(true).IterContext(ctx)
 		var (
 			v    version
+			part int
 			enc  int8
 			data []byte
 		)
-		for iter.Scan(&v.start, &v.fragment, &v.total, &v.digest, &enc, &data) {
+		for iter.Scan(&v.start, &v.fragment, &v.total, &v.digest, &part, &enc, &data) {
 			if started && v != cur {
 				flushVersion()
 			}
 			cur, started = v, true
 			samples, err := chunk.Decode(chunk.Encoding(enc), data)
 			if err != nil {
-				c.logger.Error("skipping undecodable chunk", "series", id, "day", day, "err", err)
+				// See storage.ColdStore: skipped, with the primary key of
+				// the row so that it can be inspected or deleted.
+				c.logger.Error("skipping undecodable chunk", "series", id, "day", day, "start", v.start,
+					"fragment", v.fragment, "total", v.total, "digest", v.digest, "part", part, "err", err)
 			} else {
 				pending = append(pending, samples...)
 			}

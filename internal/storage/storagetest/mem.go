@@ -403,12 +403,12 @@ func (c *Cold) Read(_ context.Context, ids []model.SeriesID, mint, maxt int64) (
 				pending = nil
 			}
 			ch := c.chunks[k]
+			cur = &k
 			s, err := chunk.Decode(ch.Encoding, ch.Data)
 			if err != nil {
-				return nil, err
+				continue // skipped, as the contract of storage.ColdStore requires
 			}
 			pending = append(pending, s...)
-			cur = &k
 		}
 		if cur != nil {
 			sets = append(sets, chunk.Filter(chunk.Normalize(pending), mint, maxt))

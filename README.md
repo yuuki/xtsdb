@@ -326,6 +326,13 @@ is moved to a quarantine key instead of blocking flushing, and kept for
 `xtsdb quarantine delete -config.file=... <key>...` (or `-all`). See
 [docs/architecture.md](docs/architecture.md#quarantined-chunks).
 
+**Corrupt data in the persistent tier.** Queries skip a part of the
+persistent tier that cannot be decoded and return the other samples (where
+the part held the newest value at a timestamp, an older version's value). It
+is logged at error level as `skipping undecodable chunk` with the key of the
+part on every read, and there is no metric for it. See
+[docs/architecture.md](docs/architecture.md#corrupt-data-in-the-persistent-tier).
+
 **Configuration.** [examples/xtsdb.yaml](examples/xtsdb.yaml) documents every
 option with its default. `xtsdb config -config.file=...` prints the
 effective configuration. With `-config.expand-env`, `${VAR}` and

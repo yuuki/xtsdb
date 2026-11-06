@@ -47,6 +47,7 @@ func RunColdStoreTests(t *testing.T, newStore ColdFactory) {
 	t.Run("ManyWindows", func(t *testing.T) { testColdManyWindows(t, newStore) })
 	t.Run("LargePart", func(t *testing.T) { testColdLargePart(t, newStore) })
 	t.Run("Histograms", func(t *testing.T) { testColdHistograms(t, newStore) })
+	t.Run("CorruptParts", func(t *testing.T) { testColdCorruptParts(t, newStore) })
 	t.Run("Retention", func(t *testing.T) { testColdRetention(t, newStore) })
 }
 
@@ -160,6 +161,48 @@ func testColdVersionsAndParts(t *testing.T, newStore ColdFactory) {
 	writePart(t, store, c(1, 0xbbbb, 0), []model.Sample{{T: start + 1, V: 1}})
 	got := read(t, store, []model.SeriesID{id}, start, start+hour)
 	expectSamples(t, "read", got[id], []model.Sample{{T: start + 1, V: 1}, {T: start + 2, V: 2}, {T: start + 3, V: 3}})
+}
+
+// corruptHistogramChunk is a typed blob holding a float histogram chunk whose
+// layout claims spans of billions of buckets. Decoding it used to run the
+// process out of memory.
+const corruptHistogramChunk = "\x037\x01\x00\xff?PbM\xd2\xf1\xa9\xfc\x8cdE\x00\xa8\x00$$$$$$\x00\x00\x00\x00\x00\xff\xc0\x00p\x00\x00\x00\x00\xff\xe0\x00\x00\x00\x00\x00\x01\x00`\x00\x00\x00\x00\x00\x01\x00\x00\x00"
+
+// Parts that do not decode are skipped, and the other parts and versions are
+// still read (see storage.ColdStore). Where a skipped part held the newest
+// value at a timestamp, the value of an older version is returned.
+func testColdCorruptParts(t *testing.T, newStore ColdFactory) {
+	store := newStore(t, 0, hour)
+	id := model.SeriesID(78)
+	start := int64(20_000) * model.DayMillis
+	c := func(fragment int64, part int) storage.ColdChunk {
+		return storage.ColdChunk{Series: id, Start: start, Fragment: fragment, Total: 3, Digest: 0xaaaa, Part: part}
+	}
+	writePart(t, store, c(5, 0), []model.Sample{{T: start + 1, V: 1}, {T: start + 2, V: 2}})
+	for i, corrupt := range []struct {
+		enc  chunk.Encoding
+		data string
+	}{{chunk.EncodingTyped, corruptHistogramChunk}, {chunk.EncodingXOR, "\xff"}, {9, "\x00"}} {
+		bad := c(5, i+1)
+		bad.MaxT, bad.Count, bad.Encoding, bad.Data = start+3, 1, corrupt.enc, []byte(corrupt.data)
+		if err := store.WriteChunk(context.Background(), bad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A valid part after the corrupt ones.
+	writePart(t, store, c(5, 4), []model.Sample{{T: start + 3, V: 3}})
+	// A later version, and a still later one that is entirely corrupt: the
+	// values of the later version are returned where it would have won.
+	writePart(t, store, c(6, 0), []model.Sample{{T: start + 2, V: 20}, {T: start + 4, V: 4}})
+	bad := c(7, 0)
+	bad.MaxT, bad.Count, bad.Encoding, bad.Data = start+5, 1, chunk.EncodingXOR, []byte{0xff}
+	if err := store.WriteChunk(context.Background(), bad); err != nil {
+		t.Fatal(err)
+	}
+	got := read(t, store, []model.SeriesID{id}, start, start+hour)
+	expectSamples(t, "read", got[id], []model.Sample{
+		{T: start + 1, V: 1}, {T: start + 2, V: 20}, {T: start + 3, V: 3}, {T: start + 4, V: 4},
+	})
 }
 
 // Versions of a window take precedence in (fragment, total, digest) order,

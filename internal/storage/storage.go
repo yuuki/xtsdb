@@ -178,6 +178,12 @@ type ColdChunk struct {
 
 // ColdStore is the persistent tier. Writes must be idempotent: writing the
 // same (Series, Start, Fragment, Total, Digest, Part) twice stores it once.
+//
+// Read skips parts whose data does not decode (chunk.ErrCorrupt) and logs
+// them as errors with their primary key, instead of failing: the persistent
+// tier has no quarantine, so a failing read would fail every query of the
+// series over that window until the part expires. Read fails only when the
+// backend cannot be read.
 type ColdStore interface {
 	WriteChunk(ctx context.Context, c ColdChunk) error
 	Read(ctx context.Context, ids []model.SeriesID, mint, maxt int64) (map[model.SeriesID][]model.Sample, error)

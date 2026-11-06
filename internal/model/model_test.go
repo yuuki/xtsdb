@@ -2,8 +2,10 @@ package model
 
 import (
 	"errors"
+	"math"
 	"testing"
 
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 )
 
@@ -138,5 +140,38 @@ func TestDays(t *testing.T) {
 	}
 	if Days(10, 5) != nil {
 		t.Fatal("empty range must return nil")
+	}
+}
+
+// A NaN zero threshold made PromQL loop forever when it added the histogram
+// to another one; other non-finite or negative thresholds make no sense.
+func TestValidateHistogramZeroThreshold(t *testing.T) {
+	for _, zt := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), -1} {
+		h := &histogram.FloatHistogram{Schema: 0, ZeroThreshold: zt}
+		if ValidateHistogram(h) == nil || ValidateHistogramLayout(h) == nil {
+			t.Errorf("zero threshold %v accepted", zt)
+		}
+	}
+	for _, zt := range []float64{0, math.Ldexp(1, -128), 0.001, 1e300} {
+		if err := ValidateHistogram(&histogram.FloatHistogram{Schema: 0, ZeroThreshold: zt}); err != nil {
+			t.Errorf("zero threshold %v: %v", zt, err)
+		}
+	}
+}
+
+// The layout of a persistent-tier chunk may have more buckets than one
+// histogram, but not more spans or custom bounds.
+func TestValidateHistogramLayout(t *testing.T) {
+	n := MaxHistogramBuckets + 1
+	many := &histogram.FloatHistogram{Schema: 0, PositiveSpans: []histogram.Span{{Length: uint32(n)}}, PositiveBuckets: make([]float64, n)}
+	if ValidateHistogram(many) == nil {
+		t.Error("ValidateHistogram accepted too many buckets")
+	}
+	if err := ValidateHistogramLayout(many); err != nil {
+		t.Errorf("ValidateHistogramLayout: %v", err)
+	}
+	spans := &histogram.FloatHistogram{Schema: 0, PositiveSpans: make([]histogram.Span, n)}
+	if ValidateHistogramLayout(spans) == nil {
+		t.Error("ValidateHistogramLayout accepted too many spans")
 	}
 }
