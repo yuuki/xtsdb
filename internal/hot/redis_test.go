@@ -351,7 +351,7 @@ func TestQuarantineIsFenced(t *testing.T) {
 	corrupt := []byte("0000000000001000x")
 	client.Set(ctx, key, "0000000000002000", 0) // healthy newer incarnation
 	client.ZAdd(ctx, s.inflightKey(0), redis.Z{Score: 0, Member: m})
-	if s.quarantine(ctx, ref, corrupt, errors.New("test")) {
+	if s.quarantine(ctx, ref, corrupt, nil, errors.New("test")) {
 		t.Fatal("a newer incarnation must not be quarantined")
 	}
 	if client.Get(ctx, key).Val() != "0000000000002000" {
@@ -362,12 +362,12 @@ func TestQuarantineIsFenced(t *testing.T) {
 	}
 	// Same header, different length: samples were appended since the read.
 	client.Set(ctx, key, "0000000000001000xyz", 0)
-	if s.quarantine(ctx, ref, corrupt, errors.New("test")) {
+	if s.quarantine(ctx, ref, corrupt, nil, errors.New("test")) {
 		t.Fatal("a chunk that grew must not be quarantined")
 	}
 	// A chunk that disappeared is released.
 	client.Del(ctx, key)
-	if s.quarantine(ctx, ref, corrupt, errors.New("test")) {
+	if s.quarantine(ctx, ref, corrupt, nil, errors.New("test")) {
 		t.Fatal("a missing chunk cannot be quarantined")
 	}
 	if client.ZCard(ctx, s.inflightKey(0)).Val() != 0 {

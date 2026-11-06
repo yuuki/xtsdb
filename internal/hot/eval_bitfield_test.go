@@ -442,7 +442,7 @@ func (s *bfStore) read(ctx context.Context, id model.SeriesID, start int64) ([]m
 	return samples, records, bytesOf(v[0]), err
 }
 
-func sameSamples(a, b []model.Sample) error {
+func diffSamples(a, b []model.Sample) error {
 	if len(a) != len(b) {
 		return fmt.Errorf("%d samples, want %d", len(a), len(b))
 	}
@@ -585,14 +585,14 @@ func TestEvalBitfieldSemantics(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, want, wantRecords, err := chunk.DecodeHot(append(slices.Clone(evalHeader), chunk.AppendRaw(nil, all)...))
+		_, want, wantRecords, err := chunk.DecodeHot(append(slices.Clone(evalHeader), chunk.AppendRaw(nil, all)...), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if records != wantRecords {
 			t.Fatalf("iteration %d: %d records, want %d", iter, records, wantRecords)
 		}
-		if err := sameSamples(got, want); err != nil {
+		if err := diffSamples(got, want); err != nil {
 			t.Fatalf("iteration %d: %v", iter, err)
 		}
 	}

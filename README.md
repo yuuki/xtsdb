@@ -33,8 +33,10 @@ use each store for what it is good at, and scale each tier independently.
   and the series index, with the same semantics.
 - **Series index** partitioned by day, so label matchers
   (`=`, `!=`, `=~`, `!~`) work on any time range.
-- **Gorilla compression** in the persistent tier (Prometheus XOR and float
-  histogram chunks).
+- **Gorilla compression** in both tiers (Prometheus XOR and float histogram
+  chunks): flushers compact the open chunks in Redis every few minutes,
+  which cuts its memory by about three times, without changing the append
+  path.
 - **Redis 7.0+ standalone, Sentinel or Cluster; Valkey 7.2+** as a drop-in
   replacement. Every Redis script touches a single cluster slot.
 - **One binary, four roles** (`ingester`, `flusher`, `querier`, or `all`)
@@ -60,6 +62,8 @@ flowchart LR
 
 1. The **ingester** validates and canonicalizes labels, records the series
    in the index, and appends samples to per-series time windows in Redis.
+   Every few minutes, a **flusher** compresses the samples of open windows
+   in place.
 2. When a window closes (`chunk_range` + `grace_period` after it starts),
    a **flusher** claims it under a lease, compresses it, writes it to
    the persistent tier and only then deletes it from Redis.
@@ -217,9 +221,12 @@ stateless and can be scaled horizontally:
   flushed yet; xtsdb logs a warning at startup otherwise.
 - Enable AOF (`appendonly yes`) and replicas: the hot tier holds the most
   recent `chunk_range` + `grace_period` of data.
-- Memory needed is roughly 16 bytes per float sample held in Redis (native
-  histograms take more, depending on their buckets), plus a small
-  sorted set per series with chunks in Redis (its window index).
+- Memory needed is about 10 bytes per float sample held in Redis with the
+  default `flusher.compaction_interval` of 5 minutes, and about 30 without
+  compaction, including the per-series window index and the due set
+  (measured on Redis 7.0 with generated data at a 15 s interval; real data
+  compresses better). Native histograms take more, depending on their
+  buckets. See [docs/hot-compression.md](docs/hot-compression.md).
 - Redis 7.0 or later (Valkey 7.2 or later) is required. No
   keyspace-notification or other special configuration is needed.
 
@@ -303,6 +310,7 @@ Watch in particular:
 | `xtsdb_hot_pending_chunks`, `xtsdb_hot_inflight_chunks` | Chunks held in Redis. |
 | `xtsdb_flusher_chunks_total{outcome="error"}` | Failed flushes; they are retried after the lease. |
 | `xtsdb_hot_quarantined_chunks`, `xtsdb_flusher_chunks_total{outcome="quarantined"}` | Undecodable chunks moved out of the way. Should stay at zero; inspect them with `xtsdb quarantine list`. |
+| `xtsdb_flusher_compaction_chunks_total{outcome=...}`, `xtsdb_flusher_compaction_output_bytes_total` / `xtsdb_flusher_compaction_input_bytes_total` | Open chunks compressed in Redis (`compacted`; `changed`: retried at the next compaction; `failed`: undecodable) and the size after compaction relative to before. |
 | `xtsdb_ingester_samples_total{outcome=...}` | Accepted samples and rejections: `too_old`, `too_new`, `invalid` (labels or histograms), `chunk_full`, `collision`, `throttled`, `error`. |
 | `xtsdb_ingester_series_collisions_total` | Series refused because another label set already uses their 64-bit ID. Both label sets are logged. |
 | `xtsdb_graphite_lines_total{outcome="dropped"}`, `xtsdb_graphite_connections_total{outcome="rejected"}` | Graphite overload. |
@@ -362,8 +370,9 @@ Prometheus 3.15.1 and Grafana 13.3.0.
   Authentication distinguishes writers from readers, not tenants.
 - Samples older than their closed chunk window are rejected by remote write
   and Graphite; history is loaded with `xtsdb import`.
-- A series can hold at most about two million samples per chunk window in
-  Redis (32 MiB); more are rejected as `chunk_full`.
+- A series can hold at most about two million raw samples per chunk window
+  in Redis (32 MiB), plus as many compacted ones; more are rejected as
+  `chunk_full`.
 - Queries reach back at most `storage.retention`, or
   `querier.max_query_lookback` (default one year) when retention is 0.
 - Series are identified by a 64-bit hash of their labels. Collisions are

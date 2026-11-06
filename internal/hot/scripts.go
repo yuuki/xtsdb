@@ -11,10 +11,10 @@ import "github.com/redis/go-redis/v9"
 // same clock, which is what makes the hand-off race free: once a window is
 // due, no further sample can be appended to it.
 //
-// claim, complete and quarantine carry the allow-oom flag (Redis >= 7.0):
-// they must keep working when Redis is full, because flushing is the only
-// way memory is ever freed. append has no flags and is refused as a whole
-// when Redis is out of memory.
+// claim, complete, quarantine and the compaction scripts carry the
+// allow-oom flag (Redis >= 7.0): they must keep working when Redis is full,
+// because flushing and compaction are the only ways memory is freed. append
+// has no flags and is refused as a whole when Redis is out of memory.
 
 // prelude computes the server time in milliseconds.
 const prelude = `
@@ -112,34 +112,39 @@ return out
 // completeScript finishes in-flight chunks.
 //
 // For a persisted chunk (header non-empty) the chunk is deleted only if it
-// is still exactly what was persisted: same header (incarnation) and same
-// length (no sample appended since it was loaded). Otherwise it is left in
-// flight and re-processed after its lease expires.
+// is still exactly what was persisted: same header (incarnation), same
+// length (no sample appended since it was loaded) and same length of the
+// compacted part. Otherwise it is left in flight and re-processed after its
+// lease expires.
 //
 // For a chunk that no longer exists (header empty) the in-flight entries
-// are removed, so that they do not leak.
+// are removed, so that they do not leak, and so is a leftover compacted
+// part.
 //
 // A finished chunk is removed from the window index of its series.
 //
 // KEYS[1] = in-flight set, KEYS[2] = in-flight due set,
-// KEYS[3..] = (chunk key, window index) for every chunk
-// ARGV = (member, window start, header, length) for every chunk
+// KEYS[3..] = (chunk key, compacted key, window index) for every chunk
+// ARGV = (member, window start, header, length, compacted length) for every
+// chunk
 // Returns the number of chunks finished.
 var completeScript = redis.NewScript(allowOOM + `
 local done = 0
-for c = 0, (#KEYS - 2) / 2 - 1 do
-  local key, windows = KEYS[3 + 2 * c], KEYS[4 + 2 * c]
-  local j = 1 + 4 * c
-  local member, start, want, size = ARGV[j], ARGV[j + 1], ARGV[j + 2], tonumber(ARGV[j + 3])
+for c = 0, (#KEYS - 2) / 3 - 1 do
+  local key, zkey, windows = KEYS[3 + 3 * c], KEYS[4 + 3 * c], KEYS[5 + 3 * c]
+  local j = 1 + 5 * c
+  local member, start, want = ARGV[j], ARGV[j + 1], ARGV[j + 2]
+  local size, zsize = tonumber(ARGV[j + 3]), tonumber(ARGV[j + 4])
   local hdr = redis.call('GETRANGE', key, 0, 15)
   local finished = false
   if want == '' then
     finished = (hdr == '')
-  elseif hdr == want and redis.call('STRLEN', key) == size then
+  elseif hdr == want and redis.call('STRLEN', key) == size and redis.call('STRLEN', zkey) == zsize then
     redis.call('DEL', key)
     finished = true
   end
   if finished then
+    redis.call('DEL', zkey)
     redis.call('ZREM', KEYS[1], member)
     redis.call('ZREM', KEYS[2], member)
     redis.call('ZREM', windows, start)
@@ -153,39 +158,46 @@ return done
 // does not block the flusher forever, while keeping it for inspection.
 //
 // It is fenced like completeScript: the chunk is moved only if its first 16
-// bytes and its length are still those that were read. A chunk that changed
-// (a newer incarnation of the window after a failover or a clock step) is
-// left in flight and re-processed after its lease. A chunk that no longer
-// exists is released.
+// bytes, its length and the length of its compacted part are still those
+// that were read. A chunk that changed (a newer incarnation of the window
+// after a failover or a clock step) is left in flight and re-processed after
+// its lease. A chunk that no longer exists is released.
 //
 // The quarantine key is named after the content of the chunk, so a later
-// quarantine of the same window never overwrites a different chunk. Every
-// quarantine key is recorded in the quarantine index with its expiry time
-// (+inf without a TTL); expired entries are pruned here.
+// quarantine of the same window never overwrites a different chunk. The
+// compacted part, if any, is moved next to it. Every quarantine key is
+// recorded in the quarantine index with its expiry time (+inf without a
+// TTL); expired entries are pruned here.
 //
 // KEYS[1] = in-flight set, KEYS[2] = in-flight due set, KEYS[3] = chunk key,
 // KEYS[4] = quarantine key, KEYS[5] = quarantine index,
-// KEYS[6] = window index of the series
+// KEYS[6] = window index of the series, KEYS[7] = compacted key,
+// KEYS[8] = quarantine key of the compacted part
 // ARGV[1] = member, ARGV[2] = first 16 bytes as read, ARGV[3] = length as
 // read, ARGV[4] = TTL of the quarantine key in milliseconds (0: none),
-// ARGV[5] = window start
+// ARGV[5] = window start, ARGV[6] = length of the compacted part as read
 // Returns 1 if the chunk was quarantined, 0 if it changed and -1 if it no
 // longer exists.
 var quarantineScript = redis.NewScript(allowOOM + prelude + `
 local member, want, size, ttl = ARGV[1], ARGV[2], tonumber(ARGV[3]), tonumber(ARGV[4])
+local zsize = tonumber(ARGV[6])
 if redis.call('EXISTS', KEYS[3]) == 0 then
+  redis.call('DEL', KEYS[7])
   redis.call('ZREM', KEYS[1], member)
   redis.call('ZREM', KEYS[2], member)
   redis.call('ZREM', KEYS[6], ARGV[5])
   return -1
 end
-if redis.call('GETRANGE', KEYS[3], 0, 15) ~= want or redis.call('STRLEN', KEYS[3]) ~= size then
+if redis.call('GETRANGE', KEYS[3], 0, 15) ~= want or redis.call('STRLEN', KEYS[3]) ~= size
+    or redis.call('STRLEN', KEYS[7]) ~= zsize then
   return 0
 end
 redis.call('RENAME', KEYS[3], KEYS[4])
+if zsize > 0 then redis.call('RENAME', KEYS[7], KEYS[8]) end
 local expiry = '+inf'
 if ttl > 0 then
   redis.call('PEXPIRE', KEYS[4], ttl)
+  if zsize > 0 then redis.call('PEXPIRE', KEYS[8], ttl) end
   expiry = now + ttl
 end
 redis.call('ZREMRANGEBYSCORE', KEYS[5], '-inf', now)
@@ -194,6 +206,51 @@ redis.call('ZREM', KEYS[1], member)
 redis.call('ZREM', KEYS[2], member)
 redis.call('ZREM', KEYS[6], ARGV[5])
 return 1
+`)
+
+// compactLeaseScript takes the compaction lease of a shard, which limits
+// compaction to once per interval across all flushers. It must work when
+// Redis is full, since compaction frees memory.
+//
+// KEYS[1] = compaction lease, ARGV[1] = interval in milliseconds
+// Returns OK if the lease was taken, nil if another holder has it.
+var compactLeaseScript = redis.NewScript(allowOOM + `
+return redis.call('SET', KEYS[1], '1', 'NX', 'PX', ARGV[1])
+`)
+
+// compactScript replaces the raw records of open chunks, which the caller
+// read and encoded, with their new compacted part.
+//
+// A chunk is compacted only while its window is open by the clock of the
+// node, as in append, so that a due window never changes. And only if what
+// was read is still there: the chunk starts with exactly the bytes that
+// were read, and its compacted part is the one that was read. Contents are
+// compared, not lengths: after a failover to a lagging replica, different
+// records of the same length may have been appended. Records appended after
+// the read are kept after the header.
+//
+// It runs when Redis is out of memory: it releases more than it allocates.
+//
+// KEYS[1] = due set, KEYS[2..] = (chunk key, compacted key) for every chunk
+// ARGV = (member, chunk as read, compacted part as read (empty if none), new
+// compacted part) for every chunk
+// Returns the 0-based indexes of the chunks that were compacted.
+var compactScript = redis.NewScript(allowOOM + prelude + `
+local done = {}
+for c = 0, (#KEYS - 1) / 2 - 1 do
+  local key, zkey = KEYS[2 + 2 * c], KEYS[3 + 2 * c]
+  local j = 1 + 4 * c
+  local member, raw, old, new = ARGV[j], ARGV[j + 1], ARGV[j + 2], ARGV[j + 3]
+  local due = redis.call('ZSCORE', KEYS[1], member)
+  if due and now < tonumber(due)
+      and redis.call('GETRANGE', key, 0, string.len(raw) - 1) == raw
+      and (redis.call('GET', zkey) or '') == old then
+    redis.call('SET', key, string.sub(raw, 1, 16) .. redis.call('GETRANGE', key, string.len(raw), -1))
+    redis.call('SET', zkey, new)
+    done[#done + 1] = c
+  end
+end
+return done
 `)
 
 // indexScript registers existing chunks in the window index of their

@@ -227,6 +227,10 @@ type FlusherConfig struct {
 	// QuarantineTTL is how long undecodable chunks are kept in Redis for
 	// inspection. Zero keeps them until they are deleted.
 	QuarantineTTL Duration `yaml:"quarantine_ttl"`
+	// CompactionInterval is how often the raw samples of open chunks are
+	// compressed in Redis; each shard is compacted at most once per interval
+	// across all flushers. Zero disables compaction.
+	CompactionInterval Duration `yaml:"compaction_interval"`
 }
 
 // QuerierConfig configures the read path.
@@ -295,11 +299,12 @@ func Default() *Config {
 			IndexWriteConcurrency:  64,
 		},
 		Flusher: FlusherConfig{
-			PollInterval:  Duration(time.Second),
-			BatchSize:     128,
-			Concurrency:   8,
-			LeaseDuration: Duration(2 * time.Minute),
-			QuarantineTTL: Duration(30 * 24 * time.Hour),
+			PollInterval:       Duration(time.Second),
+			BatchSize:          128,
+			Concurrency:        8,
+			LeaseDuration:      Duration(2 * time.Minute),
+			QuarantineTTL:      Duration(30 * 24 * time.Hour),
+			CompactionInterval: Duration(5 * time.Minute),
 		},
 		Querier: QuerierConfig{
 			LookbackDelta:     Duration(5 * time.Minute),
@@ -493,6 +498,8 @@ func (c *Config) Validate() error {
 	check(c.Flusher.LeaseDuration.D() >= time.Second, "flusher.lease_duration must be at least 1s")
 	check(c.Flusher.QuarantineTTL.D() == 0 || c.Flusher.QuarantineTTL.D() >= time.Hour,
 		"flusher.quarantine_ttl must be 0 (keep until deleted) or at least 1h")
+	check(c.Flusher.CompactionInterval.D() == 0 || c.Flusher.CompactionInterval.D() >= time.Second,
+		"flusher.compaction_interval must be 0 (disabled) or at least 1s")
 	check(c.Querier.LookbackDelta.D() > 0, "querier.lookback_delta must be positive")
 	check(c.Querier.Timeout.D() > 0, "querier.timeout must be positive")
 	check(c.Querier.MaxSamples > 0, "querier.max_samples must be positive")

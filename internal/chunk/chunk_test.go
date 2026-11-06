@@ -14,7 +14,7 @@ import (
 func TestDecodeHotNormalizes(t *testing.T) {
 	b := []byte("1793881662314273")
 	b = AppendRaw(b, []model.Sample{{T: 3000, V: 3}, {T: 1000, V: 1}, {T: 2000, V: 2}, {T: 1000, V: 1.5}})
-	frag, got, records, err := DecodeHot(b)
+	frag, got, records, err := DecodeHot(b, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -27,9 +27,87 @@ func TestDecodeHotNormalizes(t *testing.T) {
 
 func TestDecodeHotRejectsCorruptInput(t *testing.T) {
 	for _, b := range [][]byte{nil, []byte("123"), append([]byte("1793881662314273"), 1, 2, 3)} {
-		if _, _, _, err := DecodeHot(b); !errors.Is(err, ErrCorrupt) {
+		if _, _, _, err := DecodeHot(b, nil); !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("len %d: expected ErrCorrupt, got %v", len(b), err)
 		}
+	}
+}
+
+func TestDecodeHotMergesCompactedPart(t *testing.T) {
+	header := []byte("1793881662314273")
+	// Compaction folded five records (one overwritten) into the compacted
+	// part; the raw part holds what was appended since.
+	folded := Normalize(rawRoundTrip(t, []model.Sample{
+		{T: 1000, V: 1}, {T: 2000, V: 2}, {T: 3000, V: 3}, {T: 2000, V: 2.5}, {T: 5000, H: testHistogram(1, false)},
+	}))
+	compacted, err := EncodeCompacted(header, 5, folded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := AppendRaw(append([]byte{}, header...), []model.Sample{{T: 3000, V: 30}, {T: 4000, V: 4}, {T: 3000, V: 31}})
+	frag, got, records, err := DecodeHot(raw, compacted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frag != 1793881662314273 || records != 8 {
+		t.Fatalf("fragment = %d, records = %d", frag, records)
+	}
+	// Raw records were written after the compacted samples and win.
+	assertSamples(t, got, []model.Sample{
+		{T: 1000, V: 1}, {T: 2000, V: 2.5}, {T: 3000, V: 31}, {T: 4000, V: 4}, {T: 5000, H: testHistogram(1, false)},
+	})
+
+	// Without raw records.
+	if _, got, records, err := DecodeHot(header, compacted); err != nil || records != 5 || len(got) != 4 {
+		t.Fatalf("compacted only: %d samples, %d records, %v", len(got), records, err)
+	}
+	// A compacted part of another incarnation is corruption.
+	other := append([]byte("1793881662314274"), compacted[HeaderLen:]...)
+	if _, _, _, err := DecodeHot(raw, other); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("expected ErrCorrupt for another incarnation, got %v", err)
+	}
+}
+
+// rawRoundTrip round-trips samples through raw records, as compaction
+// reads them.
+func rawRoundTrip(t *testing.T, samples []model.Sample) []model.Sample {
+	t.Helper()
+	out, err := DecodeRaw(AppendRaw(nil, samples))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestCompactedRejectsCorruptInput(t *testing.T) {
+	header := []byte("1793881662314273")
+	good, err := EncodeCompacted(header, 3, []model.Sample{{T: 1, V: 1}, {T: 2, V: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s, n, err := DecodeCompacted(good); err != nil || n != 3 || len(s) != 2 {
+		t.Fatalf("decode: %v %d %v", s, n, err)
+	}
+	for name, b := range map[string][]byte{
+		"empty":        {},
+		"short":        header[:10],
+		"bad header":   append([]byte("17938816623142xx"), good[HeaderLen:]...),
+		"no encoding":  good[:HeaderLen+1],
+		"bad encoding": append(append([]byte{}, good[:HeaderLen+1]...), 9, 0),
+		"truncated":    good[:len(good)-3],
+		"few records":  append(append(append([]byte{}, header...), 1), good[HeaderLen+1:]...),
+		"huge records": append(append(append([]byte{}, header...), 0xff, 0xff, 0xff, 0xff, 0x0f), good[HeaderLen+1:]...),
+		"bad uvarint":  append(append([]byte{}, header...), 0xff),
+	} {
+		if _, _, err := DecodeCompacted(b); !errors.Is(err, ErrCorrupt) {
+			t.Errorf("%s: expected ErrCorrupt, got %v", name, err)
+		}
+	}
+	if _, err := EncodeCompacted(header, 1, []model.Sample{{T: 1}, {T: 2}}); err == nil {
+		t.Error("fewer records than samples must be refused")
+	}
+	if _, err := EncodeCompacted(header[:4], 1, nil); err == nil {
+		t.Error("a short header must be refused")
 	}
 }
 
@@ -150,7 +228,7 @@ func TestHotHistogramRecords(t *testing.T) {
 	if (len(b)-HeaderLen)%RecordLen != 0 {
 		t.Fatalf("records must keep chunks a multiple of %d bytes, got %d", RecordLen, len(b)-HeaderLen)
 	}
-	_, got, records, err := DecodeHot(b)
+	_, got, records, err := DecodeHot(b, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +242,7 @@ func TestHotHistogramRecords(t *testing.T) {
 	got[3].V = want[3].V
 	assertSamples(t, got, want)
 	// A truncated histogram record is corrupt, not a crash.
-	if _, _, _, err := DecodeHot(b[:HeaderLen+2*RecordLen]); !errors.Is(err, ErrCorrupt) {
+	if _, _, _, err := DecodeHot(b[:HeaderLen+2*RecordLen], nil); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("expected ErrCorrupt, got %v", err)
 	}
 }
@@ -215,7 +293,7 @@ func TestDecodeHotRejectsInvalidHistograms(t *testing.T) {
 	}
 	for i, h := range bad {
 		b := AppendRaw([]byte("0000000000000001"), []model.Sample{{T: 1000, V: 1}, {T: 2000, H: h}})
-		if _, _, _, err := DecodeHot(b); !errors.Is(err, ErrCorrupt) {
+		if _, _, _, err := DecodeHot(b, nil); !errors.Is(err, ErrCorrupt) {
 			t.Errorf("case %d: expected ErrCorrupt, got %v", i, err)
 		}
 		// Even if one got through, encoding must fail instead of panicking.
@@ -224,7 +302,7 @@ func TestDecodeHotRejectsInvalidHistograms(t *testing.T) {
 		}
 	}
 	// A header that parses as a number but is not 16 digits.
-	if _, _, _, err := DecodeHot([]byte("+000000000000001")); !errors.Is(err, ErrCorrupt) {
+	if _, _, _, err := DecodeHot([]byte("+000000000000001"), nil); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("expected ErrCorrupt for a signed header, got %v", err)
 	}
 }

@@ -9,7 +9,8 @@ stored 16-byte raw records.
 - **Question.** Can the hot tier hold Gorilla-compressed samples, in
   particular from the moment they are ingested?
 - **Decision.** Keep the append path as it is, and compress the open
-  chunks of the hot tier asynchronously ("compaction").
+  chunks of the hot tier asynchronously ("compaction"). It is implemented
+  as described in [architecture.md](architecture.md#compaction).
 - **Not chosen for now.** Encoding at append time inside Redis with
   `BITFIELD` works, but costs about three times the Redis CPU. When it
   would pay off is tracked in
@@ -17,17 +18,20 @@ stored 16-byte raw records.
 
 ## Summary
 
-| | Redis memory, chunk keys | Redis time per sample |
+| | Redis memory, whole store | Extra Redis time, relative to appending |
 |---|---|---|
-| Raw records, as before compaction | 28.1 B/sample | 2.3–2.6 µs |
-| Encoding at append time with `BITFIELD` | 6.5 B/sample | 6.2–10.6 µs |
-| Compaction every 20 samples (5 min at 15 s) | 6.9 B/sample | +0.3 µs |
-| Compaction every 40 samples (10 min at 15 s) | 8.7 B/sample | +0.15 µs |
-| Lower bound: every chunk one Gorilla blob | 4.5 B/sample | |
+| Raw records, as before compaction | 29.8 B/sample | |
+| Encoding at append time with `BITFIELD` (prototype) | 8.0 B/sample | +180% to +280% |
+| Compaction every 20 samples (5 min at 15 s, the default) | 9.1 B/sample | +17% |
+| Compaction every 40 samples (10 min at 15 s) | 10.8 B/sample | +9% |
+| Lower bound: every chunk one Gorilla blob | about 6 B/sample | |
 
 All values were measured on Redis 7.0.15 with generated data (see
-[Method](#method)), with chunk fill spread uniformly over 1–240 samples, as
-it is at any moment with a 1 hour `chunk_range` and a 15 s interval.
+[Method](#method)), in steady state: chunk fill spread uniformly over
+1–240 samples, as it is at any moment with a 1 hour `chunk_range` and a
+15 s interval. The whole store includes the due set and the window index of
+each series (about 1.5 B/sample). The compaction rows are measurements of
+the implementation ([Results of the implementation](#results-of-the-implementation)).
 
 - Compressing each write batch on its own does not help: remote write and
   Graphite deliver about one sample per series per request, and a Gorilla
@@ -40,9 +44,9 @@ it is at any moment with a 1 hour `chunk_range` and a 15 s interval.
   then runs out of CPU long before it runs out of memory: it holds fewer
   series per node than raw records do.
 - Compaction folds the raw records of an open chunk into a compressed part
-  in the background. The append path is unchanged, the work runs in Go in
-  the flusher, and Redis only performs a compare-and-swap that costs about
-  6 µs per chunk.
+  in the background. The append path is unchanged, the encoding runs in Go
+  in the flusher, and Redis only lists, reads and swaps the parts of each
+  chunk with a compare-and-swap.
 - The raw format used more memory than documented: Redis grows a string
   greedily on `APPEND`, so a chunk held 28 bytes per sample on average, not
   16, and up to 39 just after its buffer doubled. Compaction rewrites values
@@ -233,15 +237,16 @@ Redis time per sample (`TestEvalBitfieldCost`):
 
 Capacity of one Redis core (Lua runs on the main thread; I/O threads do not
 help), with a 1 hour `chunk_range`, 15 s interval and the integer counter
-timings; memory of chunk keys only:
+timings; memory of the whole store; compaction as measured in
+[Results of the implementation](#results-of-the-implementation) (+17%):
 
 | | µs/sample | Series per core | Memory per series | Memory at CPU saturation | Series on a 16 GB node |
 |---|---|---|---|---|---|
-| Raw records | 2.56 | 5.9 M | 3.4 KB | 20 GB | 4.7 M (memory) |
-| `BITFIELD`, lean | 7.45 | 2.0 M | 0.8 KB | 1.6 GB | 2.0 M (CPU) |
-| Compaction, 5 min | 2.87 | 5.2 M | 0.8 KB | 4.3 GB | 5.2 M (CPU) |
+| Raw records | 2.56 | 5.9 M | 3.6 KB | 21 GB | 4.4 M (memory) |
+| `BITFIELD`, lean | 7.45 | 2.0 M | 1.0 KB | 1.9 GB | 2.0 M (CPU) |
+| Compaction, 5 min | 3.0 | 5.0 M | 1.1 KB | 5.5 GB | 5.0 M (CPU) |
 
-With encoding at append time, Redis saturates its CPU with 1.6 GB of data,
+With encoding at append time, Redis saturates its CPU with 1.9 GB of data,
 and a node holds fewer series than with raw records. Each script call also
 blocks Redis three times longer (about 2 ms for 256 chunks), which delays
 queries.
@@ -261,7 +266,7 @@ Two variants would change the balance; both are tracked in
   the absence of a raw tail matters more, but compaction remains as small
   in memory at a fraction of the CPU.
 
-### Compaction of open chunks
+### Compaction of open chunks (model)
 
 Layout D of the measurements, which is what was implemented:
 
@@ -276,17 +281,46 @@ Layout D of the measurements, which is what was implemented:
   appends and claims, so a due window stays immutable. It compares the
   content that was read, not just lengths: after a failover to a lagging
   replica, different records of the same length could have been appended.
-- A compare-and-swap with 40 raw records costs 6.11 µs per chunk, 0.15 µs
-  per sample folded (`TestEvalCompactionModelCost`); compacting every
-  20 samples costs about 0.3 µs per sample, 12% of an append.
+- A model of the compare-and-swap alone, with 40 raw records and no
+  compacted part yet, costs 6.11 µs per chunk, 0.15 µs per sample folded
+  (`TestEvalCompactionModelCost`). The implementation costs about three
+  times as much (below).
+
+## Results of the implementation
+
+`TestEvalCompaction` runs the implementation (`Store.Append` and
+`Store.Compact`) in steady state: 12,000 series with chunk fill uniform in
+1–240 samples, all ending now, one sample per series per append, and each
+shard compacted every 20 or 40 samples at a phase of its own, so that the
+raw tails left are uniform too. Whole store, Redis time of every command:
+
+| | Memory | Appending | Compaction |
+|---|---|---|---|
+| No compaction | 29.77 B/sample | 5.09 µs/sample | |
+| Compaction every 40 samples | 10.76 B/sample | 5.43 µs/sample | 0.50 µs/sample (+9%) |
+| Compaction every 20 samples | 9.13 B/sample | 5.33 µs/sample | 0.90 µs/sample (+17%) |
+
+- Memory matches the model of layout D (8.73 and 6.89 B/sample for the
+  chunk keys) plus the due set and the window indexes. Compaction cuts the
+  memory of Redis by 2.8 to 3.3 times.
+- Appending costs more per sample here than in the script measurements
+  above (2.3–2.6 µs) because a script call carries about 47 chunks
+  (12,000 series over 256 shards) instead of 256, and every command is
+  counted.
+- Compaction costs the lease, the listing of open chunks, a `STRLEN` and an
+  `MGET` per chunk, and the swap, which compares and rewrites both parts:
+  about 18–20 µs per compacted chunk, three times the model of the swap
+  alone.
+- No chunk changed during a compaction here: nothing else wrote.
 
 ## Decision
 
-Compaction reaches about the memory of encoding at append time (6.9 against
-6.5 B/sample) for less than a tenth of the extra Redis CPU, keeps the append path and
-the ingesters as they are, does its encoding work outside Redis with the
-existing, tested Go encoder, and works on every supported Redis and Valkey
-version.
+Compaction reaches about the memory of encoding at append time (9.1 against
+8.0 B/sample for the whole store) for a tenth of the extra Redis time (+17%
+against +180% to +280%), keeps the append path and the ingesters as they
+are, does its encoding work outside Redis with the existing, tested Go
+encoder, and works on every supported Redis and Valkey version. It is
+enabled by default every 5 minutes (`flusher.compaction_interval`).
 
 ## Open questions
 
@@ -295,3 +329,6 @@ version.
   but the memory figures were not measured there.
 - The data is generated. Real data compresses better, which makes the raw
   tail a larger part of what remains.
+- The Redis time of compaction has not been optimized: the `STRLEN` pass,
+  and the comparison and rewriting of whole compacted parts, could be made
+  cheaper.

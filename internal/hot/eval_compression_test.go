@@ -494,3 +494,105 @@ func TestEvalCompactionModelCost(t *testing.T) {
 	fmt.Printf("\ncompaction CAS: %.2f us per chunk, %.2f us per raw sample folded (%d raw samples, %d B new z)\n",
 		perChunk, perChunk/tail, tail, zBytes/(rounds*nChunks))
 }
+
+// commandMicros returns the Redis time spent in all commands since the last
+// CONFIG RESETSTAT, except the INFO and CONFIG calls of the measurement.
+func commandMicros(t testing.TB, c redis.UniversalClient) float64 {
+	info, err := c.Info(context.Background(), "commandstats").Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var usec float64
+	for _, l := range strings.Split(info, "\r\n") {
+		name, stats, ok := strings.Cut(l, ":")
+		if !ok || !strings.HasPrefix(name, "cmdstat_") || strings.HasPrefix(name, "cmdstat_info") ||
+			strings.HasPrefix(name, "cmdstat_config") {
+			continue
+		}
+		for _, kv := range strings.Split(stats, ",") {
+			if v, ok := strings.CutPrefix(kv, "usec="); ok {
+				x, _ := strconv.ParseFloat(v, 64)
+				usec += x
+			}
+		}
+	}
+	return usec
+}
+
+// TestEvalCompaction measures the implementation in steady state, as in
+// TestEvalSteadyStateMemory: chunk fill uniform in 1..240 samples, appended
+// one sample per series per call through Store.Append, every series ending
+// now. Each shard is compacted every `every` samples, at a phase of its own,
+// so that the raw tails left at the end are uniform in 0..every-1.
+func TestEvalCompaction(t *testing.T) {
+	c := evalClient(t)
+	ctx := context.Background()
+	const nSeries, rounds = 12000, 240
+	layout := model.Layout{Shards: 256, ChunkRange: 24 * time.Hour.Milliseconds(), Grace: 72 * time.Hour.Milliseconds()}
+	r := rand.New(rand.NewPCG(13, 14))
+	ids := make([]model.SeriesID, nSeries)
+	data := make([][]model.Sample, nSeries)
+	now := time.Now().UnixMilli()
+	n := 0.0
+	for i := range data {
+		ids[i] = model.SeriesID(r.Uint64())
+		start := layout.WindowStart(ids[i], now-time.Hour.Milliseconds())
+		for _, s := range series(gens[i%len(gens)], 1+i%rounds, false, uint64(i+17)) {
+			data[i] = append(data[i], model.Sample{T: start + 1000 + s.T - 1_762_000_000_000, V: s.V})
+		}
+		n += float64(len(data[i]))
+	}
+	fmt.Printf("\nimplementation, steady state (fill uniform in 1..240 samples), whole store\n")
+	for _, every := range []int{0, 40, 20} {
+		flushAll(t, c)
+		base := usedMemory(t, c)
+		st, err := New(ctx, c, Options{Prefix: "ec", Layout: layout, Lease: time.Minute})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var appendUsec, compactUsec float64
+		var res storage.CompactResult
+		for k := range rounds {
+			var batch []storage.SeriesSamples
+			for i, d := range data {
+				if j := k - (rounds - len(d)); j >= 0 {
+					batch = append(batch, storage.SeriesSamples{ID: ids[i], Samples: d[j : j+1]})
+				}
+			}
+			_ = c.ConfigResetStat(ctx).Err()
+			if _, err := st.Append(ctx, batch); err != nil {
+				t.Fatal(err)
+			}
+			appendUsec += commandMicros(t, c)
+			if every == 0 {
+				continue
+			}
+			_ = c.ConfigResetStat(ctx).Err()
+			for shard := range layout.Shards {
+				if (k+1+shard)%every != 0 {
+					continue
+				}
+				c.Del(ctx, st.compactLeaseKey(shard))
+				r, err := st.Compact(ctx, shard, time.Hour)
+				if err != nil {
+					t.Fatal(err)
+				}
+				res.Compacted += r.Compacted
+				res.Changed += r.Changed
+				res.BytesBefore += r.BytesBefore
+				res.BytesAfter += r.BytesAfter
+			}
+			compactUsec += commandMicros(t, c)
+		}
+		used := usedMemory(t, c) - base
+		name := "no compaction"
+		if every > 0 {
+			name = fmt.Sprintf("compaction every %d samples", every)
+		}
+		fmt.Printf("%-30s %5.2f B/sample, Redis time: append %.2f us/sample", name, float64(used)/n, appendUsec/n)
+		if every > 0 {
+			fmt.Printf(", compaction %.2f us/sample (%d compactions, %d changed)", compactUsec/n, res.Compacted, res.Changed)
+		}
+		fmt.Println()
+	}
+}

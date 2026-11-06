@@ -20,7 +20,9 @@ type QuarantinedChunk struct {
 	Shard  int
 	Series model.SeriesID
 	Start  int64 // window start in milliseconds
-	Bytes  int64
+	// Bytes is the size of the chunk and of its compacted part, kept in
+	// <prefix>:{N}:qz:... next to the quarantine key.
+	Bytes int64
 	// Header is the first 16 bytes as stored. In a healthy chunk it is the
 	// fragment: the time the chunk was created in microseconds, from the
 	// shard's hybrid clock.
@@ -78,10 +80,12 @@ func (s *Store) ListQuarantined(ctx context.Context) ([]QuarantinedChunk, error)
 	}
 
 	sizes := make([]*redis.IntCmd, len(out))
+	compactedSizes := make([]*redis.IntCmd, len(out))
 	heads := make([]*redis.StringCmd, len(out))
 	ttls := make([]*redis.DurationCmd, len(out))
 	if err := s.pipelined(ctx, len(out), func(pipe redis.Pipeliner, i int) {
 		sizes[i] = pipe.StrLen(ctx, out[i].Key)
+		compactedSizes[i] = pipe.StrLen(ctx, quarantinedCompactedKey(out[i].Key))
 		heads[i] = pipe.GetRange(ctx, out[i].Key, 0, 15)
 		if i >= nIndexed {
 			ttls[i] = pipe.PTTL(ctx, out[i].Key)
@@ -92,17 +96,17 @@ func (s *Store) ListQuarantined(ctx context.Context) ([]QuarantinedChunk, error)
 	var gone []QuarantinedChunk
 	live := out[:0]
 	for i, c := range out {
-		c.Bytes = sizes[i].Val()
 		c.Header = heads[i].Val()
 		if ttls[i] != nil && ttls[i].Val() > 0 {
 			c.Expires = time.Now().Add(ttls[i].Val())
 		}
-		if c.Bytes == 0 {
+		if sizes[i].Val() == 0 {
 			if i < nIndexed {
 				gone = append(gone, c)
 			}
 			continue
 		}
+		c.Bytes = sizes[i].Val() + compactedSizes[i].Val()
 		live = append(live, c)
 	}
 	if err := s.pipelined(ctx, len(gone), func(pipe redis.Pipeliner, i int) {
@@ -157,8 +161,9 @@ func globEscape(s string) string {
 	return b.String()
 }
 
-// DeleteQuarantined deletes quarantined chunks by key and returns how many
-// existed. Keys that are not quarantine keys of this store are refused.
+// DeleteQuarantined deletes quarantined chunks by key, with their compacted
+// parts, and returns how many existed. Keys that are not quarantine keys of
+// this store are refused.
 func (s *Store) DeleteQuarantined(ctx context.Context, keys []string) (int, error) {
 	shards := make([]int, len(keys))
 	for i, k := range keys {
@@ -171,6 +176,7 @@ func (s *Store) DeleteQuarantined(ctx context.Context, keys []string) (int, erro
 	dels := make([]*redis.IntCmd, len(keys))
 	if err := s.pipelined(ctx, len(keys), func(pipe redis.Pipeliner, i int) {
 		dels[i] = pipe.Del(ctx, keys[i])
+		pipe.Del(ctx, quarantinedCompactedKey(keys[i]))
 		pipe.ZRem(ctx, s.quarantineIndexKey(shards[i]), keys[i])
 	}); err != nil {
 		return 0, err

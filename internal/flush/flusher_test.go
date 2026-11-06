@@ -3,9 +3,12 @@ package flush
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/prometheus/prometheus/model/histogram"
 
 	"github.com/yuuki/xtsdb/internal/model"
 	"github.com/yuuki/xtsdb/internal/storage"
@@ -257,5 +260,84 @@ func TestLaterStateOfIncarnationWins(t *testing.T) {
 		if err != nil || len(got[1]) != 2 || got[1][1].V != 11 {
 			t.Fatalf("%s: got %v %v, want the rewritten value 11", order, got[1], err)
 		}
+	}
+}
+
+// Compaction must not change what is flushed: the same versions, totals,
+// digests and data reach the cold tier with or without it.
+func TestCompactionDoesNotChangeFlushedData(t *testing.T) {
+	ctx := context.Background()
+	layout := model.Layout{Shards: 2, ChunkRange: time.Hour.Milliseconds(), Grace: 10 * time.Minute.Milliseconds()}
+	c := newClock()
+	newTier := func() (*Flusher, *storagetest.Hot, *storagetest.Cold) {
+		hot := storagetest.NewHot(layout, time.Minute)
+		hot.Now = c.Now
+		cold := storagetest.NewCold(layout.ChunkRange)
+		return New(hot, cold, Options{BatchSize: 16, Concurrency: 2, Lease: time.Minute, CompactionInterval: time.Second}), hot, cold
+	}
+	plainF, plainHot, plainCold := newTier()
+	compF, compHot, compCold := newTier()
+	h := &histogram.FloatHistogram{Count: 3, ZeroCount: 3, ZeroThreshold: 0.001, Sum: 1}
+	for round := range 3 {
+		var batch []storage.SeriesSamples
+		for i := range 5 {
+			batch = append(batch, storage.SeriesSamples{ID: model.SeriesID(i * 7919), Samples: []model.Sample{
+				{T: c.ms(0), V: float64(round)},
+				{T: c.ms(-time.Duration(round) * time.Second), V: float64(10 * round)}, // overwrites an earlier sample
+				{T: c.ms(time.Millisecond), H: h},
+			}})
+		}
+		for _, hot := range []*storagetest.Hot{plainHot, compHot} {
+			if _, err := hot.Append(ctx, batch); err != nil {
+				t.Fatal(err)
+			}
+		}
+		compF.CompactOnce(ctx)
+		c.Add(time.Second)
+	}
+	if compHot.CompactionsDone() == 0 {
+		t.Fatal("nothing was compacted")
+	}
+	c.Add(2 * time.Hour)
+	plainF.FlushOnce(ctx)
+	compF.FlushOnce(ctx)
+	if plainHot.Len() != 0 || compHot.Len() != 0 {
+		t.Fatalf("chunks left: %d and %d", plainHot.Len(), compHot.Len())
+	}
+	want, got := plainCold.Chunks(), compCold.Chunks()
+	if len(want) == 0 || !reflect.DeepEqual(got, want) {
+		t.Fatalf("cold chunks differ with compaction:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+func TestRunCompacts(t *testing.T) {
+	layout := model.Layout{Shards: 4, ChunkRange: time.Hour.Milliseconds(), Grace: 10 * time.Minute.Milliseconds()}
+	c := newClock()
+	hot := storagetest.NewHot(layout, time.Minute)
+	hot.Now = c.Now
+	f := New(hot, storagetest.NewCold(layout.ChunkRange), Options{
+		PollInterval: 10 * time.Millisecond, BatchSize: 2, Concurrency: 2, Lease: time.Minute,
+		CompactionInterval: time.Second,
+	})
+	var batch []storage.SeriesSamples
+	for i := range 8 {
+		batch = append(batch, storage.SeriesSamples{ID: model.SeriesID(i * 7919), Samples: []model.Sample{{T: c.ms(0), V: 1}}})
+	}
+	if _, err := hot.Append(context.Background(), batch); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error)
+	go func() { done <- f.Run(ctx) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for hot.CompactionsDone() < 8 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if n := hot.CompactionsDone(); n != 8 {
+		t.Fatalf("%d chunks compacted, want 8", n)
 	}
 }

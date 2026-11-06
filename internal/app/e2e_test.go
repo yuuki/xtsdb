@@ -218,6 +218,11 @@ func testEndToEnd(t *testing.T, redisAddrs []string, backend string) {
 	if !strings.Contains(string(b), `xtsdb_flusher_chunks_total{outcome="flushed"}`) {
 		t.Fatal("flusher metrics missing")
 	}
+	// Every shard is offered for compaction when the flusher starts; these
+	// windows close too soon to be compacted.
+	if !strings.Contains(string(b), `xtsdb_flusher_compaction_chunks_total{outcome="compacted"}`) {
+		t.Fatal("compaction metrics missing")
+	}
 	resp, err = http.Get(base + "/-/ready")
 	if err != nil {
 		t.Fatal(err)
