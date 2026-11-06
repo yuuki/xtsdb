@@ -131,7 +131,10 @@ func testEndToEnd(t *testing.T, redisAddrs []string, backend string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fmt.Fprintf(conn, "servers.web01.load;dc=tokyo 0.75 %d\n", now.Unix())
+	// Stamped when sent, to the millisecond: with a grace period of 1s, a
+	// sample truncated to the second, or stamped before the remote write,
+	// can fall into a window that has already closed.
+	fmt.Fprintf(conn, "servers.web01.load;dc=tokyo 0.75 %.3f\n", float64(time.Now().UnixMilli())/1000)
 	conn.Close()
 
 	query := func(q string) []any {
