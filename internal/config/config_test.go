@@ -116,6 +116,7 @@ func TestValidate(t *testing.T) {
 		"index_buckets":         func(c *Config) { c.Storage.IndexBuckets = 0 },
 		"max_sample_future":     func(c *Config) { c.Ingester.MaxSampleFuture = Duration(72 * time.Hour) },
 		"quarantine_ttl":        func(c *Config) { c.Flusher.QuarantineTTL = Duration(time.Minute) },
+		"compaction_interval":   func(c *Config) { c.Flusher.CompactionInterval = Duration(time.Millisecond) },
 	}
 	for field, mutate := range cases {
 		cfg := Default()

@@ -45,7 +45,10 @@ type HotChunk struct {
 	// Fragment identifies this incarnation of the window. Later
 	// incarnations have larger fragments.
 	Fragment int64
-	Size     int // encoded size when loaded; used to detect later appends
+	Size     int // size of the raw part when loaded; used to detect later appends
+	// CompactedSize is the size of the compacted part when loaded (zero if
+	// the chunk has none).
+	CompactedSize int
 	// Records is the number of samples appended to this incarnation,
 	// including those that were overwritten by a later sample with the same
 	// timestamp. An incarnation only grows, so a larger count means a later
@@ -76,12 +79,56 @@ type Backlog struct {
 	OldestStart       int64 // window start of that chunk in ms; 0 if none
 }
 
+// CompactMargin is how long before its window closes a chunk is left alone
+// by HotStore.Compact: the flusher compresses it soon anyway.
+const CompactMargin = time.Minute
+
+// CompactMinRecords is the number of raw float records (16 bytes each, or
+// their size in histogram records) a chunk needs before HotStore.Compact
+// compacts it. With fewer, creating the compacted part can take more memory
+// than it frees, and the cost of a compaction is spread over few samples.
+const CompactMinRecords = 12
+
+// CompactResult reports what HotStore.Compact did.
+type CompactResult struct {
+	// Skipped means that the shard was compacted less than an interval
+	// ago, by this caller or another one, and nothing was done.
+	Skipped bool
+	// Compacted is the number of chunks whose raw records were moved into
+	// their compacted part.
+	Compacted int
+	// Changed counts chunks that changed between their read and their
+	// compaction (another compaction, a closed window, a new incarnation).
+	// They are compacted next time if they are still open.
+	Changed int
+	// Failed counts chunks that could not be decoded or encoded. They are
+	// left as they are; flushing quarantines undecodable chunks.
+	Failed int
+	// Kept counts chunks left raw because compaction would not help: they
+	// hold native histograms, too many records, or their compacted part
+	// would not be smaller than what it replaces.
+	Kept int
+	// BytesBefore is the size of the raw records and compacted parts that
+	// were replaced, and BytesAfter the size of the new compacted parts.
+	BytesBefore, BytesAfter int64
+}
+
 // HotStore is the in-memory tier. Samples are appended to per-series time
 // windows; once a window closes, flushers claim it, persist it and complete
 // it. A claim is a lease: if the flusher dies, the chunk is claimed again
 // after the lease expires, which gives at-least-once delivery.
+//
+// A chunk holds raw records, appended without reading the chunk, and a
+// compacted part: compaction compresses the raw records of open chunks
+// into it, so that they take less memory until they are flushed.
 type HotStore interface {
 	Append(ctx context.Context, batch []SeriesSamples) (AppendResult, error)
+	// Compact moves the raw records of the open chunks of a shard into their
+	// compacted part, at most once per interval per shard across all
+	// callers. The samples a chunk holds do not change. Chunks whose window
+	// is closed or closes within CompactMargin, and chunks with fewer than
+	// CompactMinRecords raw records, are left alone.
+	Compact(ctx context.Context, shard int, interval time.Duration) (CompactResult, error)
 	Claim(ctx context.Context, shard, limit int) ([]ChunkRef, error)
 	// Load reads claimed chunks. Undecodable chunks are quarantined: moved
 	// out of the way, unless they changed since they were read, so that
