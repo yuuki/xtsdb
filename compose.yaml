@@ -5,7 +5,10 @@
 #   open http://localhost:3000  (Grafana)
 #
 # `docker compose up -d --wait redis cassandra` starts only the backends,
-# which is what `make test-integration` uses.
+# which is what `make test-integration` uses. `docker compose --profile tikv
+# up -d pd tikv` starts a single-node TiKV for the tikv backend, which is
+# what `make test-tikv` uses; it uses the host network (Linux), so that
+# clients on the host reach TiKV at the address it advertises.
 #
 # This is a local development stack: nothing is authenticated, so every
 # port is published on 127.0.0.1 only.
@@ -38,6 +41,23 @@ services:
       timeout: 10s
       retries: 30
       start_period: 60s
+
+  # TiKV for storage.backend: tikv (see deploy/tikv.toml).
+  pd:
+    image: pingcap/pd:v8.5.8
+    profiles: [tikv]
+    network_mode: host
+    command: ["--name=pd", "--data-dir=/data", "--client-urls=http://127.0.0.1:2379", "--peer-urls=http://127.0.0.1:2380"]
+    volumes: ["pd-data:/data"]
+
+  tikv:
+    image: pingcap/tikv:v8.5.8
+    profiles: [tikv]
+    network_mode: host
+    command: ["--pd-endpoints=127.0.0.1:2379", "--addr=127.0.0.1:20160", "--status-addr=127.0.0.1:20180",
+              "--data-dir=/data", "--config=/etc/tikv/tikv.toml"]
+    volumes: ["tikv-data:/data", "./deploy/tikv.toml:/etc/tikv/tikv.toml:ro"]
+    depends_on: [pd]
 
   xtsdb:
     build: .
@@ -78,3 +98,5 @@ services:
 volumes:
   redis-data:
   cassandra-data:
+  pd-data:
+  tikv-data:

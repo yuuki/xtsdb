@@ -615,7 +615,10 @@ func TestGraphiteFlushesWhileDataKeepsFlowing(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	base := time.Now().Unix() - 100
+	// The samples are just before now: their window is open whatever the
+	// time, while 100s back it had closed in about 1% of runs (when a window
+	// boundary fell 60-100s before now, with a grace period of 1m).
+	base := time.Now().Unix() - 15
 	// A line every 200ms: the connection never goes quiet for a full second.
 	for i := range 12 {
 		fmt.Fprintf(conn, "steady %d %d\n", i, base+int64(i))

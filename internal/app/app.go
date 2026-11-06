@@ -9,14 +9,12 @@ import (
 	"net/http"
 	"time"
 
-	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/klauspost/compress/gzhttp"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/yuuki/xtsdb/internal/cassandra"
 	"github.com/yuuki/xtsdb/internal/config"
 	"github.com/yuuki/xtsdb/internal/flush"
 	"github.com/yuuki/xtsdb/internal/hot"
@@ -61,8 +59,10 @@ type App struct {
 	Flusher  *flush.Flusher
 	Hot      *hot.Store
 
-	redis   redis.UniversalClient
-	session *gocql.Session
+	// Persistent is the persistent tier and the index.
+	Persistent *Persistent
+
+	redis redis.UniversalClient
 }
 
 // New connects to the storage backends and builds the components of the
@@ -80,27 +80,17 @@ func New(ctx context.Context, target Target, cfg *config.Config, logger *slog.Lo
 		buildInfo(),
 	)
 
-	layout := Layout(cfg)
 	a.Hot, a.redis, err = OpenHot(ctx, cfg, logger)
 	if err != nil {
 		return nil, err
 	}
 
-	if cfg.Cassandra.AutoMigrate {
-		if err := cassandra.Migrate(ctx, cfg.Cassandra, logger); err != nil {
-			return nil, fmt.Errorf("migrate: %w", err)
-		}
-	}
-	a.session, err = cassandra.NewSession(cfg.Cassandra, logger, true)
+	a.Persistent, err = OpenPersistent(ctx, cfg, logger)
 	if err != nil {
 		return nil, err
 	}
 	retention := cfg.Storage.Retention.D()
-	cold := cassandra.NewChunkStore(a.session, retention, layout.ChunkRange, cfg.Querier.ReadConcurrency, logger)
-	if err := cassandra.CheckLayout(ctx, a.session, cfg.Storage.IndexBuckets, cfg.Storage.ChunkRange.D()); err != nil {
-		return nil, err
-	}
-	index := cassandra.NewIndex(a.session, retention, cfg.Querier.ReadConcurrency, cfg.Storage.IndexBuckets)
+	cold, index := a.Persistent.Cold, a.Persistent.Index
 
 	httpTLS, err := cfg.Server.TLS.Build()
 	if err != nil {
@@ -115,7 +105,7 @@ func New(ctx context.Context, target Target, cfg *config.Config, logger *slog.Lo
 		Ops:         readAuth.Wrap,
 	}, logger.With("component", "http"))
 	a.Server.AddCheck("redis", a.Hot.Ping)
-	a.Server.AddCheck("cassandra", cold.Ping)
+	a.Server.AddCheck(a.Persistent.Backend, cold.Ping)
 	a.Server.Mux.Handle("/", readAuth.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -227,6 +217,7 @@ func OpenHot(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*hot
 		Layout:        Layout(cfg),
 		Lease:         cfg.Flusher.LeaseDuration.D(),
 		QuarantineTTL: cfg.Flusher.QuarantineTTL.D(),
+		Backend:       cfg.Storage.Backend,
 		Logger:        logger.With("component", "redis"),
 	})
 	if err != nil {
@@ -268,9 +259,7 @@ func (a *App) close() {
 	if a.Server != nil {
 		_ = a.Server.Close()
 	}
-	if a.session != nil {
-		a.session.Close()
-	}
+	a.Persistent.Close()
 	if a.redis != nil {
 		_ = a.redis.Close()
 	}

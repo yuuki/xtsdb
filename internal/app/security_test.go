@@ -16,17 +16,19 @@ import (
 	"github.com/klauspost/compress/snappy"
 	"github.com/prometheus/prometheus/prompb"
 
+	"github.com/yuuki/xtsdb/internal/backendtest"
 	"github.com/yuuki/xtsdb/internal/config"
 	"github.com/yuuki/xtsdb/internal/tlstest"
 )
 
 // TestSecurity serves the API over TLS with separate write and read
-// credentials. Set XTSDB_TEST_REDIS_ADDRS and XTSDB_TEST_CASSANDRA_HOSTS.
+// credentials. Set XTSDB_TEST_REDIS_ADDRS and XTSDB_TEST_CASSANDRA_HOSTS or
+// XTSDB_TEST_TIKV_PD; it runs against one persistent backend.
 func TestSecurity(t *testing.T) {
 	redisAddrs := os.Getenv("XTSDB_TEST_REDIS_ADDRS")
-	cassHosts := os.Getenv("XTSDB_TEST_CASSANDRA_HOSTS")
-	if redisAddrs == "" || cassHosts == "" {
-		t.Skip("XTSDB_TEST_REDIS_ADDRS and XTSDB_TEST_CASSANDRA_HOSTS not set")
+	backends := backendtest.Available()
+	if redisAddrs == "" || len(backends) == 0 {
+		t.Skip("XTSDB_TEST_REDIS_ADDRS and XTSDB_TEST_CASSANDRA_HOSTS or XTSDB_TEST_TIKV_PD not set")
 	}
 	f := tlstest.Generate(t, t.TempDir())
 	cfg := config.Default()
@@ -38,16 +40,13 @@ func TestSecurity(t *testing.T) {
 	cfg.Server.Auth.Read.BearerTokens = []string{"read-token"}
 	cfg.Redis.Addrs = strings.Split(redisAddrs, ",")
 	cfg.Redis.ClusterMode = os.Getenv("XTSDB_TEST_REDIS_CLUSTER") == "1"
-	cfg.Cassandra.Hosts = strings.Split(cassHosts, ",")
-	cfg.Cassandra.Keyspace = fmt.Sprintf("xtsec_%d", rand.Uint32())
-	cfg.Cassandra.Consistency = "ONE"
-	cfg.Cassandra.AutoMigrate = true
 	cfg.Storage.KeyPrefix = fmt.Sprintf("xtsec%d", rand.Uint32())
+	backendtest.Configure(t, cfg, backends[0])
 	cfg.Storage.Shards = 4
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { cleanup(t, cfg) })
+	t.Cleanup(func() { cleanupRedis(t, cfg) })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	a, err := New(ctx, TargetAll, cfg, slog.New(slog.DiscardHandler))

@@ -10,7 +10,9 @@ against the failures that a two-tier time series database has to survive.
 3. Be usable from the existing ecosystem (Prometheus, Graphite, Grafana)
    without custom clients.
 4. Keep the tiers behind small interfaces (`internal/storage`) so that other
-   key-value stores can be added.
+   key-value stores can be added. The persistent tier and the index run on
+   Cassandra or TiKV; a conformance suite (`internal/storage/storagetest`)
+   defines the semantics every backend must provide.
 
 ## Components
 
@@ -19,7 +21,9 @@ against the failures that a two-tier time series database has to survive.
 | `internal/model` | Label canonicalization, series IDs, sharding, chunk windows, day buckets. Part of the storage format. |
 | `internal/chunk` | Raw sample records (hot tier), Gorilla/XOR blobs (cold tier), merging and de-duplication. |
 | `internal/hot` | Hot tier on Redis/Valkey: Lua scripts for append, claim, complete. |
+| `internal/storage` | Interfaces of the tiers; `storagetest` holds in-memory stores and the backend conformance tests. |
 | `internal/cassandra` | Cold tier and series index on Cassandra; schema migration. |
+| `internal/tikv` | Cold tier and series index on TiKV (RawKV). |
 | `internal/ingest` | Writer (validation, index, append), Remote Write 1.0/2.0 handler, Graphite server. |
 | `internal/flush` | Flusher: moves closed chunks from the hot to the cold tier. |
 | `internal/query` | Matcher resolution, tier merge, Prometheus HTTP API on the Prometheus PromQL engine. |
@@ -205,7 +209,7 @@ left data in Redis forever.
 | Redis restart / `SCRIPT FLUSH` | Scripts are reloaded automatically. Unflushed data loss is bounded by the Redis persistence settings. |
 | Redis restored from an older snapshot, or failover to a lagging replica | Chunks flushed since the snapshot may be flushed again with less data; they are stored as separate versions and never overwrite the complete one. |
 | Undecodable chunk | Moved to a quarantine key (fenced, see below), logged and counted; it does not block flushing. |
-| Very large chunk | Persisted in parts of at most 100,000 samples and 4 MiB, below Cassandra's mutation limit. A single native histogram is limited to 16,384 buckets (about 130 KB), so every part fits. |
+| Very large chunk | Persisted in parts of at most 100,000 samples and 4 MiB, below Cassandra's mutation limit (TiKV stores parts in segments of 8 KiB). A single native histogram is limited to 16,384 buckets (about 130 KB), so every part fits. |
 | Sample for a closed window | Rejected and counted (`outcome="too_old"`); remote write returns 400. |
 | Redis clock moves backwards | A claimed chunk still rejects appends (the in-flight check). A chunk re-created after completion gets a larger fragment from the shard clock and is stored as a separate version that takes precedence; reads merge versions. |
 | Index write fails | The batch fails with 503 before any sample is stored; the client retries. |
@@ -365,6 +369,91 @@ The transaction costs a few more round trips than a plain write, once per
 series and day. 128-bit series IDs would make collisions practically
 impossible, but would change the storage format.
 
+## Cold tier and index on TiKV
+
+With `storage.backend: tikv`, chunks and the index are stored through the
+RawKV API of TiKV, which keeps keys sorted and splits them into regions by
+itself. Every key starts with `storage.key_prefix` and `:`, then a tag:
+
+```text
+m <name>                                                    -> value       layout (meta)
+c <series> <start> <fragment> <total> <digest> <part> <seg> -> segment     chunks
+s <series>                                                  -> expiry, labels  series
+p <hash(name, value)> <day> <name> <value> <series>         -> 0x01        postings
+v <hash(name)> <day> <name> <value>                         -> 0x01        label values
+n <day> <name>                                              -> 0x01        label names
+```
+
+Integers are fixed-width big-endian, signed ones with the sign bit flipped,
+so keys sort like the numbers. Strings are prefixed with their length, so a
+key is unambiguous whatever bytes a label holds (NUL included) and a lookup
+is an exact prefix scan. The longest key, with labels of the maximum length
+(2048 bytes), stays below TiKV's 8 KiB key limit. The 16-bit hash in front
+of the day of postings and label values places the entries of a new day
+next to those of the same label on earlier days, all over the key space: at
+midnight UTC every active series writes postings for the new day, which
+would otherwise all go to one new range, and so to one region.
+
+**Chunks.** The chunks of a series are one contiguous range ordered by window
+start and then by version in the order of precedence (`fragment`, `total`,
+`digest` as a signed value), the same order as the clustering order in
+Cassandra. A read for `[mint, maxt]` is one range scan per series over the
+window starts in `[mint - chunk_range, maxt]`; no day partitioning is
+needed. A part is split into segments of at most 8 KiB; most parts fit in
+one. Each segment value holds the encoding, the number of segments of the
+part, `max_t`, the sample count and a checksum of the whole blob of the
+part, then its slice of the blob. A part is used only if all its segments
+are present, agree on the header and match the checksum: a part that is
+being written, or whose write failed half way and was not retried yet, is
+skipped (logged at debug level; the hot tier still holds its samples), and
+segments of different writes are never mixed (logged as a warning). Segments beyond the count of
+segment 0 are left over from an earlier write of the part in more segments
+(by a build that encoded it differently) and are ignored until they expire.
+Small values keep every request within TiKV's response limit
+(`server.max-grpc-send-msg-len`, 10 MiB by default): reads take as many
+entries at a time as fit in 8 MiB if every one were as large as allowed
+(about 1000 segments; 2048 or more index entries; about 30 label sets for
+`SeriesLabels`, whose entries can be 260 KB in the worst case). Within a
+build, writes are idempotent: the same part always produces the same keys
+and values.
+
+**Retention.** Entries carry RawKV TTLs with the rules of the Cassandra
+backend: chunks expire `storage.retention` after their last sample, index
+entries of a day two days after the samples of that day, series entries two
+days after their last write, and entries that are already expired are not
+written. TiKV must run with `storage.api-version = 1` and
+`storage.enable-ttl = true` (`tikv.api_version: v1ttl`, the default), where a
+compaction filter drops expired entries, or with `api-version = 2`. API v2
+keeps versions of every entry and drops expired ones only below the GC safe
+point, which TiDB in the same cluster or a RawKV GC worker advances; on a
+cluster with neither, expired data is never removed from disk.
+
+**Collision detection.** A series entry holds the labels and the time until
+which it owns its ID (retention plus two days after it was written). It is
+claimed with `CompareAndSwap(key, absent -> entry)`. If an entry already
+exists, it decides: the same labels are recorded again; other labels that
+still own the ID are a collision, handled as with Cassandra; an entry whose
+time has passed is taken over with a compare-and-swap on its exact value.
+An entry of the same labels that expires within an hour is also refreshed
+with a compare-and-swap, so that it cannot expire and be claimed by other
+labels in between. Compare-and-swap cannot set a TTL, so the entry is then
+written again with one. Reads and claims go by the time in the entry, not
+by the TTL: an entry whose TTL write failed (a timeout or a crash between
+the two writes) still expires, and the TTL only frees the space.
+Compare-and-swap needs the atomic mode of RawKV, so xtsdb uses it for every
+write: TiKV is linearizable for a key only if all its writers agree on the
+mode.
+
+**Layout.** `format` and `chunk_range_ms` are recorded under meta keys with
+compare-and-swap on first start, and xtsdb refuses to start with a different
+`storage.chunk_range`. With a retention, xtsdb also writes an entry with a
+TTL at startup, so that a cluster without TTLs is reported then rather than
+by every write. The Redis meta records `storage.backend`, so that a
+deployment does not switch backends and split its series between two
+stores. `storage.index_buckets` does not apply: a label pair
+shared by a million series is a range of a million keys, which TiKV spreads
+over regions; a lookup reads it in pages of up to 10,240 keys.
+
 ## Read path
 
 1. **Bound the range.** Queries are clamped to `storage.retention` (or
@@ -396,7 +485,8 @@ Cassandra read started. Reading both tiers concurrently (as an earlier
 version of v2 did) loses chunks that are persisted after the Cassandra read
 and deleted before the Redis read. With Cassandra replication, the read and
 write consistency levels must overlap (`LOCAL_QUORUM`, the default) for the
-same argument to hold.
+same argument to hold. TiKV needs no setting: RawKV reads are served by the
+leader of a region and see every write that was acknowledged before.
 
 Redis is read for at least `querier.hot_lookback` and, using the oldest due
 time in the `due` and `infdue` sets (refreshed every 10 seconds), back to the

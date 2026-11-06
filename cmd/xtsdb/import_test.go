@@ -12,44 +12,41 @@ import (
 	"time"
 
 	"github.com/prometheus/prometheus/model/labels"
+	yaml "go.yaml.in/yaml/v4"
 
-	"github.com/yuuki/xtsdb/internal/cassandra"
+	"github.com/yuuki/xtsdb/internal/app"
+	"github.com/yuuki/xtsdb/internal/backendtest"
 	"github.com/yuuki/xtsdb/internal/config"
 	"github.com/yuuki/xtsdb/internal/model"
 )
 
-// TestImportCommand imports OpenMetrics files into Cassandra, then resumes
-// with a state file. It needs XTSDB_TEST_CASSANDRA_HOSTS.
+// TestImportCommand imports OpenMetrics files into each available
+// persistent backend, then resumes with a state file. It needs
+// XTSDB_TEST_CASSANDRA_HOSTS or XTSDB_TEST_TIKV_PD.
 func TestImportCommand(t *testing.T) {
-	hosts := os.Getenv("XTSDB_TEST_CASSANDRA_HOSTS")
-	if hosts == "" {
-		t.Skip("XTSDB_TEST_CASSANDRA_HOSTS not set")
+	backends := backendtest.Available()
+	if len(backends) == 0 {
+		t.Skip("XTSDB_TEST_CASSANDRA_HOSTS or XTSDB_TEST_TIKV_PD not set")
 	}
+	for _, b := range backends {
+		t.Run(b, func(t *testing.T) { testImportCommand(t, b) })
+	}
+}
+
+func testImportCommand(t *testing.T, backend string) {
 	dir := t.TempDir()
-	keyspace := fmt.Sprintf("xtimport_%d", rand.Uint32())
+	cfg := config.Default()
+	cfg.Storage.KeyPrefix = fmt.Sprintf("xtimport%d", rand.Uint32())
+	cfg.Storage.Retention = config.Duration(30 * 24 * time.Hour)
+	backendtest.Configure(t, cfg, backend)
+	b, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	cfgFile := filepath.Join(dir, "xtsdb.yaml")
-	err := os.WriteFile(cfgFile, []byte(fmt.Sprintf(`
-cassandra:
-  hosts: [%s]
-  keyspace: %s
-  consistency: ONE
-  auto_migrate: true
-storage:
-  retention: 30d
-`, hosts, keyspace)), 0o600)
-	if err != nil {
+	if err := os.WriteFile(cfgFile, b, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(cfgFile, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if s, err := cassandra.NewSession(cfg.Cassandra, nil, false); err == nil {
-			_ = s.Query("DROP KEYSPACE IF EXISTS " + keyspace).Exec()
-			s.Close()
-		}
-	})
 
 	start := time.Now().Add(-72 * time.Hour).Truncate(time.Hour)
 	files := make([]string, 2)
@@ -86,19 +83,18 @@ storage:
 		t.Fatalf("everything must be skipped, got %q", out)
 	}
 
-	s, err := cassandra.NewSession(cfg.Cassandra, nil, true)
+	p, err := app.OpenPersistent(context.Background(), cfg, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer p.Close()
 	lset := labels.FromStrings("__name__", "backfilled", "part", "x")
 	id := model.ID(lset)
-	cold := cassandra.NewChunkStore(s, cfg.Storage.Retention.D(), cfg.Storage.ChunkRange.D().Milliseconds(), 8, nil)
-	got, err := cold.Read(context.Background(), []model.SeriesID{id}, start.UnixMilli(), time.Now().UnixMilli())
+	got, err := p.Cold.Read(context.Background(), []model.SeriesID{id}, start.UnixMilli(), time.Now().UnixMilli())
 	if err != nil || len(got[id]) != 4320 {
 		t.Fatalf("read %d samples, want 4320 (%v)", len(got[id]), err)
 	}
-	index := cassandra.NewIndex(s, cfg.Storage.Retention.D(), 8, cfg.Storage.IndexBuckets)
+	index := p.Index
 	for _, day := range model.Days(start.UnixMilli(), start.Add(72*time.Hour-time.Minute).UnixMilli()) {
 		if ids, err := index.Postings(context.Background(), day, "part", "x"); err != nil || len(ids) != 1 {
 			t.Fatalf("day %d not indexed: %v %v", day, ids, err)

@@ -12,7 +12,6 @@ import (
 
 	"github.com/yuuki/xtsdb/internal/app"
 	"github.com/yuuki/xtsdb/internal/backfill"
-	"github.com/yuuki/xtsdb/internal/cassandra"
 	"github.com/yuuki/xtsdb/internal/config"
 )
 
@@ -23,7 +22,7 @@ type importOptions struct {
 	maxBuffered int
 }
 
-// runImport imports historical data directly into Cassandra.
+// runImport imports historical data directly into the persistent tier.
 func runImport(ctx context.Context, cfg *config.Config, logger *slog.Logger, opts importOptions, paths []string, stdout io.Writer) error {
 	if opts.format != "tsdb" && opts.format != "openmetrics" {
 		return fmt.Errorf("unknown format %q (tsdb or openmetrics)", opts.format)
@@ -31,26 +30,14 @@ func runImport(ctx context.Context, cfg *config.Config, logger *slog.Logger, opt
 	if opts.concurrency < 1 {
 		return fmt.Errorf("-concurrency must be positive")
 	}
-	if cfg.Cassandra.AutoMigrate {
-		if err := cassandra.Migrate(ctx, cfg.Cassandra, logger); err != nil {
-			return fmt.Errorf("migrate: %w", err)
-		}
-	}
-	session, err := cassandra.NewSession(cfg.Cassandra, logger, true)
+	p, err := app.OpenPersistent(ctx, cfg, logger)
 	if err != nil {
 		return err
 	}
-	defer session.Close()
-	if err := cassandra.CheckLayout(ctx, session, cfg.Storage.IndexBuckets, cfg.Storage.ChunkRange.D()); err != nil {
-		return err
-	}
-	retention := cfg.Storage.Retention.D()
-	layout := app.Layout(cfg)
-	im, err := backfill.New(
-		cassandra.NewChunkStore(session, retention, layout.ChunkRange, cfg.Querier.ReadConcurrency, logger),
-		cassandra.NewIndex(session, retention, cfg.Querier.ReadConcurrency, cfg.Storage.IndexBuckets),
-		backfill.Options{Layout: layout, Retention: retention, MaxFuture: cfg.Ingester.MaxSampleFuture.D(), Logger: logger},
-	)
+	defer p.Close()
+	im, err := backfill.New(p.Cold, p.Index, backfill.Options{
+		Layout: app.Layout(cfg), Retention: cfg.Storage.Retention.D(), MaxFuture: cfg.Ingester.MaxSampleFuture.D(), Logger: logger,
+	})
 	if err != nil {
 		return err
 	}

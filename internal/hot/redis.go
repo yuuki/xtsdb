@@ -92,7 +92,12 @@ type Options struct {
 	// QuarantineTTL is how long undecodable chunks are kept for inspection;
 	// zero keeps them until they are deleted.
 	QuarantineTTL time.Duration
-	Logger        *slog.Logger
+	// Backend is the persistent backend (storage.backend) that chunks are
+	// flushed to. It is recorded like the layout, so that a deployment does
+	// not switch backends and split its series between two stores. Empty
+	// skips the check.
+	Backend string
+	Logger  *slog.Logger
 }
 
 // Store is a storage.HotStore backed by Redis.
@@ -103,6 +108,7 @@ type Store struct {
 	lease         time.Duration
 	maxChunkBytes int
 	quarantineTTL time.Duration
+	backend       string
 	logger        *slog.Logger
 }
 
@@ -124,6 +130,7 @@ func New(ctx context.Context, client redis.UniversalClient, opts Options) (*Stor
 		lease:         opts.Lease,
 		maxChunkBytes: opts.MaxChunkBytes,
 		quarantineTTL: opts.QuarantineTTL,
+		backend:       opts.Backend,
 		logger:        opts.Logger,
 	}
 	if err := client.Ping(ctx).Err(); err != nil {
@@ -141,7 +148,8 @@ func New(ctx context.Context, client redis.UniversalClient, opts Options) (*Stor
 
 // checkLayout records the layout on first use and refuses to run with a
 // different one: changing the shard count or the chunk range would make
-// existing chunks unreachable.
+// existing chunks unreachable, and changing the persistent backend would
+// leave the series flushed so far, and their index, in the other one.
 //
 // Once the layout is recorded this only reads, so that a flusher can start
 // while Redis is out of memory: flushing is what frees it.
@@ -150,6 +158,9 @@ func (s *Store) checkLayout(ctx context.Context) error {
 	fields := []struct{ name, value, option string }{
 		{"shards", strconv.Itoa(s.layout.Shards), "storage.shards"},
 		{"chunk_range_ms", strconv.FormatInt(s.layout.ChunkRange, 10), "storage.chunk_range"},
+	}
+	if s.backend != "" {
+		fields = append(fields, struct{ name, value, option string }{"backend", s.backend, "storage.backend"})
 	}
 	for _, f := range fields {
 		got, err := s.client.HGet(ctx, key, f.name).Result()

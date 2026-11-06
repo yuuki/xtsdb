@@ -235,14 +235,26 @@ type coldKey struct {
 type Cold struct {
 	mu         sync.Mutex
 	ChunkRange int64
-	chunks     map[coldKey]storage.ColdChunk
+	// Retention drops writes of chunks whose last sample is older than
+	// this, as the real backends do; zero keeps every chunk. Stored chunks
+	// never expire.
+	Retention time.Duration
+	Now       func() time.Time
+	chunks    map[coldKey]storage.ColdChunk
 	// FailWrites makes WriteChunk fail, to simulate an outage.
 	FailWrites error
 }
 
 // NewCold creates a Cold store.
 func NewCold(chunkRange int64) *Cold {
-	return &Cold{ChunkRange: chunkRange, chunks: make(map[coldKey]storage.ColdChunk)}
+	return &Cold{ChunkRange: chunkRange, Now: time.Now, chunks: make(map[coldKey]storage.ColdChunk)}
+}
+
+// expired reports whether data that must be kept until keepUntil would
+// already have expired, with the one-second resolution of the TTLs of the
+// real backends.
+func expired(retention time.Duration, keepUntil, now time.Time) bool {
+	return retention > 0 && keepUntil.Sub(now) < time.Second
 }
 
 var _ storage.ColdStore = (*Cold)(nil)
@@ -253,6 +265,9 @@ func (c *Cold) WriteChunk(_ context.Context, ch storage.ColdChunk) error {
 	defer c.mu.Unlock()
 	if c.FailWrites != nil {
 		return c.FailWrites
+	}
+	if expired(c.Retention, time.UnixMilli(ch.MaxT).Add(c.Retention), c.Now()) {
+		return nil
 	}
 	c.chunks[coldKey{ch.Series, ch.Start, ch.Fragment, ch.Total, ch.Digest, ch.Part}] = ch
 	return nil
@@ -289,7 +304,9 @@ func (c *Cold) Read(_ context.Context, ids []model.SeriesID, mint, maxt int64) (
 			cur     *coldKey
 		)
 		for _, k := range keys {
-			if k.series != id || k.start > maxt || k.start+c.ChunkRange <= mint {
+			// The window [start, start+ChunkRange) must overlap [mint, maxt],
+			// without overflowing at the extremes.
+			if k.series != id || k.start > maxt || (k.start < mint && uint64(mint)-uint64(k.start) >= uint64(c.ChunkRange)) {
 				continue
 			}
 			if cur != nil && (cur.start != k.start || cur.fragment != k.fragment || cur.total != k.total || cur.digest != k.digest) {
@@ -333,11 +350,17 @@ type Index struct {
 	Writes int
 	// FailWrites makes writes fail, to simulate an outage.
 	FailWrites error
+	// Retention drops writes for days whose samples have expired, as the
+	// real backends do (see storage.IndexSlack); zero keeps every entry.
+	// Stored entries never expire.
+	Retention time.Duration
+	Now       func() time.Time
 }
 
 // NewIndex creates an Index.
 func NewIndex() *Index {
 	return &Index{
+		Now:      time.Now,
 		series:   make(map[model.SeriesID]labels.Labels),
 		postings: make(map[posting]map[model.SeriesID]struct{}),
 		values:   make(map[posting]struct{}),
@@ -350,12 +373,20 @@ var (
 	_ storage.IndexReader = (*Index)(nil)
 )
 
+func (x *Index) expired(day int32) bool {
+	end := time.UnixMilli((int64(day) + 1) * model.DayMillis)
+	return expired(x.Retention, end.Add(x.Retention+storage.IndexSlack), x.Now())
+}
+
 // WriteSeries implements storage.IndexWriter.
 func (x *Index) WriteSeries(_ context.Context, day int32, id model.SeriesID, lset labels.Labels) error {
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	if x.FailWrites != nil {
 		return x.FailWrites
+	}
+	if x.expired(day) {
+		return nil
 	}
 	if old, ok := x.series[id]; ok && !labels.Equal(old, lset) {
 		return &storage.SeriesCollisionError{ID: id, Labels: lset, Existing: old}
@@ -379,6 +410,9 @@ func (x *Index) WriteLabelValue(_ context.Context, day int32, name, value string
 	if x.FailWrites != nil {
 		return x.FailWrites
 	}
+	if x.expired(day) {
+		return nil
+	}
 	x.Writes++
 	x.values[posting{day, name, value}] = struct{}{}
 	return nil
@@ -390,6 +424,9 @@ func (x *Index) WriteLabelName(_ context.Context, day int32, name string) error 
 	defer x.mu.Unlock()
 	if x.FailWrites != nil {
 		return x.FailWrites
+	}
+	if x.expired(day) {
+		return nil
 	}
 	x.Writes++
 	x.names[posting{day: day, name: name}] = struct{}{}

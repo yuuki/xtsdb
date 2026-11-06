@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	yaml "go.yaml.in/yaml/v4"
 )
 
 func TestDefaultIsValid(t *testing.T) {
@@ -17,6 +19,7 @@ func TestDefaultIsValid(t *testing.T) {
 
 func TestLoadExampleConfig(t *testing.T) {
 	t.Setenv("XTSDB_CASSANDRA_HOSTS", "c1:9042, c2:9042")
+	t.Setenv("XTSDB_TIKV_PD_ENDPOINTS", "pd-0:2379")
 	cfg, err := Load(filepath.Join("..", "..", "examples", "xtsdb.yaml"), true)
 	if err != nil {
 		t.Fatal(err)
@@ -29,7 +32,10 @@ func TestLoadExampleConfig(t *testing.T) {
 	}
 	// The example documents the defaults; only fields marked "example" differ.
 	def := Default()
-	cfg.Redis.Addrs, cfg.Cassandra.Hosts = def.Redis.Addrs, def.Cassandra.Hosts
+	if len(cfg.TiKV.PDEndpoints) != 1 || cfg.TiKV.PDEndpoints[0] != "pd-0:2379" {
+		t.Fatalf("env lists not expanded: %v", cfg.TiKV.PDEndpoints)
+	}
+	cfg.Redis.Addrs, cfg.Cassandra.Hosts, cfg.TiKV.PDEndpoints = def.Redis.Addrs, def.Cassandra.Hosts, def.TiKV.PDEndpoints
 	cfg.Cassandra.AutoMigrate = def.Cassandra.AutoMigrate
 	cfg.Ingester.GraphiteListenAddress = def.Ingester.GraphiteListenAddress
 	if got, want := fmt.Sprintf("%+v", cfg), fmt.Sprintf("%+v", def); got != want {
@@ -118,5 +124,76 @@ func TestValidate(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), field) {
 			t.Errorf("%s: expected validation error, got %v", field, err)
 		}
+	}
+}
+
+func TestTiKVConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.yaml")
+	err := os.WriteFile(path, []byte(`
+storage:
+  backend: tikv
+tikv:
+  pd_endpoints: [pd-0:2379, pd-1:2379]
+  api_version: v2
+  keyspace: metrics
+cassandra:
+  hosts: []   # not used with the tikv backend
+`), 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Storage.Backend != BackendTiKV || len(cfg.TiKV.PDEndpoints) != 2 || cfg.TiKV.APIVersion != "v2" {
+		t.Fatalf("unexpected config %+v", cfg.TiKV)
+	}
+	for _, c := range []struct {
+		edit func(*Config)
+		want string
+	}{
+		{func(c *Config) { c.Storage.Backend = "hbase" }, "storage.backend"},
+		{func(c *Config) { c.TiKV.PDEndpoints = nil }, "tikv.pd_endpoints"},
+		{func(c *Config) { c.TiKV.APIVersion = "v1" }, "tikv.api_version"},
+		{func(c *Config) { c.TiKV.APIVersion = "v1ttl" }, "tikv.keyspace"},
+		{func(c *Config) { c.TiKV.APIVersion = "" }, "tikv.api_version"},
+		{func(c *Config) { c.TiKV.Timeout = 0 }, "tikv.timeout"},
+		{func(c *Config) { c.TiKV.TLS = TLSConfig{Enabled: true} }, "tikv.tls.ca_file"},
+		{func(c *Config) { c.TiKV.TLS = TLSConfig{Enabled: true, CAFile: "ca"} }, "tikv.tls.cert_file"},
+		{func(c *Config) { c.TiKV.TLS = TLSConfig{Enabled: true, CAFile: "ca", CertFile: "c"} }, "tikv.tls.key_file"},
+		{func(c *Config) {
+			c.TiKV.TLS = TLSConfig{Enabled: true, CAFile: "ca", CertFile: "c", KeyFile: "k", InsecureSkipVerify: true}
+		}, "not supported"},
+		{func(c *Config) { c.Storage.KeyPrefix = strings.Repeat("x", 65) }, "storage.key_prefix"},
+	} {
+		bad := *cfg
+		c.edit(&bad)
+		if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("expected an error about %s, got %v", c.want, err)
+		}
+	}
+	// The Cassandra settings are checked only with the cassandra backend.
+	cfg.Storage.Backend = BackendCassandra
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "cassandra.hosts") {
+		t.Fatalf("expected an error about cassandra.hosts, got %v", err)
+	}
+}
+
+// The output of xtsdb config is a valid configuration file.
+func TestMarshalRoundTrip(t *testing.T) {
+	cfg := Default()
+	cfg.Storage.Backend = BackendTiKV
+	cfg.TiKV.Keyspace = "metrics"
+	b, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := &Config{}
+	if err := Parse(b, got); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprintf("%+v", got) != fmt.Sprintf("%+v", cfg) {
+		t.Fatalf("round trip changed the configuration:\n%s", b)
 	}
 }

@@ -20,6 +20,7 @@ type Config struct {
 	Log       LogConfig       `yaml:"log"`
 	Redis     RedisConfig     `yaml:"redis"`
 	Cassandra CassandraConfig `yaml:"cassandra"`
+	TiKV      TiKVConfig      `yaml:"tikv"`
 	Storage   StorageConfig   `yaml:"storage"`
 	Ingester  IngesterConfig  `yaml:"ingester"`
 	Flusher   FlusherConfig   `yaml:"flusher"`
@@ -151,11 +152,44 @@ type CassandraConfig struct {
 	Datacenters       map[string]int `yaml:"datacenters"`
 }
 
+// TiKVConfig configures the persistent tier and the series index on the
+// RawKV API of TiKV (storage.backend: tikv).
+type TiKVConfig struct {
+	// PDEndpoints are the addresses of the PD servers of the cluster.
+	PDEndpoints []string `yaml:"pd_endpoints"`
+	// APIVersion is the RawKV API of the cluster: v1ttl (TiKV
+	// storage.api-version = 1 with storage.enable-ttl = true) or v2
+	// (api-version = 2). With v2, TiKV removes expired entries only below
+	// the GC safe point, which TiDB or a RawKV GC worker must advance.
+	APIVersion string `yaml:"api_version"`
+	// Keyspace is the API v2 keyspace; empty means the default keyspace.
+	Keyspace string `yaml:"keyspace"`
+	// Timeout bounds each request, retries included.
+	Timeout        Duration `yaml:"timeout"`
+	ConnectTimeout Duration `yaml:"connect_timeout"`
+	// TLS uses the same files for PD and TiKV. ca_file, cert_file and
+	// key_file are required (the PD client uses TLS only with a client
+	// certificate); server_name and insecure_skip_verify are not supported.
+	TLS TLSConfig `yaml:"tls"`
+}
+
+// Storage backends of the persistent tier and the index.
+const (
+	BackendCassandra = "cassandra"
+	BackendTiKV      = "tikv"
+)
+
 // StorageConfig holds settings that define the on-storage layout. Changing
-// key_prefix, shards, chunk_range or index_buckets on an existing deployment
-// orphans the data written with the previous values, so xtsdb refuses to
-// start when shards, chunk_range or index_buckets change.
+// backend, key_prefix, shards, chunk_range or index_buckets on an existing
+// deployment orphans the data written with the previous values, so xtsdb
+// refuses to start when backend, shards, chunk_range or index_buckets
+// change.
 type StorageConfig struct {
+	// Backend is the store of the persistent tier and the index: cassandra
+	// or tikv.
+	Backend string `yaml:"backend"`
+	// KeyPrefix starts every key in Redis and, with the tikv backend, in
+	// TiKV.
 	KeyPrefix   string   `yaml:"key_prefix"`
 	Shards      int      `yaml:"shards"`
 	ChunkRange  Duration `yaml:"chunk_range"`
@@ -163,6 +197,7 @@ type StorageConfig struct {
 	Retention   Duration `yaml:"retention"`
 	// IndexBuckets is the number of Cassandra partitions per day over which
 	// the series of a label pair, and the values of a label, are spread.
+	// TiKV splits large ranges by itself and ignores it.
 	IndexBuckets int `yaml:"index_buckets"`
 }
 
@@ -232,7 +267,14 @@ func Default() *Config {
 			ReplicationClass:  "SimpleStrategy",
 			ReplicationFactor: 1,
 		},
+		TiKV: TiKVConfig{
+			PDEndpoints:    []string{"127.0.0.1:2379"},
+			APIVersion:     "v1ttl",
+			Timeout:        Duration(10 * time.Second),
+			ConnectTimeout: Duration(10 * time.Second),
+		},
 		Storage: StorageConfig{
+			Backend:      BackendCassandra,
 			KeyPrefix:    "xt",
 			Shards:       256,
 			ChunkRange:   Duration(time.Hour),
@@ -350,6 +392,33 @@ func validKeyspace(s string) bool {
 	return true
 }
 
+func (c TiKVConfig) validate() []error {
+	var errs []error
+	check := func(ok bool, format string, args ...any) {
+		if !ok {
+			errs = append(errs, fmt.Errorf(format, args...))
+		}
+	}
+	check(len(c.PDEndpoints) > 0 && !slices.Contains(c.PDEndpoints, ""), "tikv.pd_endpoints must contain non-empty addresses")
+	switch c.APIVersion {
+	case "v2":
+	case "v1ttl":
+		check(c.Keyspace == "", "tikv.keyspace requires tikv.api_version v2")
+	default:
+		errs = append(errs, fmt.Errorf("tikv.api_version must be v2 or v1ttl"))
+	}
+	check(c.Timeout.D() > 0, "tikv.timeout must be positive")
+	check(c.ConnectTimeout.D() > 0, "tikv.connect_timeout must be positive")
+	if c.TLS.Enabled {
+		// The PD client uses TLS only with a client certificate.
+		check(c.TLS.CAFile != "" && c.TLS.CertFile != "" && c.TLS.KeyFile != "",
+			"tikv.tls.ca_file, tikv.tls.cert_file and tikv.tls.key_file are required when TLS is enabled")
+		check(c.TLS.ServerName == "" && !c.TLS.InsecureSkipVerify,
+			"tikv.tls.server_name and tikv.tls.insecure_skip_verify are not supported")
+	}
+	return errs
+}
+
 // Validate checks the configuration for values that would make xtsdb
 // misbehave and returns a descriptive error for the first one found.
 func (c *Config) Validate() error {
@@ -377,13 +446,21 @@ func (c *Config) Validate() error {
 	check(len(c.Redis.Addrs) > 0 && !slices.Contains(c.Redis.Addrs, ""), "redis.addrs must contain non-empty addresses")
 	check(c.Redis.PoolSize >= 0, "redis.pool_size must not be negative")
 	check(c.Redis.DB >= 0, "redis.db must not be negative")
-	check(len(c.Cassandra.Hosts) > 0 && !slices.Contains(c.Cassandra.Hosts, ""), "cassandra.hosts must contain non-empty hosts")
-	check(validKeyspace(c.Cassandra.Keyspace), "cassandra.keyspace must be 1-48 letters, digits or underscores, starting with a letter")
-	check(slices.Contains(consistencyLevels, strings.ToUpper(c.Cassandra.Consistency)),
-		"cassandra.consistency must be one of %s", strings.Join(consistencyLevels, ", "))
-	check(c.Cassandra.NumConns >= 0, "cassandra.num_conns must not be negative")
-	check(c.Cassandra.ReplicationClass == "SimpleStrategy" || c.Cassandra.ReplicationClass == "NetworkTopologyStrategy",
-		"cassandra.replication_class must be SimpleStrategy or NetworkTopologyStrategy")
+	switch c.Storage.Backend {
+	case BackendCassandra:
+		check(len(c.Cassandra.Hosts) > 0 && !slices.Contains(c.Cassandra.Hosts, ""), "cassandra.hosts must contain non-empty hosts")
+		check(validKeyspace(c.Cassandra.Keyspace), "cassandra.keyspace must be 1-48 letters, digits or underscores, starting with a letter")
+		check(slices.Contains(consistencyLevels, strings.ToUpper(c.Cassandra.Consistency)),
+			"cassandra.consistency must be one of %s", strings.Join(consistencyLevels, ", "))
+		check(c.Cassandra.NumConns >= 0, "cassandra.num_conns must not be negative")
+		check(c.Cassandra.ReplicationClass == "SimpleStrategy" || c.Cassandra.ReplicationClass == "NetworkTopologyStrategy",
+			"cassandra.replication_class must be SimpleStrategy or NetworkTopologyStrategy")
+	case BackendTiKV:
+		errs = append(errs, c.TiKV.validate()...)
+		check(len(c.Storage.KeyPrefix) <= 64, "storage.key_prefix must be at most 64 bytes with the tikv backend")
+	default:
+		errs = append(errs, fmt.Errorf("storage.backend must be %s or %s", BackendCassandra, BackendTiKV))
+	}
 	check(c.Storage.KeyPrefix != "" && !strings.ContainsAny(c.Storage.KeyPrefix, "{}: "),
 		"storage.key_prefix must be non-empty and must not contain '{', '}', ':' or spaces")
 	check(c.Storage.Shards > 0 && c.Storage.Shards <= 16384, "storage.shards must be in [1, 16384]")

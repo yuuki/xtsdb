@@ -1,0 +1,22 @@
+# TiKV settings for storage.backend: tikv, used by compose.yaml (profile
+# tikv) and CI. xtsdb needs RawKV entries with TTLs: API v1 with TTLs
+# enabled (tikv.api_version: v1ttl, the default), or API v2
+# (api-version = 2, tikv.api_version: v2), which removes expired entries
+# from disk only below the GC safe point. These settings cannot be changed
+# once the cluster holds data.
+[storage]
+api-version = 1
+enable-ttl = true
+# A single development node: no disk space reserved, a small cache.
+reserve-space = "0MB"
+
+[storage.block-cache]
+capacity = "512MB"
+
+# TiKV refuses to start unless the open file limit exceeds the sum of these
+# plus 1000 (with the defaults of 40960, more than many hosts allow).
+[rocksdb]
+max-open-files = 4096
+
+[raftdb]
+max-open-files = 4096

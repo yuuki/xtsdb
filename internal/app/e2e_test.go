@@ -24,33 +24,44 @@ import (
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/redis/go-redis/v9"
 
-	"github.com/yuuki/xtsdb/internal/cassandra"
+	"github.com/yuuki/xtsdb/internal/backendtest"
 	"github.com/yuuki/xtsdb/internal/config"
 )
 
-// TestEndToEnd runs all roles in one process against real Redis and
-// Cassandra. Set XTSDB_TEST_REDIS_ADDRS and XTSDB_TEST_CASSANDRA_HOSTS.
+// TestEndToEnd runs all roles in one process against real Redis and every
+// persistent backend available (see backendtest.Available). Set
+// XTSDB_TEST_REDIS_ADDRS and XTSDB_TEST_CASSANDRA_HOSTS or
+// XTSDB_TEST_TIKV_PD.
 //
 // It writes samples once and never again, then checks that they stay
-// queryable while they move from Redis to Cassandra and after Redis no
-// longer holds them.
+// queryable while they move from Redis to the persistent tier and after
+// Redis no longer holds them.
 func TestEndToEnd(t *testing.T) {
+	forEachBackend(t, testEndToEnd)
+}
+
+// forEachBackend runs a test against Redis and each available persistent
+// backend.
+func forEachBackend(t *testing.T, test func(t *testing.T, redisAddrs []string, backend string)) {
 	redisAddrs := os.Getenv("XTSDB_TEST_REDIS_ADDRS")
-	cassHosts := os.Getenv("XTSDB_TEST_CASSANDRA_HOSTS")
-	if redisAddrs == "" || cassHosts == "" {
-		t.Skip("XTSDB_TEST_REDIS_ADDRS and XTSDB_TEST_CASSANDRA_HOSTS not set")
+	backends := backendtest.Available()
+	if redisAddrs == "" || len(backends) == 0 {
+		t.Skip("XTSDB_TEST_REDIS_ADDRS and XTSDB_TEST_CASSANDRA_HOSTS or XTSDB_TEST_TIKV_PD not set")
 	}
+	for _, b := range backends {
+		t.Run(b, func(t *testing.T) { test(t, strings.Split(redisAddrs, ","), b) })
+	}
+}
+
+func testEndToEnd(t *testing.T, redisAddrs []string, backend string) {
 	cfg := config.Default()
 	cfg.Log.Level = "warn"
 	cfg.Server.HTTPListenAddress = "127.0.0.1:0"
 	cfg.Server.GracefulShutdownTimeout = config.Duration(5 * time.Second)
-	cfg.Redis.Addrs = strings.Split(redisAddrs, ",")
+	cfg.Redis.Addrs = redisAddrs
 	cfg.Redis.ClusterMode = os.Getenv("XTSDB_TEST_REDIS_CLUSTER") == "1"
-	cfg.Cassandra.Hosts = strings.Split(cassHosts, ",")
-	cfg.Cassandra.Keyspace = fmt.Sprintf("xte2e_%d", rand.Uint32())
-	cfg.Cassandra.Consistency = "ONE"
-	cfg.Cassandra.AutoMigrate = true
 	cfg.Storage.KeyPrefix = fmt.Sprintf("xte2e%d", rand.Uint32())
+	backendtest.Configure(t, cfg, backend)
 	cfg.Storage.Shards = 16
 	cfg.Storage.ChunkRange = config.Duration(2 * time.Second)
 	cfg.Storage.GracePeriod = config.Duration(time.Second)
@@ -87,7 +98,7 @@ func TestEndToEnd(t *testing.T) {
 		return runErr
 	}
 	// Cleanups run in reverse order: stop the app before dropping its data.
-	t.Cleanup(func() { cleanup(t, cfg) })
+	t.Cleanup(func() { cleanupRedis(t, cfg) })
 	t.Cleanup(func() { _ = stop() })
 	base := "http://" + a.Server.Addr().String()
 
@@ -171,7 +182,7 @@ func TestEndToEnd(t *testing.T) {
 	}
 
 	// The windows close a few seconds later; the flusher must move them.
-	waitFor(t, "flush to cassandra", func() bool {
+	waitFor(t, "flush to "+backend, func() bool {
 		b, err := a.Hot.Backlog(context.Background())
 		return err == nil && b.PendingChunks == 0 && b.InflightChunks == 0
 	})
@@ -233,13 +244,8 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
-func cleanup(t *testing.T, cfg *config.Config) {
+func cleanupRedis(t *testing.T, cfg *config.Config) {
 	ctx := context.Background()
-	s, err := cassandra.NewSession(cfg.Cassandra, nil, false)
-	if err == nil {
-		_ = s.Query("DROP KEYSPACE IF EXISTS " + cfg.Cassandra.Keyspace).ExecContext(ctx)
-		s.Close()
-	}
 	client := redis.NewUniversalClient(&redis.UniversalOptions{Addrs: cfg.Redis.Addrs, IsClusterMode: cfg.Redis.ClusterMode})
 	defer client.Close()
 	del := func(ctx context.Context, c *redis.Client) error {
@@ -249,6 +255,7 @@ func cleanup(t *testing.T, cfg *config.Config) {
 		}
 		return iter.Err()
 	}
+	var err error
 	if cc, ok := client.(*redis.ClusterClient); ok {
 		err = cc.ForEachMaster(ctx, del)
 	} else {
