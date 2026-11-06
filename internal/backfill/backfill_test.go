@@ -3,6 +3,7 @@ package backfill
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -210,7 +211,11 @@ func writeBlock(t *testing.T, dir string, series map[string][]model.Sample, dele
 	var entries []entry
 	symbols := map[string]struct{}{}
 	mint, maxt := int64(math.MaxInt64), int64(math.MinInt64)
-	for name, samples := range series {
+	// The index requires chunk references in the order series are added
+	// (sorted by labels), so chunks are written in that order too: all
+	// series share the labels except __name__.
+	for _, name := range slices.Sorted(maps.Keys(series)) {
+		samples := series[name]
 		lset := labels.FromStrings("__name__", name, "job", "prom")
 		lset.Range(func(l labels.Label) { symbols[l.Name], symbols[l.Value] = struct{}{}, struct{}{} })
 		var metas []chunks.Meta
