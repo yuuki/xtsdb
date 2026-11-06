@@ -152,12 +152,13 @@ func New(ctx context.Context, target Target, cfg *config.Config, logger *slog.Lo
 
 	if target.runs(TargetFlusher) {
 		a.Flusher = flush.New(a.Hot, cold, flush.Options{
-			PollInterval: cfg.Flusher.PollInterval.D(),
-			BatchSize:    cfg.Flusher.BatchSize,
-			Concurrency:  cfg.Flusher.Concurrency,
-			Lease:        cfg.Flusher.LeaseDuration.D(),
-			Registerer:   a.Registry,
-			Logger:       logger,
+			PollInterval:       cfg.Flusher.PollInterval.D(),
+			BatchSize:          cfg.Flusher.BatchSize,
+			Concurrency:        cfg.Flusher.Concurrency,
+			Lease:              cfg.Flusher.LeaseDuration.D(),
+			CompactionInterval: cfg.Flusher.CompactionInterval.D(),
+			Registerer:         a.Registry,
+			Logger:             logger,
 		})
 	}
 

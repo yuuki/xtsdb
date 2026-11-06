@@ -1,9 +1,11 @@
 // Package chunk implements the sample encodings used by the two tiers.
 //
-// The hot tier stores a chunk as a fixed header followed by raw records
-// appended in arrival order, which lets Redis append without reading. A
-// float sample is one 16-byte record; a native histogram is a 16-byte record
-// followed by its encoding, padded to a multiple of 16 bytes.
+// The hot tier stores a chunk in two parts. The raw part is a fixed header
+// followed by raw records appended in arrival order, which lets Redis append
+// without reading. A float sample is one 16-byte record; a native histogram
+// is a 16-byte record followed by its encoding, padded to a multiple of 16
+// bytes. The compacted part holds the float samples that compaction moved
+// out of the raw part, XOR-encoded like the cold tier.
 // The cold tier stores sorted, de-duplicated samples compressed with the
 // Gorilla XOR encoding from the Prometheus TSDB, and native histograms with
 // its float histogram encoding.
@@ -84,30 +86,123 @@ func AppendRaw(dst []byte, samples []model.Sample) []byte {
 	return dst
 }
 
-// DecodeHot decodes a hot chunk value. It returns the fragment, the samples
-// sorted by time with duplicates resolved in favour of the latest write, and
-// the number of records the chunk holds (including overwritten samples).
-func DecodeHot(b []byte) (fragment int64, samples []model.Sample, records int, err error) {
-	if len(b) < HeaderLen || (len(b)-HeaderLen)%RecordLen != 0 {
-		return 0, nil, 0, fmt.Errorf("%w: length %d", ErrCorrupt, len(b))
+// DecodeHot decodes a hot chunk: its raw part and its compacted part (nil or
+// empty if it has none). It returns the fragment, the samples sorted by time
+// with duplicates resolved in favour of the latest write, and the number of
+// records appended to the chunk (including overwritten samples).
+//
+// Compaction moves the oldest raw records into the compacted part, so the
+// raw records were written after every sample of the compacted part and win
+// over it.
+func DecodeHot(raw, compacted []byte) (fragment int64, samples []model.Sample, records int, err error) {
+	if len(raw) < HeaderLen || (len(raw)-HeaderLen)%RecordLen != 0 {
+		return 0, nil, 0, fmt.Errorf("%w: length %d", ErrCorrupt, len(raw))
 	}
-	// Only 16 ASCII digits: the fragment is re-rendered that way to fence
-	// completion, so any other spelling could never be completed.
-	for _, c := range b[:HeaderLen] {
-		if c < '0' || c > '9' {
-			return 0, nil, 0, fmt.Errorf("%w: header %q", ErrCorrupt, b[:HeaderLen])
-		}
-	}
-	fragment, err = strconv.ParseInt(string(b[:HeaderLen]), 10, 64)
+	fragment, err = parseHeader(raw)
 	if err != nil {
-		return 0, nil, 0, fmt.Errorf("%w: header: %w", ErrCorrupt, err)
+		return 0, nil, 0, err
 	}
-	samples, err = DecodeRaw(b[HeaderLen:])
+	samples, err = DecodeRaw(raw[HeaderLen:])
 	if err != nil {
 		return 0, nil, 0, err
 	}
 	records = len(samples)
+	if len(compacted) > 0 {
+		if len(compacted) < HeaderLen || string(compacted[:HeaderLen]) != string(raw[:HeaderLen]) {
+			return 0, nil, 0, fmt.Errorf("%w: compacted part of another incarnation", ErrCorrupt)
+		}
+		folded, n, err := DecodeCompacted(compacted)
+		if err != nil {
+			return 0, nil, 0, err
+		}
+		samples = append(folded, samples...)
+		records += n
+	}
 	return fragment, Normalize(samples), records, nil
+}
+
+// parseHeader parses the fragment at the start of a hot chunk part.
+func parseHeader(b []byte) (int64, error) {
+	// Only 16 ASCII digits: the fragment is re-rendered that way to fence
+	// completion, so any other spelling could never be completed.
+	for _, c := range b[:HeaderLen] {
+		if c < '0' || c > '9' {
+			return 0, fmt.Errorf("%w: header %q", ErrCorrupt, b[:HeaderLen])
+		}
+	}
+	fragment, err := strconv.ParseInt(string(b[:HeaderLen]), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%w: header: %w", ErrCorrupt, err)
+	}
+	return fragment, nil
+}
+
+// maxCompactedRecords bounds the record count of a compacted part, so that
+// it and the records of the raw part still fit the 32-bit total of the cold
+// tier.
+const maxCompactedRecords = 1 << 30
+
+// EncodeCompacted returns the compacted part of a hot chunk:
+//
+//	header    the 16-byte header of the raw part, which identifies the incarnation
+//	records   uvarint, the number of raw records folded into it, overwritten ones included
+//	encoding  one byte, EncodingXOR
+//	data      the samples, as EncodeXOR writes them
+//
+// samples must be sorted, de-duplicated floats. Native histograms are not
+// compacted: their decoding from chunks loses the counter reset hints they
+// were written with, and gauge histograms can grow when re-encoded.
+func EncodeCompacted(header []byte, records int, samples []model.Sample) ([]byte, error) {
+	if len(header) != HeaderLen {
+		return nil, fmt.Errorf("header of %d bytes", len(header))
+	}
+	if records < len(samples) || records > maxCompactedRecords {
+		return nil, fmt.Errorf("%d records for %d samples", records, len(samples))
+	}
+	if slices.ContainsFunc(samples, model.Sample.IsHistogram) {
+		return nil, errors.New("native histograms cannot be compacted")
+	}
+	data, err := EncodeXOR(samples)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 0, HeaderLen+binary.MaxVarintLen64+1+len(data))
+	out = append(out, header...)
+	out = binary.AppendUvarint(out, uint64(records))
+	out = append(out, byte(EncodingXOR))
+	return append(out, data...), nil
+}
+
+// DecodeCompacted decodes the compacted part of a hot chunk. It returns its
+// samples, sorted and de-duplicated, and the number of raw records folded
+// into it.
+func DecodeCompacted(b []byte) ([]model.Sample, int, error) {
+	if len(b) < HeaderLen {
+		return nil, 0, fmt.Errorf("%w: compacted part of %d bytes", ErrCorrupt, len(b))
+	}
+	if _, err := parseHeader(b); err != nil {
+		return nil, 0, err
+	}
+	records, n := binary.Uvarint(b[HeaderLen:])
+	if n <= 0 || records > maxCompactedRecords || len(b) < HeaderLen+n+1 {
+		return nil, 0, fmt.Errorf("%w: compacted part header", ErrCorrupt)
+	}
+	b = b[HeaderLen+n:]
+	if Encoding(b[0]) != EncodingXOR {
+		return nil, 0, fmt.Errorf("%w: compacted part with encoding %d", ErrCorrupt, b[0])
+	}
+	// Stop as soon as the samples outnumber the records, so that corrupt
+	// data cannot make decoding allocate much more than it claims.
+	samples, err := decodeXOR(b[1:], int(records))
+	if err != nil {
+		return nil, 0, err
+	}
+	for i := 1; i < len(samples); i++ {
+		if samples[i].T <= samples[i-1].T {
+			return nil, 0, fmt.Errorf("%w: compacted samples out of order at %d", ErrCorrupt, samples[i].T)
+		}
+	}
+	return samples, int(records), nil
 }
 
 // DecodeRaw decodes raw records without sorting them.

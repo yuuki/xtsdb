@@ -57,6 +57,23 @@ key prefix. Versions before 2.0.0 were not released.
   macOS builds without cgo (the release binaries) do not include it (#10).
 - `storage.backend` is recorded in Redis, and xtsdb refuses to start when it
   changes (#10).
+- Compaction of open chunks in Redis: every `flusher.compaction_interval`
+  (10 minutes by default; 0 disables it), flushers compress the raw float
+  samples of open chunks into a compacted part, XOR-encoded like the
+  persistent tier. Redis holds about 9 bytes per sample instead of 29
+  (steady state, generated data at a 15 s interval, Redis 7.0), for about
+  22% more CPU time of the Redis main thread; the append path does not
+  change. Chunks with fewer than 12 raw samples or with native histograms,
+  and chunks that would not get smaller, are left as they are. Metrics
+  `xtsdb_flusher_compaction_chunks_total`,
+  `xtsdb_flusher_compaction_input_bytes_total`,
+  `xtsdb_flusher_compaction_output_bytes_total` and
+  `xtsdb_flusher_compaction_duration_seconds`. A chunk now has a second key
+  (`<prefix>:{N}:z:<series>:<window>`) that builds without compaction do not
+  know: stop every process of an earlier build before starting this one.
+  [docs/hot-compression.md](docs/hot-compression.md) records the evaluation
+  behind the design; encoding at append time with `BITFIELD` is tracked in
+  #15.
 
 ### Changed
 

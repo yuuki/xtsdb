@@ -20,6 +20,15 @@ type hotChunk struct {
 	fragment int64
 	raw      []model.Sample
 	due      int64
+	// compacted holds the samples compaction moved out of raw, sorted, and
+	// compactedRecords the number of raw records they came from.
+	compacted        []model.Sample
+	compactedRecords int
+}
+
+// samples returns the samples of a chunk sorted, the latest write winning.
+func (c *hotChunk) samples() []model.Sample {
+	return chunk.Normalize(append(slices.Clone(c.compacted), c.raw...))
 }
 
 // Hot is an in-memory storage.HotStore.
@@ -29,21 +38,39 @@ type Hot struct {
 	Lease    time.Duration
 	Now      func() time.Time
 	MaxChunk int // maximum samples per chunk; 0 means unlimited
-	chunks   map[storage.ChunkRef]*hotChunk
-	inflight map[storage.ChunkRef]int64
-	seq      int64
+	// CompactMinRecords is the number of raw records a chunk needs to be
+	// compacted: storage.CompactMinRecords unless a test lowers it.
+	CompactMinRecords int
+	chunks            map[storage.ChunkRef]*hotChunk
+	inflight          map[storage.ChunkRef]int64
+	leases            map[int]int64 // compaction lease expiry per shard
+	compactions       int
+	seq               int64
 }
 
 func size(c *hotChunk) int { return 16 + 16*len(c.raw) }
 
+// compactedSize stands for the size of the compacted part, which fences
+// compare once the window has closed and compaction no longer runs. It grows
+// with every compaction; a real compacted part may keep its size when the
+// records it folds only overwrite samples, which those fences never see.
+func compactedSize(c *hotChunk) int {
+	if c.compactedRecords == 0 {
+		return 0
+	}
+	return 16 + c.compactedRecords
+}
+
 // NewHot creates a Hot store.
 func NewHot(layout model.Layout, lease time.Duration) *Hot {
 	return &Hot{
-		Layout:   layout,
-		Lease:    lease,
-		Now:      time.Now,
-		chunks:   make(map[storage.ChunkRef]*hotChunk),
-		inflight: make(map[storage.ChunkRef]int64),
+		Layout:            layout,
+		Lease:             lease,
+		Now:               time.Now,
+		CompactMinRecords: storage.CompactMinRecords,
+		chunks:            make(map[storage.ChunkRef]*hotChunk),
+		inflight:          make(map[storage.ChunkRef]int64),
+		leases:            make(map[int]int64),
 	}
 }
 
@@ -86,6 +113,52 @@ func (h *Hot) Append(_ context.Context, batch []storage.SeriesSamples) (storage.
 	return res, nil
 }
 
+// Compact implements storage.HotStore.
+func (h *Hot) Compact(_ context.Context, shard int, interval time.Duration) (storage.CompactResult, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var res storage.CompactResult
+	now := h.now()
+	if h.leases[shard] > now {
+		res.Skipped = true
+		return res, nil
+	}
+	h.leases[shard] = now + interval.Milliseconds()
+	for ref, c := range h.chunks {
+		if ref.Shard != shard || len(c.raw) == 0 || len(c.raw) < h.CompactMinRecords ||
+			c.due <= now+storage.CompactMargin.Milliseconds() {
+			continue
+		}
+		// Chunks with native histograms are not compacted.
+		if slices.ContainsFunc(c.raw, model.Sample.IsHistogram) || slices.ContainsFunc(c.compacted, model.Sample.IsHistogram) {
+			continue
+		}
+		// As in Redis, a chunk holds at most twice the records of a full raw
+		// part: compaction stops beyond that.
+		if h.MaxChunk > 0 && c.compactedRecords+len(c.raw) > h.MaxChunk {
+			continue
+		}
+		if _, busy := h.inflight[ref]; busy {
+			continue
+		}
+		res.BytesBefore += int64(size(c) - 16 + compactedSize(c))
+		c.compacted = c.samples()
+		c.compactedRecords += len(c.raw)
+		c.raw = nil
+		res.BytesAfter += int64(compactedSize(c))
+		res.Compacted++
+	}
+	h.compactions += res.Compacted
+	return res, nil
+}
+
+// CompactionsDone returns the number of chunks compacted so far.
+func (h *Hot) CompactionsDone() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.compactions
+}
+
 // Claim implements storage.HotStore.
 func (h *Hot) Claim(_ context.Context, shard, limit int) ([]storage.ChunkRef, error) {
 	h.mu.Lock()
@@ -119,8 +192,8 @@ func (h *Hot) Load(_ context.Context, refs []storage.ChunkRef) (storage.LoadResu
 			continue
 		}
 		res.Chunks = append(res.Chunks, storage.HotChunk{
-			Ref: ref, Fragment: c.fragment, Size: size(c), Records: len(c.raw),
-			Samples: chunk.Normalize(slices.Clone(c.raw)),
+			Ref: ref, Fragment: c.fragment, Size: size(c), CompactedSize: compactedSize(c),
+			Records: c.compactedRecords + len(c.raw), Samples: c.samples(),
 		})
 	}
 	return res, nil
@@ -131,7 +204,8 @@ func (h *Hot) Complete(_ context.Context, chunks []storage.HotChunk) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for _, hc := range chunks {
-		if c := h.chunks[hc.Ref]; c != nil && c.fragment == hc.Fragment && size(c) == hc.Size {
+		if c := h.chunks[hc.Ref]; c != nil && c.fragment == hc.Fragment && size(c) == hc.Size &&
+			compactedSize(c) == hc.CompactedSize {
 			delete(h.chunks, hc.Ref)
 			delete(h.inflight, hc.Ref)
 		}
@@ -175,7 +249,7 @@ func (h *Hot) Read(_ context.Context, ids []model.SeriesID, mint, maxt int64) (m
 		for _, w := range h.Layout.Windows(id, mint, maxt) {
 			ref := storage.ChunkRef{Shard: h.Layout.Shard(id), Series: id, Start: w}
 			if c := h.chunks[ref]; c != nil {
-				all = append(all, c.raw...)
+				all = append(all, c.samples()...)
 			}
 		}
 		if s := chunk.Filter(chunk.Normalize(all), mint, maxt); len(s) > 0 {
@@ -271,6 +345,21 @@ func (c *Cold) WriteChunk(_ context.Context, ch storage.ColdChunk) error {
 	}
 	c.chunks[coldKey{ch.Series, ch.Start, ch.Fragment, ch.Total, ch.Digest, ch.Part}] = ch
 	return nil
+}
+
+// Chunks returns the chunks stored, in key order.
+func (c *Cold) Chunks() []storage.ColdChunk {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]storage.ColdChunk, 0, len(c.chunks))
+	for _, ch := range c.chunks {
+		out = append(out, ch)
+	}
+	slices.SortFunc(out, func(a, b storage.ColdChunk) int {
+		return cmp.Or(cmp.Compare(a.Series, b.Series), cmp.Compare(a.Start, b.Start), cmp.Compare(a.Fragment, b.Fragment),
+			cmp.Compare(a.Total, b.Total), cmp.Compare(a.Digest, b.Digest), cmp.Compare(a.Part, b.Part))
+	})
+	return out
 }
 
 // Len returns the number of chunks stored.

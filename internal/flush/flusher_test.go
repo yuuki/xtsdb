@@ -3,9 +3,14 @@ package flush
 import (
 	"context"
 	"errors"
+	"math"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 
 	"github.com/yuuki/xtsdb/internal/model"
 	"github.com/yuuki/xtsdb/internal/storage"
@@ -257,5 +262,163 @@ func TestLaterStateOfIncarnationWins(t *testing.T) {
 		if err != nil || len(got[1]) != 2 || got[1][1].V != 11 {
 			t.Fatalf("%s: got %v %v, want the rewritten value 11", order, got[1], err)
 		}
+	}
+}
+
+// Compaction must not change what is flushed: the same versions, totals,
+// digests and data reach the cold tier with or without it.
+func TestCompactionDoesNotChangeFlushedData(t *testing.T) {
+	ctx := context.Background()
+	layout := model.Layout{Shards: 2, ChunkRange: time.Hour.Milliseconds(), Grace: 10 * time.Minute.Milliseconds()}
+	c := newClock()
+	newTier := func() (*Flusher, *storagetest.Hot, *storagetest.Cold) {
+		hot := storagetest.NewHot(layout, time.Minute)
+		hot.Now = c.Now
+		hot.CompactMinRecords = 1
+		cold := storagetest.NewCold(layout.ChunkRange)
+		return New(hot, cold, Options{BatchSize: 16, Concurrency: 2, Lease: time.Minute, CompactionInterval: time.Second}), hot, cold
+	}
+	plainF, plainHot, plainCold := newTier()
+	compF, compHot, compCold := newTier()
+	for round := range 3 {
+		var batch []storage.SeriesSamples
+		for i := range 5 {
+			batch = append(batch, storage.SeriesSamples{ID: spreadID(i), Samples: []model.Sample{
+				{T: c.ms(0), V: float64(round)},
+				{T: c.ms(-time.Duration(round) * time.Second), V: float64(10 * round)}, // overwrites an earlier sample
+				{T: c.ms(time.Millisecond), V: math.NaN()},
+			}})
+		}
+		for _, hot := range []*storagetest.Hot{plainHot, compHot} {
+			if _, err := hot.Append(ctx, batch); err != nil {
+				t.Fatal(err)
+			}
+		}
+		compF.CompactOnce(ctx)
+		c.Add(time.Second)
+	}
+	if compHot.CompactionsDone() == 0 {
+		t.Fatal("nothing was compacted")
+	}
+	c.Add(2 * time.Hour)
+	plainF.FlushOnce(ctx)
+	compF.FlushOnce(ctx)
+	if plainHot.Len() != 0 || compHot.Len() != 0 {
+		t.Fatalf("chunks left: %d and %d", plainHot.Len(), compHot.Len())
+	}
+	want, got := plainCold.Chunks(), compCold.Chunks()
+	if len(want) == 0 || !reflect.DeepEqual(got, want) {
+		t.Fatalf("cold chunks differ with compaction:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+// spreadID returns series IDs that fall into different shards (the shard
+// comes from the high 32 bits of the ID).
+func spreadID(i int) model.SeriesID { return model.SeriesID(uint64(i)<<32 | uint64(i)*7919) }
+
+// countingHot records the compactions the flusher asks for.
+type countingHot struct {
+	*storagetest.Hot
+	mu      sync.Mutex
+	offered map[int]int
+	ran     map[int]int
+}
+
+func (h *countingHot) Compact(ctx context.Context, shard int, interval time.Duration) (storage.CompactResult, error) {
+	res, err := h.Hot.Compact(ctx, shard, interval)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.offered[shard]++
+	if !res.Skipped {
+		h.ran[shard]++
+	}
+	return res, err
+}
+
+// Run compacts every shard, about once per interval: shards are offered
+// often, and the lease of the store lets one compaction per interval run.
+func TestRunCompactsOncePerInterval(t *testing.T) {
+	layout := model.Layout{Shards: 4, ChunkRange: time.Hour.Milliseconds(), Grace: 10 * time.Minute.Milliseconds()}
+	hot := &countingHot{Hot: storagetest.NewHot(layout, time.Minute), offered: map[int]int{}, ran: map[int]int{}}
+	hot.CompactMinRecords = 1
+	const interval = 300 * time.Millisecond
+	f := New(hot, storagetest.NewCold(layout.ChunkRange), Options{
+		PollInterval: time.Hour, // does not slow down compaction
+		BatchSize:    2, Concurrency: 2, Lease: time.Minute, CompactionInterval: interval,
+	})
+	var batch []storage.SeriesSamples
+	for i := range 8 {
+		batch = append(batch, storage.SeriesSamples{ID: spreadID(i), Samples: []model.Sample{{T: time.Now().UnixMilli(), V: 1}}})
+	}
+	if _, err := hot.Append(context.Background(), batch); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error)
+	start := time.Now()
+	go func() { done <- f.Run(ctx) }()
+	time.Sleep(1050 * time.Millisecond)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	if n := hot.CompactionsDone(); n != 8 {
+		t.Fatalf("%d chunks compacted, want 8", n)
+	}
+	hot.mu.Lock()
+	defer hot.mu.Unlock()
+	for shard := range layout.Shards {
+		// The lease allows one compaction at the start and one per interval
+		// after it.
+		most := 1 + int(elapsed/interval)
+		if r := hot.ran[shard]; r < 2 || r > most {
+			t.Errorf("shard %d compacted %d times in %v, want 2 to %d", shard, r, elapsed, most)
+		}
+		if o := hot.offered[shard]; o < 3*most {
+			t.Errorf("shard %d offered %d times, want about ten per interval", shard, o)
+		}
+	}
+}
+
+func metricValue(t *testing.T, m prometheus.Metric) *dto.Metric {
+	t.Helper()
+	var out dto.Metric
+	if err := m.Write(&out); err != nil {
+		t.Fatal(err)
+	}
+	return &out
+}
+
+func TestCompactionMetrics(t *testing.T) {
+	layout := model.Layout{Shards: 4, ChunkRange: time.Hour.Milliseconds(), Grace: 10 * time.Minute.Milliseconds()}
+	c := newClock()
+	hot := storagetest.NewHot(layout, time.Minute)
+	hot.Now = c.Now
+	hot.CompactMinRecords = 1
+	reg := prometheus.NewRegistry()
+	f := New(hot, storagetest.NewCold(layout.ChunkRange), Options{
+		BatchSize: 2, Concurrency: 2, Lease: time.Minute, CompactionInterval: time.Minute, Registerer: reg,
+	})
+	var batch []storage.SeriesSamples
+	for i := range 6 {
+		batch = append(batch, storage.SeriesSamples{ID: spreadID(i), Samples: []model.Sample{{T: c.ms(0), V: 1}, {T: c.ms(time.Second), V: 2}}})
+	}
+	if _, err := hot.Append(context.Background(), batch); err != nil {
+		t.Fatal(err)
+	}
+	f.CompactOnce(context.Background())
+	f.CompactOnce(context.Background()) // within the interval: skipped
+	if got := metricValue(t, f.compactions.WithLabelValues("compacted")).GetCounter().GetValue(); got != 6 {
+		t.Fatalf("compacted chunks = %v, want 6", got)
+	}
+	in := metricValue(t, f.compactInBytes).GetCounter().GetValue()
+	out := metricValue(t, f.compactOutBytes).GetCounter().GetValue()
+	if in != 6*2*16 || out <= 0 {
+		t.Fatalf("bytes in %v, out %v", in, out)
+	}
+	// One observation per shard that was compacted, not for skipped ones.
+	if n := metricValue(t, f.compactShardTime).GetHistogram().GetSampleCount(); n != uint64(layout.Shards) {
+		t.Fatalf("%d duration observations, want %d", n, layout.Shards)
 	}
 }

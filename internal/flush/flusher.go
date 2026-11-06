@@ -1,10 +1,14 @@
 // Package flush moves closed chunks from the hot tier to the persistent
-// tier.
+// tier, and compacts open chunks in the hot tier.
 //
 // The hand-off is at-least-once: a chunk is deleted from the hot tier only
 // after it has been written to the cold tier, and a chunk claimed by a
 // flusher that dies is claimed again once its lease expires. Cold writes
 // are idempotent, so a chunk written twice is stored once.
+//
+// Compaction compresses the raw records of open chunks in place, so that
+// they take less memory until they are flushed. It does not change the
+// samples of a chunk, nor what is flushed.
 package flush
 
 import (
@@ -31,9 +35,12 @@ type Options struct {
 	Concurrency  int
 	// Lease bounds how long a batch may take; after it the chunks are
 	// handed to another flusher anyway.
-	Lease      time.Duration
-	Registerer prometheus.Registerer
-	Logger     *slog.Logger
+	Lease time.Duration
+	// CompactionInterval is how often each shard is compacted, across all
+	// flushers; zero disables compaction.
+	CompactionInterval time.Duration
+	Registerer         prometheus.Registerer
+	Logger             *slog.Logger
 }
 
 // Flusher persists closed hot chunks.
@@ -51,6 +58,11 @@ type Flusher struct {
 	inflight    prometheus.Gauge
 	quarantined prometheus.Gauge
 	lagSeconds  prometheus.Gauge
+
+	compactions      *prometheus.CounterVec
+	compactInBytes   prometheus.Counter
+	compactOutBytes  prometheus.Counter
+	compactShardTime prometheus.Histogram
 }
 
 // New creates a Flusher.
@@ -98,6 +110,24 @@ func New(hot storage.HotStore, cold storage.ColdStore, opts Options) *Flusher {
 			Name: "xtsdb_flusher_lag_seconds",
 			Help: "How long the oldest closed chunk (pending or in flight) has been waiting to be flushed.",
 		}),
+		compactions: reg.NewCounterVec(prometheus.CounterOpts{
+			Name: "xtsdb_flusher_compaction_chunks_total",
+			Help: "Open hot chunks processed by compaction, by outcome (compacted; kept: left raw because compaction would not help; changed: retried at the next compaction; failed: undecodable).",
+		}, []string{"outcome"}),
+		compactInBytes: reg.NewCounter(prometheus.CounterOpts{
+			Name: "xtsdb_flusher_compaction_input_bytes_total",
+			Help: "Bytes of raw records and earlier compacted parts replaced by compaction.",
+		}),
+		compactOutBytes: reg.NewCounter(prometheus.CounterOpts{
+			Name: "xtsdb_flusher_compaction_output_bytes_total",
+			Help: "Bytes of compacted parts written by compaction.",
+		}),
+		compactShardTime: reg.NewHistogram(prometheus.HistogramOpts{
+			Name:                        "xtsdb_flusher_compaction_duration_seconds",
+			Help:                        "Time to compact the open chunks of one shard.",
+			Buckets:                     prometheus.DefBuckets,
+			NativeHistogramBucketFactor: 1.1,
+		}),
 	}
 }
 
@@ -113,10 +143,14 @@ func (f *Flusher) Run(ctx context.Context) error {
 		})
 	}
 	wg.Go(func() { f.reportBacklog(ctx) })
+	if f.opts.CompactionInterval > 0 {
+		wg.Go(func() { f.compactLoop(ctx) })
+	}
 
 	ticker := time.NewTicker(f.opts.PollInterval)
 	defer ticker.Stop()
-	f.log.Info("flusher started", "shards", f.hot.Shards(), "concurrency", f.opts.Concurrency)
+	f.log.Info("flusher started", "shards", f.hot.Shards(), "concurrency", f.opts.Concurrency,
+		"compaction_interval", f.opts.CompactionInterval)
 dispatch:
 	for {
 		// Visit shards in random order so that several flushers spread out.
@@ -157,6 +191,72 @@ func (f *Flusher) flushShard(ctx context.Context, shard int) {
 		if done := f.flushBatch(ctx, refs); done == 0 || len(refs) < f.opts.BatchSize {
 			return
 		}
+	}
+}
+
+// compactLoop offers every shard for compaction regularly. The hot tier
+// compacts a shard at most once per interval across all flushers, so the
+// shards are offered ten times per interval, in random order, to compact
+// each of them soon after its interval has passed.
+func (f *Flusher) compactLoop(ctx context.Context) {
+	tick := max(f.opts.CompactionInterval/10, 10*time.Millisecond)
+	shards := make(chan int)
+	var wg sync.WaitGroup
+	for range f.opts.Concurrency {
+		wg.Go(func() {
+			for shard := range shards {
+				f.compactShard(ctx, shard)
+			}
+		})
+	}
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+offer:
+	for {
+		for _, shard := range rand.Perm(f.hot.Shards()) {
+			select {
+			case shards <- shard:
+			case <-ctx.Done():
+				break offer
+			}
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			break offer
+		}
+	}
+	close(shards)
+	wg.Wait()
+}
+
+// compactShard compacts the open chunks of a shard, unless it was compacted
+// less than an interval ago.
+func (f *Flusher) compactShard(ctx context.Context, shard int) {
+	start := time.Now()
+	res, err := f.hot.Compact(ctx, shard, f.opts.CompactionInterval)
+	if err != nil && ctx.Err() == nil {
+		f.log.Warn("compaction failed; the shard is compacted again after the interval", "shard", shard, "err", err)
+	}
+	if res.Skipped {
+		return
+	}
+	f.compactions.WithLabelValues("compacted").Add(float64(res.Compacted))
+	f.compactions.WithLabelValues("kept").Add(float64(res.Kept))
+	f.compactions.WithLabelValues("changed").Add(float64(res.Changed))
+	f.compactions.WithLabelValues("failed").Add(float64(res.Failed))
+	f.compactInBytes.Add(float64(res.BytesBefore))
+	f.compactOutBytes.Add(float64(res.BytesAfter))
+	if err == nil {
+		f.compactShardTime.Observe(time.Since(start).Seconds())
+	}
+}
+
+// CompactOnce offers every shard for compaction once. It is intended for
+// tests and tools; production code uses Run.
+func (f *Flusher) CompactOnce(ctx context.Context) {
+	for shard := range f.hot.Shards() {
+		f.compactShard(ctx, shard)
 	}
 }
 

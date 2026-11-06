@@ -4,18 +4,22 @@
 // Key layout for shard N (all keys of a shard share the hash tag {N}):
 //
 //	<prefix>:{N}:c:<series>:<window>  chunk: 16-byte header + raw samples
+//	<prefix>:{N}:z:<series>:<window>  compacted part of the chunk
 //	<prefix>:{N}:due                  sorted set: chunk member -> due time
 //	<prefix>:{N}:inf                  sorted set: chunk member -> lease expiry
 //	<prefix>:{N}:infdue               sorted set: in-flight member -> due time
 //	<prefix>:{N}:clock                last fragment issued in the shard
 //	<prefix>:{N}:w:<series>           sorted set: window starts of the series' chunks
+//	<prefix>:{N}:compact              compaction lease of the shard
 //	<prefix>:{N}:q:<series>:<window>:<digest>  quarantined (undecodable) chunk
+//	<prefix>:{N}:qz:<series>:<window>:<digest> its compacted part
 //	<prefix>:{N}:qidx                 sorted set: quarantine key -> expiry time
 //	<prefix>:meta                     hash: layout parameters
 package hot
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -110,6 +114,17 @@ type Store struct {
 	quarantineTTL time.Duration
 	backend       string
 	logger        *slog.Logger
+
+	// compactMargin is storage.CompactMargin, shorter in tests.
+	compactMargin time.Duration
+	// compactMinRaw is the size of the raw records a chunk needs to be
+	// compacted: storage.CompactMinRecords records, fewer in tests.
+	compactMinRaw int
+	// compactPage is how many open chunks are listed at a time.
+	compactPage int
+	// beforeCompact runs between the reads and the writes of a compaction;
+	// tests use it to change chunks in between.
+	beforeCompact func()
 }
 
 var _ storage.HotStore = (*Store)(nil)
@@ -132,6 +147,9 @@ func New(ctx context.Context, client redis.UniversalClient, opts Options) (*Stor
 		quarantineTTL: opts.QuarantineTTL,
 		backend:       opts.Backend,
 		logger:        opts.Logger,
+		compactMargin: storage.CompactMargin,
+		compactMinRaw: storage.CompactMinRecords * chunk.RecordLen,
+		compactPage:   1000,
 	}
 	if err := client.Ping(ctx).Err(); err != nil {
 		return nil, fmt.Errorf("redis ping: %w", err)
@@ -302,16 +320,34 @@ func (s *Store) chunkKey(shard int, member string) string {
 	return s.tag(shard) + ":c:" + member
 }
 
+// compactedKey holds the compacted part of a chunk.
+func (s *Store) compactedKey(shard int, member string) string {
+	return s.tag(shard) + ":z:" + member
+}
+
+func (s *Store) compactLeaseKey(shard int) string { return s.tag(shard) + ":compact" }
+
 // windowsKey is the window index of a series: the starts of the windows it
 // has chunks for, so that reads touch only chunks that exist.
 func (s *Store) windowsKey(shard int, id model.SeriesID) string {
 	return s.tag(shard) + ":w:" + id.String()
 }
 
-// quarantineKey names a quarantined chunk after its content, so that two
-// different chunks of the same window never share a quarantine key.
-func (s *Store) quarantineKey(shard int, member string, content []byte) string {
-	return fmt.Sprintf("%s:q:%s:%016x", s.tag(shard), member, xxhash.Sum64(content))
+// quarantineKey names a quarantined chunk after its content (the length of
+// the chunk, the chunk and its compacted part), so that two different chunks
+// of the same window never share a quarantine key.
+func (s *Store) quarantineKey(shard int, member string, raw, compacted []byte) string {
+	d := xxhash.New()
+	_, _ = d.Write(binary.BigEndian.AppendUint64(nil, uint64(len(raw))))
+	_, _ = d.Write(raw)
+	_, _ = d.Write(compacted)
+	return fmt.Sprintf("%s:q:%s:%016x", s.tag(shard), member, d.Sum64())
+}
+
+// quarantinedCompactedKey is where the compacted part of a quarantined chunk
+// is kept: the quarantine key with "qz" for "q".
+func quarantinedCompactedKey(qkey string) string {
+	return strings.Replace(qkey, "}:q:", "}:qz:", 1)
 }
 
 func (s *Store) quarantineIndexKey(shard int) string { return s.tag(shard) + ":qidx" }
@@ -517,51 +553,84 @@ func (s *Store) Claim(ctx context.Context, shard, limit int) ([]storage.ChunkRef
 
 // Load reads claimed chunks. Undecodable chunks are quarantined and skipped.
 func (s *Store) Load(ctx context.Context, refs []storage.ChunkRef) (storage.LoadResult, error) {
-	cmds := make([]*redis.StringCmd, len(refs))
+	cmds := make([]*redis.SliceCmd, len(refs))
 	if err := s.pipelined(ctx, len(refs), func(pipe redis.Pipeliner, i int) {
-		cmds[i] = pipe.Get(ctx, s.chunkKey(refs[i].Shard, member(refs[i].Series, refs[i].Start)))
+		m := member(refs[i].Series, refs[i].Start)
+		cmds[i] = pipe.MGet(ctx, s.chunkKey(refs[i].Shard, m), s.compactedKey(refs[i].Shard, m))
 	}); err != nil {
 		return storage.LoadResult{}, err
 	}
 	res := storage.LoadResult{Chunks: make([]storage.HotChunk, 0, len(refs))}
 	for i, cmd := range cmds {
-		b, err := cmd.Bytes()
-		if errors.Is(err, redis.Nil) {
-			res.Missing = append(res.Missing, refs[i])
-			continue
-		}
+		raw, compacted, ok, err := chunkParts(cmd)
 		if err != nil {
 			return storage.LoadResult{}, fmt.Errorf("load chunk: %w", err)
 		}
-		frag, samples, records, err := chunk.DecodeHot(b)
+		if !ok {
+			res.Missing = append(res.Missing, refs[i])
+			continue
+		}
+		frag, samples, records, err := chunk.DecodeHot(raw, compacted)
 		if err != nil {
-			if s.quarantine(ctx, refs[i], b, err) {
+			if s.quarantine(ctx, refs[i], raw, compacted, err) {
 				res.Quarantined++
 			}
 			continue
 		}
 		res.Chunks = append(res.Chunks, storage.HotChunk{
-			Ref:      refs[i],
-			Fragment: frag,
-			Size:     len(b),
-			Records:  records,
-			Samples:  samples,
+			Ref:           refs[i],
+			Fragment:      frag,
+			Size:          len(raw),
+			CompactedSize: len(compacted),
+			Records:       records,
+			Samples:       samples,
 		})
 	}
 	return res, nil
 }
 
-// quarantine moves an undecodable chunk to a quarantine key, unless it
-// changed since it was read as content. It reports whether the chunk was
-// moved; otherwise it stays in flight and is retried after its lease.
-func (s *Store) quarantine(ctx context.Context, ref storage.ChunkRef, content []byte, cause error) bool {
+// chunkParts returns the chunk and its compacted part from an MGET of both;
+// ok is false if the chunk does not exist.
+func chunkParts(cmd *redis.SliceCmd) (raw, compacted []byte, ok bool, err error) {
+	vals, err := cmd.Result()
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if len(vals) != 2 {
+		return nil, nil, false, fmt.Errorf("MGET returned %d values", len(vals))
+	}
+	part := func(v any) ([]byte, error) {
+		switch v := v.(type) {
+		case nil:
+			return nil, nil
+		case string:
+			return []byte(v), nil
+		default:
+			return nil, fmt.Errorf("unexpected value of type %T", v)
+		}
+	}
+	if raw, err = part(vals[0]); err != nil || raw == nil {
+		return nil, nil, false, err
+	}
+	if compacted, err = part(vals[1]); err != nil {
+		return nil, nil, false, err
+	}
+	return raw, compacted, true, nil
+}
+
+// quarantine moves an undecodable chunk and its compacted part to
+// quarantine keys, unless the chunk changed since it was read. It reports
+// whether the chunk was moved; otherwise it stays in flight and is retried
+// after its lease.
+func (s *Store) quarantine(ctx context.Context, ref storage.ChunkRef, raw, compacted []byte, cause error) bool {
 	m := member(ref.Series, ref.Start)
-	qkey := s.quarantineKey(ref.Shard, m, content)
-	head := content[:min(len(content), chunk.HeaderLen)]
+	qkey := s.quarantineKey(ref.Shard, m, raw, compacted)
+	head := raw[:min(len(raw), chunk.HeaderLen)]
 	res, err := quarantineScript.Run(ctx, s.client,
 		[]string{s.inflightKey(ref.Shard), s.inflightDueKey(ref.Shard), s.chunkKey(ref.Shard, m), qkey,
-			s.quarantineIndexKey(ref.Shard), s.windowsKey(ref.Shard, ref.Series)},
-		m, head, len(content), s.quarantineTTL.Milliseconds(), ref.Start,
+			s.quarantineIndexKey(ref.Shard), s.windowsKey(ref.Shard, ref.Series), s.compactedKey(ref.Shard, m),
+			quarantinedCompactedKey(qkey)},
+		m, head, len(raw), s.quarantineTTL.Milliseconds(), ref.Start, len(compacted),
 	).Int()
 	switch {
 	case err != nil:
@@ -575,7 +644,7 @@ func (s *Store) quarantine(ctx context.Context, ref storage.ChunkRef, content []
 		return false // gone: completed by another flusher
 	}
 	s.logger.Error("quarantined undecodable chunk", "shard", ref.Shard, "member", m, "key", qkey,
-		"bytes", len(content), "err", cause)
+		"bytes", len(raw), "compacted_bytes", len(compacted), "err", cause)
 	return true
 }
 
@@ -584,7 +653,7 @@ func (s *Store) quarantine(ctx context.Context, ref storage.ChunkRef, content []
 func (s *Store) Complete(ctx context.Context, chunks []storage.HotChunk) error {
 	items := make([]finishItem, len(chunks))
 	for i, c := range chunks {
-		items[i] = finishItem{ref: c.Ref, header: fmt.Sprintf("%016d", c.Fragment), size: c.Size}
+		items[i] = finishItem{ref: c.Ref, header: fmt.Sprintf("%016d", c.Fragment), size: c.Size, compactedSize: c.CompactedSize}
 	}
 	return s.finish(ctx, items)
 }
@@ -599,9 +668,10 @@ func (s *Store) Release(ctx context.Context, refs []storage.ChunkRef) error {
 }
 
 type finishItem struct {
-	ref    storage.ChunkRef
-	header string // empty: release a missing chunk
-	size   int
+	ref           storage.ChunkRef
+	header        string // empty: release a missing chunk
+	size          int
+	compactedSize int
 }
 
 func (s *Store) finish(ctx context.Context, items []finishItem) error {
@@ -616,8 +686,8 @@ func (s *Store) finish(ctx context.Context, items []finishItem) error {
 			call := scriptCall{keys: []string{s.inflightKey(shard), s.inflightDueKey(shard)}}
 			for _, it := range its[:n] {
 				m := member(it.ref.Series, it.ref.Start)
-				call.keys = append(call.keys, s.chunkKey(shard, m), s.windowsKey(shard, it.ref.Series))
-				call.args = append(call.args, m, it.ref.Start, it.header, it.size)
+				call.keys = append(call.keys, s.chunkKey(shard, m), s.compactedKey(shard, m), s.windowsKey(shard, it.ref.Series))
+				call.args = append(call.args, m, it.ref.Start, it.header, it.size, it.compactedSize)
 			}
 			calls = append(calls, call)
 			its = its[n:]
@@ -648,8 +718,9 @@ func (s *Store) Read(ctx context.Context, ids []model.SeriesID, mint, maxt int64
 		return nil, err
 	}
 	type lookup struct {
-		id  model.SeriesID
-		key string
+		id     model.SeriesID
+		shard  int
+		member string
 	}
 	var lookups []lookup
 	for i, id := range ids {
@@ -663,27 +734,30 @@ func (s *Store) Read(ctx context.Context, ids []model.SeriesID, mint, maxt int64
 				s.logger.Warn("skipping invalid window index entry", "series", id, "entry", w)
 				continue
 			}
-			lookups = append(lookups, lookup{id: id, key: s.chunkKey(shard, member(id, start))})
+			lookups = append(lookups, lookup{id: id, shard: shard, member: member(id, start)})
 		}
 	}
-	cmds := make([]*redis.StringCmd, len(lookups))
+	// Both parts of a chunk are read with one MGET, so that a compaction is
+	// never seen half done.
+	cmds := make([]*redis.SliceCmd, len(lookups))
 	if err := s.pipelined(ctx, len(lookups), func(pipe redis.Pipeliner, i int) {
-		cmds[i] = pipe.Get(ctx, lookups[i].key)
+		l := lookups[i]
+		cmds[i] = pipe.MGet(ctx, s.chunkKey(l.shard, l.member), s.compactedKey(l.shard, l.member))
 	}); err != nil {
 		return nil, err
 	}
 	out := make(map[model.SeriesID][]model.Sample)
 	for i, cmd := range cmds {
-		b, err := cmd.Bytes()
-		if errors.Is(err, redis.Nil) {
-			continue // completed since the window index was read
-		}
+		raw, compacted, ok, err := chunkParts(cmd)
 		if err != nil {
 			return nil, fmt.Errorf("read chunk: %w", err)
 		}
-		_, samples, _, err := chunk.DecodeHot(b)
+		if !ok {
+			continue // completed since the window index was read
+		}
+		_, samples, _, err := chunk.DecodeHot(raw, compacted)
 		if err != nil {
-			s.logger.Warn("skipping undecodable chunk", "key", lookups[i].key, "err", err)
+			s.logger.Warn("skipping undecodable chunk", "key", s.chunkKey(lookups[i].shard, lookups[i].member), "err", err)
 			continue
 		}
 		id := lookups[i].id

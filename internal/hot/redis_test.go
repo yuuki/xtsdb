@@ -271,7 +271,7 @@ func TestQuarantinesCorruptChunks(t *testing.T) {
 	if err != nil || len(res.Chunks) != 0 || len(res.Missing) != 0 || res.Quarantined != 1 {
 		t.Fatalf("corrupt chunk must be quarantined and skipped: %+v %v", res, err)
 	}
-	qkey := s.quarantineKey(0, m, []byte(content))
+	qkey := s.quarantineKey(0, m, []byte(content), nil)
 	if client.Get(ctx, qkey).Val() != content {
 		t.Fatal("corrupt chunk was not quarantined")
 	}
@@ -351,7 +351,7 @@ func TestQuarantineIsFenced(t *testing.T) {
 	corrupt := []byte("0000000000001000x")
 	client.Set(ctx, key, "0000000000002000", 0) // healthy newer incarnation
 	client.ZAdd(ctx, s.inflightKey(0), redis.Z{Score: 0, Member: m})
-	if s.quarantine(ctx, ref, corrupt, errors.New("test")) {
+	if s.quarantine(ctx, ref, corrupt, nil, errors.New("test")) {
 		t.Fatal("a newer incarnation must not be quarantined")
 	}
 	if client.Get(ctx, key).Val() != "0000000000002000" {
@@ -362,12 +362,12 @@ func TestQuarantineIsFenced(t *testing.T) {
 	}
 	// Same header, different length: samples were appended since the read.
 	client.Set(ctx, key, "0000000000001000xyz", 0)
-	if s.quarantine(ctx, ref, corrupt, errors.New("test")) {
+	if s.quarantine(ctx, ref, corrupt, nil, errors.New("test")) {
 		t.Fatal("a chunk that grew must not be quarantined")
 	}
 	// A chunk that disappeared is released.
 	client.Del(ctx, key)
-	if s.quarantine(ctx, ref, corrupt, errors.New("test")) {
+	if s.quarantine(ctx, ref, corrupt, nil, errors.New("test")) {
 		t.Fatal("a missing chunk cannot be quarantined")
 	}
 	if client.ZCard(ctx, s.inflightKey(0)).Val() != 0 {
@@ -596,7 +596,11 @@ func TestClaimWorksAtMaxmemory(t *testing.T) {
 }
 
 func TestManySeriesAcrossShards(t *testing.T) {
-	layout := model.Layout{Shards: 64, ChunkRange: time.Hour.Milliseconds(), Grace: 0}
+	// The window of a random series can end at any time. A grace period
+	// keeps it open past the few milliseconds between now and the append,
+	// which would otherwise reject the sample of one series in a few
+	// hundred runs.
+	layout := model.Layout{Shards: 64, ChunkRange: time.Hour.Milliseconds(), Grace: time.Minute.Milliseconds()}
 	s, _ := newTestStore(t, layout, time.Minute)
 	ctx := context.Background()
 	now := nowMs()
