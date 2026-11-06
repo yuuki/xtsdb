@@ -208,7 +208,8 @@ left data in Redis forever.
 | Redis out of memory (`noeviction`) | Appends are refused (503, clients retry); claim and complete keep working, so flushing frees memory. |
 | Redis restart / `SCRIPT FLUSH` | Scripts are reloaded automatically. Unflushed data loss is bounded by the Redis persistence settings. |
 | Redis restored from an older snapshot, or failover to a lagging replica | Chunks flushed since the snapshot may be flushed again with less data; they are stored as separate versions and never overwrite the complete one. |
-| Undecodable chunk | Moved to a quarantine key (fenced, see below), logged and counted; it does not block flushing. |
+| Undecodable chunk in Redis | Moved to a quarantine key (fenced, see below), logged and counted; it does not block flushing. |
+| Undecodable part in the persistent tier | Skipped by reads and logged as an error with its key; queries return the other samples. See [Corrupt data in the persistent tier](#corrupt-data-in-the-persistent-tier). |
 | Very large chunk | Persisted in parts of at most 100,000 samples and 4 MiB, below Cassandra's mutation limit (TiKV stores parts in segments of 8 KiB). A single native histogram is limited to 16,384 buckets (about 130 KB), so every part fits. |
 | Sample for a closed window | Rejected and counted (`outcome="too_old"`); remote write returns 400. |
 | Redis clock moves backwards | A claimed chunk still rejects appends (the in-flight check). A chunk re-created after completion gets a larger fragment from the shard clock and is stored as a separate version that takes precedence; reads merge versions. |
@@ -260,7 +261,10 @@ length-prefixed Prometheus XOR chunks of sorted, de-duplicated samples
 A window with native histograms (`encoding` 2) is a sequence of segments,
 each a Prometheus chunk encoding byte (XOR or float histogram), the chunk's
 length and the chunk, in time order; a new histogram chunk starts at a
-counter reset or an incompatible bucket layout, as in the Prometheus TSDB.
+counter reset or an incompatible bucket layout, as in the Prometheus TSDB,
+and also when the bucket layout of the chunk (the union of the layouts of its
+histograms) would exceed what one histogram may have, for example 16,384
+buckets. A chunk holds at most 16,384 samples.
 A row expires `storage.retention` after its last sample (`USING TTL`), and
 TWCS drops whole SSTables when they expire. Index entries of a day expire two
 days after the samples of that day; series rows two days after they were
@@ -514,6 +518,39 @@ older ingester stopped. Older flushers do not remove window index entries,
 and older builds cannot read native histogram records. When upgrading from
 an earlier v2 build, stop all its processes (ingesters and flushers) before
 starting the new ones.
+
+### Corrupt data in the persistent tier
+
+Parts are decoded with the chunk iterators of the Prometheus TSDB, which
+trust their input: a corrupt float histogram chunk can claim billions of
+buckets, which they allocate before reading any, and other corrupt chunks
+make them panic. Running out of memory kills the process, and Go cannot
+recover from it. Every chunk is therefore checked first against what xtsdb
+writes:
+
+- a part holds at most 100,000 samples, and a chunk at most 16,384;
+- the bucket layout of a histogram chunk, which all its histograms share,
+  must be the layout of a histogram that ingestion accepts: a valid schema,
+  at most 16,384 buckets, spans and custom bounds, and the other checks of
+  native histogram validation;
+- the chunk must be long enough for the buckets its layout claims, which the
+  first histogram of a chunk stores as raw 64-bit floats.
+
+Histograms decoded from one chunk also share a single copy of its spans and
+custom bounds, which would otherwise be copied for each of them. Decoding
+corrupt data then takes about as much memory as decoding valid data of the
+same size, and a panic while decoding is reported as corruption.
+
+A part that fails to decode is skipped, deliberately: the read still returns
+the samples of the other parts and versions of the window, and of Redis, and
+logs `skipping undecodable chunk` at error level with the key of the part
+(series, window start, fragment, total, digest and part; and the day with
+Cassandra). Unlike the hot tier, the persistent tier has no quarantine, and
+a part never changes once written, so a read that failed on it would fail
+every query of that series over that window until the part expires. The
+query neither fails nor carries a warning: a corrupt part shows up only as
+missing samples and in the logs. To get rid of it, delete it by that key:
+the row in the `chunks` table, or every segment key of the part in TiKV.
 
 ## Changes from 0.x
 

@@ -78,6 +78,13 @@ key prefix. Versions before 2.0.0 were not released.
 
 ### Fixed
 
+- A corrupt chunk in the persistent tier could crash the querier: a float
+  histogram chunk whose layout claims billions of buckets ran it out of
+  memory, and other corrupt chunks made it panic. Chunks are now checked
+  against the limits that xtsdb writes them with before they are decoded;
+  parts that fail are skipped and logged with their key, and queries return
+  the other samples. The flusher starts a new histogram chunk when the union
+  of the bucket layouts of its histograms would exceed those limits.
 - Quarantining an undecodable chunk could move a healthy newer incarnation of
   its window away, and overwrote earlier quarantined chunks of the window
   (#3).

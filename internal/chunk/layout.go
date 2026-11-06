@@ -1,0 +1,268 @@
+package chunk
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"math"
+	"slices"
+
+	"github.com/prometheus/prometheus/model/histogram"
+
+	"github.com/yuuki/xtsdb/internal/model"
+)
+
+// The chunkenc iterators trust the chunks they decode. A float histogram
+// chunk starts with the bucket layout that all its histograms share, and the
+// iterator allocates as many buckets as that layout claims before it reads
+// any of them: a corrupt layout can claim billions, and the process runs out
+// of memory, which recover cannot catch. checkHistogramChunk therefore reads
+// the layout first. The format, from tsdb/chunkenc, is
+//
+//	samples   uint16, big endian
+//	flags     one byte (the counter reset header)
+//	layout    zero threshold, schema, positive spans, negative spans, and
+//	          custom bounds with the custom buckets schema
+//	samples   the first one holds its timestamp, then its count, zero count,
+//	          sum and every bucket as raw 64-bit floats
+//
+// with the layout and the samples in a bit stream (see bitReader).
+
+const histogramChunkHeaderLen = 3
+
+// checkHistogramChunk returns ErrCorrupt unless the layout of the float
+// histogram chunk b is the layout of a histogram that model.ValidateHistogram
+// accepts (at most model.MaxHistogramBuckets buckets, spans and custom bounds,
+// among others), and b is long enough for its first histogram. Decoding
+// corrupt data then takes about as much memory as valid data of the same
+// size.
+//
+// The encoder runs the same check, so that it never writes a chunk that
+// decoding refuses.
+func checkHistogramChunk(b []byte) error {
+	if len(b) < histogramChunkHeaderLen {
+		return fmt.Errorf("%w: histogram chunk of %d bytes", ErrCorrupt, len(b))
+	}
+	if binary.BigEndian.Uint16(b) == 0 {
+		return nil // the iterator reads nothing
+	}
+	r := bitReader{b: b[histogramChunkHeaderLen:]}
+	h, err := readHistogramLayout(&r)
+	if err != nil {
+		return fmt.Errorf("%w: histogram chunk layout: %w", ErrCorrupt, err)
+	}
+	// The first histogram holds its timestamp, then its count, zero count,
+	// sum and buckets as raw floats.
+	pos, neg := countBuckets(h.PositiveSpans), countBuckets(h.NegativeSpans)
+	if _, err := r.varbitInt(); err != nil || r.remaining() < 64*uint64(3+pos+neg) {
+		return fmt.Errorf("%w: histogram chunk of %d bytes is too short for %d buckets", ErrCorrupt, len(b), pos+neg)
+	}
+	// Validate the layout as the layout of a histogram without observations.
+	h.PositiveBuckets, h.NegativeBuckets = make([]float64, pos), make([]float64, neg)
+	if err := model.ValidateHistogram(h); err != nil {
+		return fmt.Errorf("%w: histogram chunk layout: %w", ErrCorrupt, err)
+	}
+	return nil
+}
+
+// readHistogramLayout reads the layout of a float histogram chunk into a
+// histogram without buckets. It reads at most model.MaxHistogramBuckets
+// spans, buckets and custom bounds, and checks that the schema is valid,
+// but leaves the other checks to model.ValidateHistogram.
+func readHistogramLayout(r *bitReader) (*histogram.FloatHistogram, error) {
+	var h histogram.FloatHistogram
+	switch zt, err := r.readBits(8); {
+	case err != nil:
+		return nil, err
+	case zt == 255:
+		v, err := r.readBits(64)
+		if err != nil {
+			return nil, err
+		}
+		h.ZeroThreshold = math.Float64frombits(v)
+	case zt != 0:
+		h.ZeroThreshold = math.Ldexp(0.5, int(zt)-243)
+	}
+	schema, err := r.varbitInt()
+	if err != nil {
+		return nil, err
+	}
+	h.Schema = int32(schema) // as chunkenc reads it
+	if !histogram.IsValidSchema(h.Schema) {
+		return nil, histogram.InvalidSchemaError(h.Schema)
+	}
+	spans, buckets := 0, 0
+	for _, side := range []*[]histogram.Span{&h.PositiveSpans, &h.NegativeSpans} {
+		n, err := r.varbitUint()
+		if err != nil {
+			return nil, err
+		}
+		if n > uint64(model.MaxHistogramBuckets-spans) {
+			return nil, fmt.Errorf("more than %d spans", model.MaxHistogramBuckets)
+		}
+		spans += int(n)
+		for range n {
+			length, err := r.varbitUint()
+			if err != nil {
+				return nil, err
+			}
+			offset, err := r.varbitInt()
+			if err != nil {
+				return nil, err
+			}
+			if length > uint64(model.MaxHistogramBuckets-buckets) {
+				return nil, fmt.Errorf("more than %d buckets", model.MaxHistogramBuckets)
+			}
+			buckets += int(length)
+			*side = append(*side, histogram.Span{Offset: int32(offset), Length: uint32(length)})
+		}
+	}
+	if histogram.IsCustomBucketsSchema(h.Schema) {
+		n, err := r.varbitUint()
+		if err != nil {
+			return nil, err
+		}
+		if n > model.MaxHistogramBuckets {
+			return nil, fmt.Errorf("more than %d custom bounds", model.MaxHistogramBuckets)
+		}
+		for range n {
+			// A bound is stored as 1 + 1000 * bound if that is a whole
+			// number that fits, else as 0 and the float64.
+			v, err := r.varbitUint()
+			if err != nil {
+				return nil, err
+			}
+			bound := float64(v-1) / 1000
+			if v == 0 {
+				bits, err := r.readBits(64)
+				if err != nil {
+					return nil, err
+				}
+				bound = math.Float64frombits(bits)
+			}
+			h.CustomValues = append(h.CustomValues, bound)
+		}
+	}
+	return &h, nil
+}
+
+func countBuckets(spans []histogram.Span) int {
+	n := 0
+	for _, s := range spans {
+		n += int(s.Length)
+	}
+	return n
+}
+
+// sharedLayout gives the histograms decoded from one chunk a single copy of
+// its spans. They all have the layout of the chunk, and chunkenc would
+// otherwise copy it for each of them: a chunk of 16,384 histograms with
+// thousands of spans, a few hundred kilobytes, would decode into gigabytes.
+// The custom bounds are already shared: chunkenc interns them per chunk.
+//
+// The spans must not be modified: like Prometheus, xtsdb treats decoded
+// histograms as read-only.
+type sharedLayout struct {
+	pos, neg []histogram.Span
+}
+
+// histogram returns a copy of fh, which the iterator will overwrite, with
+// the spans of the chunk.
+func (l *sharedLayout) histogram(fh *histogram.FloatHistogram) *histogram.FloatHistogram {
+	if !slices.Equal(l.pos, fh.PositiveSpans) {
+		l.pos = clone(fh.PositiveSpans)
+	}
+	if !slices.Equal(l.neg, fh.NegativeSpans) {
+		l.neg = clone(fh.NegativeSpans)
+	}
+	return &histogram.FloatHistogram{
+		CounterResetHint: fh.CounterResetHint,
+		Schema:           fh.Schema,
+		ZeroThreshold:    fh.ZeroThreshold,
+		ZeroCount:        fh.ZeroCount,
+		Count:            fh.Count,
+		Sum:              fh.Sum,
+		PositiveSpans:    l.pos,
+		NegativeSpans:    l.neg,
+		PositiveBuckets:  clone(fh.PositiveBuckets),
+		NegativeBuckets:  clone(fh.NegativeBuckets),
+		CustomValues:     fh.CustomValues,
+	}
+}
+
+func clone[T any](s []T) []T {
+	if len(s) == 0 {
+		return nil
+	}
+	return slices.Clone(s)
+}
+
+// bitReader reads a bit stream written by tsdb/chunkenc, most significant
+// bit first.
+type bitReader struct {
+	b   []byte
+	pos uint64 // bits read
+}
+
+func (r *bitReader) remaining() uint64 { return uint64(len(r.b))*8 - r.pos }
+
+// readBits reads n <= 64 bits.
+func (r *bitReader) readBits(n int) (uint64, error) {
+	if uint64(n) > r.remaining() {
+		return 0, io.ErrUnexpectedEOF
+	}
+	var v uint64
+	for n > 0 {
+		off := int(r.pos % 8)
+		take := min(n, 8-off)
+		v = v<<take | uint64(r.b[r.pos/8]>>(8-off-take))&(1<<take-1)
+		r.pos += uint64(take)
+		n -= take
+	}
+	return v, nil
+}
+
+// varbitWidths maps the number of 1 bits that start a varbit number to the
+// width of the value that follows.
+var varbitWidths = [9]int{0, 3, 6, 9, 12, 18, 25, 56, 64}
+
+// varbitWidth reads the prefix of a varbit number: up to eight 1 bits,
+// ended by a 0 bit unless there are eight.
+func (r *bitReader) varbitWidth() (int, error) {
+	ones := 0
+	for ones < 8 {
+		bit, err := r.readBits(1)
+		if err != nil {
+			return 0, err
+		}
+		if bit == 0 {
+			break
+		}
+		ones++
+	}
+	return varbitWidths[ones], nil
+}
+
+func (r *bitReader) varbitUint() (uint64, error) {
+	w, err := r.varbitWidth()
+	if err != nil {
+		return 0, err
+	}
+	return r.readBits(w)
+}
+
+func (r *bitReader) varbitInt() (int64, error) {
+	w, err := r.varbitWidth()
+	if err != nil {
+		return 0, err
+	}
+	v, err := r.readBits(w)
+	if err != nil {
+		return 0, err
+	}
+	// Values of fewer than 64 bits are in [-2^(w-1)+1, 2^(w-1)].
+	if w > 0 && w < 64 && v > 1<<(w-1) {
+		v -= 1 << w
+	}
+	return int64(v), nil
+}

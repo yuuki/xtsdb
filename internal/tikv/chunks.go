@@ -214,7 +214,10 @@ func (r *versionReader) endPart() {
 	}
 	samples, err := chunk.Decode(r.header.encoding, r.data)
 	if err != nil {
-		r.logger.Error("skipping undecodable chunk", "start", r.cur.start, "part", r.cur.part, "err", err)
+		// See storage.ColdStore: skipped, with the key of the part so that
+		// it can be inspected or deleted.
+		r.logger.Error("skipping undecodable chunk", "start", r.cur.start, "fragment", r.cur.fragment,
+			"total", r.cur.total, "digest", r.cur.digest, "part", r.cur.part, "err", err)
 		return
 	}
 	r.pending = append(r.pending, samples...)
