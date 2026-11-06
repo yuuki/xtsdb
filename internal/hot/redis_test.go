@@ -581,7 +581,11 @@ func TestClaimWorksAtMaxmemory(t *testing.T) {
 }
 
 func TestManySeriesAcrossShards(t *testing.T) {
-	layout := model.Layout{Shards: 64, ChunkRange: time.Hour.Milliseconds(), Grace: 0}
+	// The window of a random series can end at any time. A grace period
+	// keeps it open past the few milliseconds between now and the append,
+	// which would otherwise reject the sample of one series in a few
+	// hundred runs.
+	layout := model.Layout{Shards: 64, ChunkRange: time.Hour.Milliseconds(), Grace: time.Minute.Milliseconds()}
 	s, _ := newTestStore(t, layout, time.Minute)
 	ctx := context.Background()
 	now := nowMs()
