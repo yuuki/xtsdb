@@ -93,9 +93,9 @@ type Options struct {
 	// zero keeps them until they are deleted.
 	QuarantineTTL time.Duration
 	// Backend is the persistent backend (storage.backend) that chunks are
-	// flushed to. It is recorded like the layout, so that a deployment does
-	// not switch backends and split its series between two stores. Empty
-	// skips the check.
+	// flushed to. New refuses a different backend recorded in Redis, and
+	// RecordBackend records it, so that a deployment does not switch
+	// backends and split its series between two stores. Empty skips both.
 	Backend string
 	Logger  *slog.Logger
 }
@@ -159,26 +159,66 @@ func (s *Store) checkLayout(ctx context.Context) error {
 		{"shards", strconv.Itoa(s.layout.Shards), "storage.shards"},
 		{"chunk_range_ms", strconv.FormatInt(s.layout.ChunkRange, 10), "storage.chunk_range"},
 	}
-	if s.backend != "" {
-		fields = append(fields, struct{ name, value, option string }{"backend", s.backend, "storage.backend"})
-	}
 	for _, f := range fields {
-		got, err := s.client.HGet(ctx, key, f.name).Result()
-		if errors.Is(err, redis.Nil) {
-			if err := s.client.HSetNX(ctx, key, f.name, f.value).Err(); err != nil {
-				return fmt.Errorf("redis meta: %w", err)
-			}
-			got, err = s.client.HGet(ctx, key, f.name).Result()
+		if err := s.recordMeta(ctx, f.name, f.value, f.option); err != nil {
+			return err
 		}
-		if err != nil {
+	}
+	// The backend is only checked here: RecordBackend records it once the
+	// persistent tier has been reached, so that a start with the wrong
+	// backend, which fails, does not lock it in.
+	if s.backend != "" {
+		got, err := s.client.HGet(ctx, key, backendField).Result()
+		switch {
+		case errors.Is(err, redis.Nil):
+		case err != nil:
 			return fmt.Errorf("redis meta: %w", err)
-		}
-		if got != f.value {
-			return fmt.Errorf("%s is %s but the data in Redis was written with %s (%s); "+
-				"changing it is not supported", f.option, f.value, got, f.name)
+		case got != s.backend:
+			return backendMismatch(s.backend, got)
 		}
 	}
 	return nil
+}
+
+// recordMeta records a field of <prefix>:meta if it is missing, and refuses
+// a different recorded value. Once recorded it only reads.
+func (s *Store) recordMeta(ctx context.Context, name, value, option string) error {
+	key := s.prefix + ":meta"
+	got, err := s.client.HGet(ctx, key, name).Result()
+	if errors.Is(err, redis.Nil) {
+		if err := s.client.HSetNX(ctx, key, name, value).Err(); err != nil {
+			return fmt.Errorf("redis meta: %w", err)
+		}
+		got, err = s.client.HGet(ctx, key, name).Result()
+	}
+	if err != nil {
+		return fmt.Errorf("redis meta: %w", err)
+	}
+	if got != value {
+		if name == backendField {
+			return backendMismatch(value, got)
+		}
+		return fmt.Errorf("%s is %s but the data in Redis was written with %s (%s); "+
+			"changing it is not supported", option, value, got, name)
+	}
+	return nil
+}
+
+// backendField records storage.backend in <prefix>:meta.
+const backendField = "backend"
+
+func backendMismatch(want, got string) error {
+	return fmt.Errorf("storage.backend is %s but the chunks in Redis are flushed to %s; changing it is not supported "+
+		"(to start over with another backend, use a new storage.key_prefix)", want, got)
+}
+
+// RecordBackend records the persistent backend (Options.Backend) in Redis.
+// The caller does so once it has reached the persistent tier.
+func (s *Store) RecordBackend(ctx context.Context) error {
+	if s.backend == "" {
+		return nil
+	}
+	return s.recordMeta(ctx, backendField, s.backend, "storage.backend")
 }
 
 // windowIndexField marks in <prefix>:meta that every chunk is registered in

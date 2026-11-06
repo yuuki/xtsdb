@@ -422,14 +422,29 @@ func TestRefusesBackendChange(t *testing.T) {
 	s, client := newTestStore(t, layout, time.Minute)
 	ctx := context.Background()
 	opts := Options{Prefix: s.prefix, Layout: layout, Lease: time.Minute, Backend: "cassandra"}
-	for range 2 { // recorded on first use, accepted after
-		if _, err := New(ctx, client, opts); err != nil {
-			t.Fatal(err)
-		}
+	if _, err := New(ctx, client, opts); err != nil {
+		t.Fatal(err)
 	}
+	// Opening the store does not record the backend: a start that fails
+	// to reach the persistent tier must not lock it in.
 	opts.Backend = "tikv"
-	if _, err := New(ctx, client, opts); err == nil || !strings.Contains(err.Error(), "storage.backend") {
+	tikv, err := New(ctx, client, opts)
+	if err != nil {
+		t.Fatalf("an unrecorded backend must not be refused: %v", err)
+	}
+	if err := tikv.RecordBackend(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := tikv.RecordBackend(ctx); err != nil {
+		t.Fatalf("recording the same backend again: %v", err)
+	}
+	opts.Backend = "cassandra"
+	cassandra, err := New(ctx, client, opts)
+	if err == nil || !strings.Contains(err.Error(), "storage.backend") {
 		t.Fatalf("expected a backend mismatch error, got %v", err)
+	}
+	if cassandra != nil {
+		t.Fatal("no store expected on a mismatch")
 	}
 }
 

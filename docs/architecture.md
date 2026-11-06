@@ -448,9 +448,10 @@ mode.
 compare-and-swap on first start, and xtsdb refuses to start with a different
 `storage.chunk_range`. With a retention, xtsdb also writes an entry with a
 TTL at startup, so that a cluster without TTLs is reported then rather than
-by every write. The Redis meta records `storage.backend`, so that a
-deployment does not switch backends and split its series between two
-stores. `storage.index_buckets` does not apply: a label pair
+by every write. The Redis meta records `storage.backend` once the
+persistent tier has been reached, so that a deployment does not switch
+backends and split its series between two stores; a start that fails to
+reach its backend records nothing. `storage.index_buckets` does not apply: a label pair
 shared by a million series is a range of a million keys, which TiKV spreads
 over regions; a lookup reads it in pages of up to 10,240 keys.
 

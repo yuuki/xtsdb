@@ -157,7 +157,7 @@ func (db *DB) Close() error {
 // not in atomic mode: it is for tests and must not run while xtsdb writes
 // the namespace.
 func (db *DB) DeleteAll(ctx context.Context) error {
-	return db.raw.DeleteRange(ctx, db.keys.prefix, prefixEnd(db.keys.prefix))
+	return plain(db.raw.DeleteRange(ctx, db.keys.prefix, prefixEnd(db.keys.prefix)))
 }
 
 // Ping checks that TiKV can be read.
@@ -176,19 +176,21 @@ func (db *DB) withTimeout(ctx context.Context) (context.Context, context.CancelF
 func (db *DB) get(ctx context.Context, key []byte) ([]byte, error) {
 	ctx, cancel := db.withTimeout(ctx)
 	defer cancel()
-	return db.raw.Get(ctx, key)
+	v, err := db.raw.Get(ctx, key)
+	return v, plain(err)
 }
 
 func (db *DB) batchGet(ctx context.Context, keys [][]byte) ([][]byte, error) {
 	ctx, cancel := db.withTimeout(ctx)
 	defer cancel()
-	return db.raw.BatchGet(ctx, keys)
+	v, err := db.raw.BatchGet(ctx, keys)
+	return v, plain(err)
 }
 
 func (db *DB) put(ctx context.Context, key, value []byte, ttl uint64) error {
 	ctx, cancel := db.withTimeout(ctx)
 	defer cancel()
-	return db.raw.PutWithTTL(ctx, key, value, ttl)
+	return plain(db.raw.PutWithTTL(ctx, key, value, ttl))
 }
 
 // putAll writes entries with the same TTL.
@@ -202,13 +204,14 @@ func (db *DB) putAll(ctx context.Context, keys, values [][]byte, ttl uint64) err
 	for i := range ttls {
 		ttls[i] = ttl
 	}
-	return db.raw.BatchPutWithTTL(ctx, keys, values, ttls)
+	return plain(db.raw.BatchPutWithTTL(ctx, keys, values, ttls))
 }
 
 func (db *DB) compareAndSwap(ctx context.Context, key, previous, value []byte) ([]byte, bool, error) {
 	ctx, cancel := db.withTimeout(ctx)
 	defer cancel()
-	return db.raw.CompareAndSwap(ctx, key, previous, value)
+	prev, swapped, err := db.raw.CompareAndSwap(ctx, key, previous, value)
+	return prev, swapped, plain(err)
 }
 
 // scanLimit returns how many entries a scan may ask for when keys are at
@@ -225,7 +228,7 @@ func (db *DB) scan(ctx context.Context, start, end []byte, limit int, fn func(ke
 		keys, values, err := db.raw.Scan(sctx, start, end, limit)
 		cancel()
 		if err != nil {
-			return err
+			return plain(err)
 		}
 		for i, k := range keys {
 			if err := fn(k, values[i]); err != nil {
@@ -239,6 +242,20 @@ func (db *DB) scan(ctx context.Context, start, end []byte, limit int, fn func(ke
 		}
 		start = append(append([]byte(nil), keys[len(keys)-1]...), 0)
 	}
+}
+
+// plainError hides the stack trace that the errors of the TiKV client print
+// with %+v, as slog formats errors, and keeps the error chain.
+type plainError struct{ err error }
+
+func (e plainError) Error() string { return e.err.Error() }
+func (e plainError) Unwrap() error { return e.err }
+
+func plain(err error) error {
+	if err == nil {
+		return nil
+	}
+	return plainError{err}
 }
 
 // ttlSeconds is a TTL for TiKV, or false if keepUntil has passed. retention

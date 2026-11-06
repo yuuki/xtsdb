@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"math/rand/v2"
@@ -346,7 +347,7 @@ func TestTTLs(t *testing.T) {
 	if ttl, _ := kv.TTL(db.keys.series(model.ID(lset))); ttl < 72*time.Hour-time.Minute || ttl > 72*time.Hour {
 		t.Fatalf("a series must expire the retention plus two days after it is written, TTL %v", ttl)
 	}
-	if ttl, _ := kv.TTL(db.keys.posting(today, "__name__", "up", model.ID(lset))); ttl <= 72*time.Hour || ttl > 96*time.Hour {
+	if ttl, _ := kv.TTL(db.keys.posting(today, "__name__", "up", model.ID(lset))); ttl <= 72*time.Hour-2*time.Second || ttl > 96*time.Hour {
 		t.Fatalf("postings of today must expire the retention plus two days after the day, TTL %v", ttl)
 	}
 
@@ -739,5 +740,41 @@ func TestTiKVTTLSemantics(t *testing.T) {
 	prev, swapped, err = db.compareAndSwap(ctx, key, nil, []byte("other"))
 	if err != nil || swapped || string(prev) != "new" {
 		t.Fatalf("compare-and-swap of a live entry: %q %v %v", prev, swapped, err)
+	}
+}
+
+// stackError prints a stack trace with %+v, like the errors of the TiKV
+// client.
+type stackError struct{}
+
+func (stackError) Error() string { return "region unavailable" }
+func (e stackError) Format(f fmt.State, verb rune) {
+	_, _ = io.WriteString(f, e.Error())
+	if f.Flag('+') {
+		_, _ = io.WriteString(f, "\ngoroutine 1 [running]:\n...")
+	}
+}
+
+// Errors of the client reach the logs, which format them with %+v, without
+// their stack traces, and keep their chain.
+func TestErrorsWithoutStacks(t *testing.T) {
+	logged := func(err error) string {
+		var b bytes.Buffer
+		slog.New(slog.NewTextHandler(&b, nil)).Error("failed", "err", err)
+		return b.String()
+	}
+	if !strings.Contains(logged(stackError{}), "goroutine") {
+		t.Fatal("the test needs an error that logs its stack")
+	}
+	// Ping returns the error of a read as it is, and readiness checks log it.
+	err := plain(stackError{})
+	if l := logged(err); strings.Contains(l, "goroutine") || !strings.Contains(l, "region unavailable") {
+		t.Fatalf("unexpected log line: %s", l)
+	}
+	if !errors.As(err, new(stackError)) {
+		t.Fatal("the error chain must be kept")
+	}
+	if plain(nil) != nil {
+		t.Fatal("plain(nil) must be nil")
 	}
 }

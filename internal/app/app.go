@@ -89,6 +89,9 @@ func New(ctx context.Context, target Target, cfg *config.Config, logger *slog.Lo
 	if err != nil {
 		return nil, err
 	}
+	if err := a.Hot.RecordBackend(ctx); err != nil {
+		return nil, err
+	}
 	retention := cfg.Storage.Retention.D()
 	cold, index := a.Persistent.Cold, a.Persistent.Index
 
