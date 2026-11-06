@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/klauspost/compress/snappy"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/prompb"
 	writev2 "github.com/prometheus/prometheus/prompb/io/prometheus/write/v2"
@@ -40,8 +41,8 @@ type RemoteWriteOptions struct {
 }
 
 // RemoteWriteHandler serves the Prometheus Remote Write 1.0 and 2.0
-// protocols. Native histograms and exemplars are not supported: requests
-// carrying histograms store their float samples and answer 400.
+// protocols, with float samples and native histograms (integer, float and
+// custom buckets). Exemplars and metadata are dropped.
 func RemoteWriteHandler(w *Writer, opts RemoteWriteOptions, logger *slog.Logger) http.Handler {
 	inflight := make(chan struct{}, opts.MaxInflight)
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
@@ -98,40 +99,34 @@ func RemoteWriteHandler(w *Writer, opts RemoteWriteOptions, logger *slog.Logger)
 			return
 		}
 
-		var (
-			batch      []Series
-			histograms int
-		)
+		var d decoded
 		if proto == protoV2 {
-			batch, histograms, err = decodeV2(body)
+			err = d.v2(body)
 		} else {
-			batch, histograms, err = decodeV1(body)
+			err = d.v1(body)
 		}
 		if err != nil {
 			http.Error(rw, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		res, err := w.Write(r.Context(), batch)
-		if histograms > 0 {
-			w.discard("unsupported", histograms)
+		res, err := w.Write(r.Context(), d.batch)
+		if d.invalid > 0 {
+			w.discard("invalid", d.invalid)
+			res.Merge(Result{Invalid: d.invalid, FirstInvalid: d.firstInvalid})
 		}
 		if proto == protoV2 {
-			rw.Header().Set(headerSamplesWritten, strconv.Itoa(res.Accepted))
-			rw.Header().Set(headerHistogramsWritten, "0")
+			rw.Header().Set(headerSamplesWritten, strconv.Itoa(res.Accepted-res.AcceptedHistograms))
+			rw.Header().Set(headerHistogramsWritten, strconv.Itoa(res.AcceptedHistograms))
 			rw.Header().Set(headerExemplarsWritten, "0")
 		}
 		switch {
 		case err != nil:
 			logger.Warn("remote write failed", "err", err)
 			http.Error(rw, "storage unavailable, retry later", http.StatusServiceUnavailable)
-		case res.Rejected() > 0 || histograms > 0:
+		case res.Rejected() > 0:
 			// Partial success. 4xx tells the sender not to retry.
-			msg := describeRejections(res)
-			if histograms > 0 {
-				msg += fmt.Sprintf("; %d native histogram samples dropped: native histograms are not supported", histograms)
-			}
-			http.Error(rw, msg, http.StatusBadRequest)
+			http.Error(rw, describeRejections(res), http.StatusBadRequest)
 		default:
 			rw.WriteHeader(http.StatusNoContent)
 		}
@@ -159,56 +154,87 @@ func remoteWriteProto(contentType string) (string, error) {
 	}
 }
 
-func decodeV1(body []byte) ([]Series, int, error) {
+// decoded is a decoded remote write request.
+type decoded struct {
+	batch []Series
+	// invalid counts integer histograms that failed validation; float
+	// samples and float histograms are validated by the Writer.
+	invalid      int
+	firstInvalid error
+}
+
+// histogram converts a remote write histogram. Integer histograms are
+// validated as such, which also checks their count against their buckets,
+// before they are converted to float histograms.
+func (d *decoded) histogram(samples []model.Sample, lset labels.Labels, t int64, isFloat bool,
+	toInt func() *histogram.Histogram, toFloat func() *histogram.FloatHistogram) []model.Sample {
+	if isFloat {
+		return append(samples, model.Sample{T: t, H: toFloat()})
+	}
+	h := toInt()
+	if err := h.Validate(); err != nil {
+		d.invalid++
+		if d.firstInvalid == nil {
+			d.firstInvalid = fmt.Errorf("histogram of %s at %d: %w", lset, t, err)
+		}
+		return samples
+	}
+	return append(samples, model.Sample{T: t, H: h.ToFloat(nil)})
+}
+
+func (d *decoded) v1(body []byte) error {
 	var req prompb.WriteRequest
 	if err := req.Unmarshal(body); err != nil {
-		return nil, 0, fmt.Errorf("decode remote write 1.0 request: %w", err)
+		return fmt.Errorf("decode remote write 1.0 request: %w", err)
 	}
-	batch := make([]Series, 0, len(req.Timeseries))
-	dropped := 0
+	d.batch = make([]Series, 0, len(req.Timeseries))
 	b := labels.NewScratchBuilder(16)
 	for _, ts := range req.Timeseries {
-		dropped += len(ts.Histograms)
-		if len(ts.Samples) == 0 {
+		if len(ts.Samples) == 0 && len(ts.Histograms) == 0 {
 			continue
 		}
 		b.Reset()
 		for _, l := range ts.Labels {
 			b.Add(l.Name, l.Value)
 		}
-		samples := make([]model.Sample, len(ts.Samples))
-		for i, s := range ts.Samples {
-			samples[i] = model.Sample{T: s.Timestamp, V: s.Value}
+		lset := b.Labels()
+		samples := make([]model.Sample, 0, len(ts.Samples)+len(ts.Histograms))
+		for _, s := range ts.Samples {
+			samples = append(samples, model.Sample{T: s.Timestamp, V: s.Value})
 		}
-		batch = append(batch, Series{Labels: b.Labels(), Samples: samples})
+		for _, h := range ts.Histograms {
+			samples = d.histogram(samples, lset, h.Timestamp, h.IsFloatHistogram(), h.ToIntHistogram, h.ToFloatHistogram)
+		}
+		d.batch = append(d.batch, Series{Labels: lset, Samples: samples})
 	}
-	return batch, dropped, nil
+	return nil
 }
 
-func decodeV2(body []byte) ([]Series, int, error) {
+func (d *decoded) v2(body []byte) error {
 	var req writev2.Request
 	if err := req.Unmarshal(body); err != nil {
-		return nil, 0, fmt.Errorf("decode remote write 2.0 request: %w", err)
+		return fmt.Errorf("decode remote write 2.0 request: %w", err)
 	}
-	batch := make([]Series, 0, len(req.Timeseries))
-	dropped := 0
+	d.batch = make([]Series, 0, len(req.Timeseries))
 	b := labels.NewScratchBuilder(16)
 	for _, ts := range req.Timeseries {
-		dropped += len(ts.Histograms)
-		if len(ts.Samples) == 0 {
+		if len(ts.Samples) == 0 && len(ts.Histograms) == 0 {
 			continue
 		}
 		lset, err := ts.ToLabels(&b, req.Symbols)
 		if err != nil {
-			return nil, 0, fmt.Errorf("decode labels: %w", err)
+			return fmt.Errorf("decode labels: %w", err)
 		}
-		samples := make([]model.Sample, len(ts.Samples))
-		for i, s := range ts.Samples {
-			samples[i] = model.Sample{T: s.Timestamp, V: s.Value}
+		samples := make([]model.Sample, 0, len(ts.Samples)+len(ts.Histograms))
+		for _, s := range ts.Samples {
+			samples = append(samples, model.Sample{T: s.Timestamp, V: s.Value})
 		}
-		batch = append(batch, Series{Labels: lset, Samples: samples})
+		for _, h := range ts.Histograms {
+			samples = d.histogram(samples, lset, h.Timestamp, h.IsFloatHistogram(), h.ToIntHistogram, h.ToFloatHistogram)
+		}
+		d.batch = append(d.batch, Series{Labels: lset, Samples: samples})
 	}
-	return batch, dropped, nil
+	return nil
 }
 
 func describeRejections(res Result) string {
@@ -221,6 +247,12 @@ func describeRejections(res Result) string {
 	}
 	if res.Invalid > 0 {
 		parts = append(parts, fmt.Sprintf("%d samples of invalid series (first: %v)", res.Invalid, res.FirstInvalid))
+	}
+	if res.Collision > 0 {
+		parts = append(parts, fmt.Sprintf("%d samples of series whose ID collides with another series", res.Collision))
+	}
+	if res.ChunkFull > 0 {
+		parts = append(parts, fmt.Sprintf("%d samples whose chunk window reached its maximum size", res.ChunkFull))
 	}
 	return fmt.Sprintf("accepted %d samples, rejected %s", res.Accepted, strings.Join(parts, ", "))
 }

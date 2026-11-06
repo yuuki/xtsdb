@@ -3,12 +3,15 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,8 +40,22 @@ type Server struct {
 	duration *prometheus.HistogramVec
 }
 
+// Options configures a Server.
+type Options struct {
+	EnablePprof bool
+	// TLS serves HTTPS when set.
+	TLS *tls.Config
+	// Ops wraps /metrics and /debug/pprof, for example to require
+	// credentials. /-/healthy and /-/ready are never wrapped.
+	Ops func(http.Handler) http.Handler
+}
+
 // New creates a server listening on addr.
-func New(addr string, reg *prometheus.Registry, enablePprof bool, logger *slog.Logger) *Server {
+func New(addr string, reg *prometheus.Registry, opts Options, logger *slog.Logger) *Server {
+	ops := opts.Ops
+	if ops == nil {
+		ops = func(h http.Handler) http.Handler { return h }
+	}
 	s := &Server{
 		Mux:    http.NewServeMux(),
 		logger: logger,
@@ -51,21 +68,22 @@ func New(addr string, reg *prometheus.Registry, enablePprof bool, logger *slog.L
 		}, []string{"handler", "code", "method"}),
 	}
 	reg.MustRegister(s.duration)
-	s.Mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{EnableOpenMetrics: true}))
+	s.Mux.Handle("/metrics", ops(promhttp.HandlerFor(reg, promhttp.HandlerOpts{EnableOpenMetrics: true})))
 	s.Mux.HandleFunc("/-/healthy", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("OK\n"))
 	})
 	s.Mux.HandleFunc("/-/ready", s.ready)
-	if enablePprof {
-		s.Mux.HandleFunc("/debug/pprof/", pprof.Index)
-		s.Mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-		s.Mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-		s.Mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-		s.Mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	if opts.EnablePprof {
+		s.Mux.Handle("/debug/pprof/", ops(http.HandlerFunc(pprof.Index)))
+		s.Mux.Handle("/debug/pprof/cmdline", ops(http.HandlerFunc(pprof.Cmdline)))
+		s.Mux.Handle("/debug/pprof/profile", ops(http.HandlerFunc(pprof.Profile)))
+		s.Mux.Handle("/debug/pprof/symbol", ops(http.HandlerFunc(pprof.Symbol)))
+		s.Mux.Handle("/debug/pprof/trace", ops(http.HandlerFunc(pprof.Trace)))
 	}
 	s.srv = &http.Server{
 		Addr:              addr,
 		Handler:           s.Mux,
+		TLSConfig:         opts.TLS,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       time.Minute, // whole request, including the body
 		IdleTimeout:       2 * time.Minute,
@@ -95,14 +113,18 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 		checks[k] = v
 	}
 	s.mu.Unlock()
-	var errs []error
+	// The endpoint is unauthenticated: name the failing checks, but keep
+	// their errors (addresses, backend messages) in the log.
+	var failed []string
 	for name, c := range checks {
 		if err := c(ctx); err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", name, err))
+			failed = append(failed, name)
+			s.logger.Warn("readiness check failed", "check", name, "err", err)
 		}
 	}
-	if err := errors.Join(errs...); err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+	if len(failed) > 0 {
+		slices.Sort(failed)
+		http.Error(w, "not ready: "+strings.Join(failed, ", ")+" unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	_, _ = w.Write([]byte("Ready\n"))
@@ -138,8 +160,15 @@ func (s *Server) Serve(ctx context.Context, shutdownTimeout time.Duration) error
 		}
 	}
 	errc := make(chan error, 1)
-	go func() { errc <- s.srv.Serve(s.ln) }()
-	s.logger.Info("HTTP server listening", "addr", s.ln.Addr())
+	useTLS := s.srv.TLSConfig != nil
+	go func() {
+		if useTLS {
+			errc <- s.srv.ServeTLS(s.ln, "", "") // certificates come from TLSConfig
+			return
+		}
+		errc <- s.srv.Serve(s.ln)
+	}()
+	s.logger.Info("HTTP server listening", "addr", s.ln.Addr(), "tls", useTLS)
 	select {
 	case err := <-errc:
 		return fmt.Errorf("http server: %w", err)

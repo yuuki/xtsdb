@@ -80,22 +80,8 @@ func New(ctx context.Context, target Target, cfg *config.Config, logger *slog.Lo
 		buildInfo(),
 	)
 
-	hot.SetLogger(logger)
-	a.redis, err = hot.NewClient(cfg.Redis)
-	if err != nil {
-		return nil, err
-	}
-	layout := model.Layout{
-		Shards:     cfg.Storage.Shards,
-		ChunkRange: cfg.Storage.ChunkRange.D().Milliseconds(),
-		Grace:      cfg.Storage.GracePeriod.D().Milliseconds(),
-	}
-	a.Hot, err = hot.New(ctx, a.redis, hot.Options{
-		Prefix: cfg.Storage.KeyPrefix,
-		Layout: layout,
-		Lease:  cfg.Flusher.LeaseDuration.D(),
-		Logger: logger.With("component", "redis"),
-	})
+	layout := Layout(cfg)
+	a.Hot, a.redis, err = OpenHot(ctx, cfg, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -111,18 +97,32 @@ func New(ctx context.Context, target Target, cfg *config.Config, logger *slog.Lo
 	}
 	retention := cfg.Storage.Retention.D()
 	cold := cassandra.NewChunkStore(a.session, retention, layout.ChunkRange, cfg.Querier.ReadConcurrency, logger)
-	index := cassandra.NewIndex(a.session, retention, cfg.Querier.ReadConcurrency)
+	if err := cassandra.CheckLayout(ctx, a.session, cfg.Storage.IndexBuckets, cfg.Storage.ChunkRange.D()); err != nil {
+		return nil, err
+	}
+	index := cassandra.NewIndex(a.session, retention, cfg.Querier.ReadConcurrency, cfg.Storage.IndexBuckets)
 
-	a.Server = server.New(cfg.Server.HTTPListenAddress, a.Registry, cfg.Server.EnablePprof, logger.With("component", "http"))
+	httpTLS, err := cfg.Server.TLS.Build()
+	if err != nil {
+		return nil, fmt.Errorf("server.tls: %w", err)
+	}
+	authFailures := server.AuthFailures(a.Registry)
+	readAuth := server.NewAuthenticator("read", cfg.Server.Auth.Read, authFailures)
+	writeAuth := server.NewAuthenticator("write", cfg.Server.Auth.Write, authFailures)
+	a.Server = server.New(cfg.Server.HTTPListenAddress, a.Registry, server.Options{
+		EnablePprof: cfg.Server.EnablePprof,
+		TLS:         httpTLS,
+		Ops:         readAuth.Wrap,
+	}, logger.With("component", "http"))
 	a.Server.AddCheck("redis", a.Hot.Ping)
 	a.Server.AddCheck("cassandra", cold.Ping)
-	a.Server.Mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	a.Server.Mux.Handle("/", readAuth.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
 			return
 		}
 		fmt.Fprintf(w, "xtsdb %s (%s)\n", version.Version, target)
-	})
+	})))
 
 	if target.runs(TargetIngester) {
 		w, err := ingest.NewWriter(a.Hot, index, ingest.WriterOptions{
@@ -139,7 +139,7 @@ func New(ctx context.Context, target Target, cfg *config.Config, logger *slog.Lo
 			return nil, err
 		}
 		a.Server.Mux.Handle("POST /api/v1/write",
-			a.Server.Instrument("write", ingest.RemoteWriteHandler(w, ingest.RemoteWriteOptions{
+			a.Server.Instrument("write", writeAuth.Wrap(ingest.RemoteWriteHandler(w, ingest.RemoteWriteOptions{
 				MaxBodySize:         cfg.Ingester.MaxRequestBodySize,
 				MaxDecompressedSize: cfg.Ingester.MaxDecompressedSize,
 				MaxInflight:         cfg.Ingester.MaxInflightRequests,
@@ -147,10 +147,13 @@ func New(ctx context.Context, target Target, cfg *config.Config, logger *slog.Lo
 					MaxSeries:  cfg.Ingester.MaxSeriesPerRequest,
 					MaxSamples: cfg.Ingester.MaxSamplesPerRequest,
 				},
-			}, logger)))
+			}, logger))))
 		if cfg.Ingester.GraphiteListenAddress != "" {
 			a.Graphite = ingest.NewGraphiteServer(cfg.Ingester.GraphiteListenAddress, cfg.Ingester.GraphiteMaxConnections,
 				w, a.Registry, logger)
+			if a.Graphite.TLS, err = cfg.Ingester.GraphiteTLS.Build(); err != nil {
+				return nil, fmt.Errorf("ingester.graphite_tls: %w", err)
+			}
 		}
 	}
 
@@ -187,7 +190,7 @@ func New(ctx context.Context, target Target, cfg *config.Config, logger *slog.Lo
 			BuildInfo:            version.Info(),
 		})
 		api.Register(a.Server.Mux, func(h http.Handler) http.Handler {
-			return gzhttp.GzipHandler(a.Server.Instrument("query", h))
+			return gzhttp.GzipHandler(a.Server.Instrument("query", readAuth.Wrap(h)))
 		})
 	}
 
@@ -200,6 +203,37 @@ func New(ctx context.Context, target Target, cfg *config.Config, logger *slog.Lo
 		}
 	}
 	return a, nil
+}
+
+// Layout returns the storage layout of a configuration.
+func Layout(cfg *config.Config) model.Layout {
+	return model.Layout{
+		Shards:     cfg.Storage.Shards,
+		ChunkRange: cfg.Storage.ChunkRange.D().Milliseconds(),
+		Grace:      cfg.Storage.GracePeriod.D().Milliseconds(),
+	}
+}
+
+// OpenHot connects to Redis and opens the hot tier. The caller closes the
+// returned client.
+func OpenHot(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*hot.Store, redis.UniversalClient, error) {
+	hot.SetLogger(logger)
+	client, err := hot.NewClient(cfg.Redis)
+	if err != nil {
+		return nil, nil, err
+	}
+	s, err := hot.New(ctx, client, hot.Options{
+		Prefix:        cfg.Storage.KeyPrefix,
+		Layout:        Layout(cfg),
+		Lease:         cfg.Flusher.LeaseDuration.D(),
+		QuarantineTTL: cfg.Flusher.QuarantineTTL.D(),
+		Logger:        logger.With("component", "redis"),
+	})
+	if err != nil {
+		_ = client.Close()
+		return nil, nil, err
+	}
+	return s, client, nil
 }
 
 // Run serves until ctx is cancelled, then shuts down gracefully and

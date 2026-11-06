@@ -3,6 +3,7 @@ package ingest
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -78,6 +79,11 @@ func ParseGraphiteLine(line string, now time.Time) (Series, bool, error) {
 
 // GraphiteServer accepts the Graphite plaintext protocol over TCP and UDP.
 type GraphiteServer struct {
+	// TLS, when set before Start, serves TCP over TLS (with client
+	// certificates if it requires them) and disables UDP, which cannot be
+	// protected.
+	TLS *tls.Config
+
 	addr     string
 	writer   *Writer
 	logger   *slog.Logger
@@ -123,7 +129,7 @@ func NewGraphiteServer(addr string, maxConns int, w *Writer, reg prometheus.Regi
 		}, []string{"outcome"}),
 		connections: f.NewCounterVec(prometheus.CounterOpts{
 			Name: "xtsdb_graphite_connections_total",
-			Help: "Graphite TCP connections, by outcome (accepted, rejected).",
+			Help: "Graphite TCP connections, by outcome (accepted, rejected, tls_failed).",
 		}, []string{"outcome"}),
 	}
 }
@@ -133,6 +139,13 @@ func (g *GraphiteServer) Start() error {
 	ln, err := net.Listen("tcp", g.addr)
 	if err != nil {
 		return fmt.Errorf("graphite tcp: %w", err)
+	}
+	if g.TLS != nil {
+		g.tcp = tls.NewListener(ln, g.TLS)
+		g.logger.Info("listening for Graphite plaintext over TLS (UDP disabled)", "tcp", ln.Addr())
+		g.wg.Add(1)
+		go g.acceptLoop()
+		return nil
 	}
 	pc, err := net.ListenPacket("udp", g.addr)
 	if err != nil {
@@ -157,8 +170,13 @@ func (g *GraphiteServer) Start() error {
 // Addr returns the TCP listen address.
 func (g *GraphiteServer) Addr() net.Addr { return g.tcp.Addr() }
 
-// UDPAddr returns the UDP listen address.
-func (g *GraphiteServer) UDPAddr() net.Addr { return g.udp.LocalAddr() }
+// UDPAddr returns the UDP listen address, or nil when UDP is disabled.
+func (g *GraphiteServer) UDPAddr() net.Addr {
+	if g.udp == nil {
+		return nil
+	}
+	return g.udp.LocalAddr()
+}
 
 // Stop closes the listeners, makes every connection write what it has
 // buffered and close, and waits for that until ctx expires.
@@ -167,7 +185,9 @@ func (g *GraphiteServer) Stop(ctx context.Context) {
 		return
 	}
 	g.tcp.Close()
-	g.udp.Close()
+	if g.udp != nil {
+		g.udp.Close()
+	}
 	// Wake up blocked reads; serveConn sees closing and returns.
 	g.mu.Lock()
 	for c := range g.conns {
@@ -224,6 +244,13 @@ func (g *GraphiteServer) acceptLoop() {
 		go func() {
 			defer g.wg.Done()
 			defer func() { <-sem }()
+			if tc, ok := c.(*tls.Conn); ok && !g.handshake(tc) {
+				g.mu.Lock()
+				delete(g.conns, c)
+				g.mu.Unlock()
+				c.Close()
+				return
+			}
 			g.serveConn(c)
 			g.mu.Lock()
 			delete(g.conns, c)
@@ -235,6 +262,23 @@ func (g *GraphiteServer) acceptLoop() {
 
 // serveConn reads lines and writes them in batches. A line waits at most
 // graphiteFlushInterval in a batch, whether or not more data arrives.
+// graphiteHandshakeTimeout bounds the TLS handshake, so that clients without
+// a valid certificate cannot hold connection slots for the idle timeout
+// (like ReadHeaderTimeout for HTTP). A variable for tests.
+var graphiteHandshakeTimeout = 10 * time.Second
+
+// handshake completes the TLS handshake within graphiteHandshakeTimeout.
+func (g *GraphiteServer) handshake(c *tls.Conn) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), graphiteHandshakeTimeout)
+	defer cancel()
+	if err := c.HandshakeContext(ctx); err != nil {
+		g.connections.WithLabelValues("tls_failed").Inc()
+		g.logger.Debug("graphite TLS handshake failed", "remote", c.RemoteAddr(), "err", err)
+		return false
+	}
+	return true
+}
+
 func (g *GraphiteServer) serveConn(c net.Conn) {
 	r := bufio.NewReaderSize(c, 64<<10)
 	var (

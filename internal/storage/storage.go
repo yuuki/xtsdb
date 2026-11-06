@@ -4,6 +4,8 @@ package storage
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
 	"github.com/prometheus/prometheus/model/labels"
 
@@ -21,9 +23,12 @@ type SeriesSamples struct {
 // rejected because their chunk window had already closed or their chunk
 // reached the maximum size.
 type AppendResult struct {
-	Accepted  int
-	TooOld    int
-	ChunkFull int
+	Accepted int
+	// AcceptedHistograms is how many of the accepted samples are native
+	// histograms.
+	AcceptedHistograms int
+	TooOld             int
+	ChunkFull          int
 }
 
 // ChunkRef identifies a chunk of the hot tier.
@@ -35,18 +40,39 @@ type ChunkRef struct {
 
 // HotChunk is a closed hot chunk loaded for flushing.
 type HotChunk struct {
-	Ref      ChunkRef
-	Fragment int64 // identifies this incarnation of the chunk
-	Size     int   // encoded size when loaded; used to detect later appends
-	Samples  []model.Sample
+	Ref ChunkRef
+	// Fragment identifies this incarnation of the window. Later
+	// incarnations have larger fragments.
+	Fragment int64
+	Size     int // encoded size when loaded; used to detect later appends
+	// Records is the number of samples appended to this incarnation,
+	// including those that were overwritten by a later sample with the same
+	// timestamp. An incarnation only grows, so a larger count means a later
+	// state of it.
+	Records int
+	Samples []model.Sample // sorted and de-duplicated
+}
+
+// LoadResult is the outcome of HotStore.Load.
+type LoadResult struct {
+	// Chunks are the claimed chunks that still exist and can be persisted.
+	Chunks []HotChunk
+	// Missing are the claimed chunks that no longer exist (completed by
+	// another flusher in the meantime). Their in-flight entries must be
+	// released.
+	Missing []ChunkRef
+	// Quarantined is the number of undecodable chunks that were moved out of
+	// the way. They are kept for inspection and are no longer in flight.
+	Quarantined int
 }
 
 // Backlog summarizes the chunks held by the hot tier.
 type Backlog struct {
-	PendingChunks  int64 // chunks not yet claimed, open or closed
-	InflightChunks int64 // chunks claimed by a flusher
-	OldestDue      int64 // earliest due time of any chunk in ms; 0 if none
-	OldestStart    int64 // window start of that chunk in ms; 0 if none
+	PendingChunks     int64 // chunks not yet claimed, open or closed
+	InflightChunks    int64 // chunks claimed by a flusher
+	QuarantinedChunks int64 // undecodable chunks kept for inspection
+	OldestDue         int64 // earliest due time of any chunk in ms; 0 if none
+	OldestStart       int64 // window start of that chunk in ms; 0 if none
 }
 
 // HotStore is the in-memory tier. Samples are appended to per-series time
@@ -56,9 +82,10 @@ type Backlog struct {
 type HotStore interface {
 	Append(ctx context.Context, batch []SeriesSamples) (AppendResult, error)
 	Claim(ctx context.Context, shard, limit int) ([]ChunkRef, error)
-	// Load returns the claimed chunks that still exist, and the refs of
-	// those that do not (completed by another flusher in the meantime).
-	Load(ctx context.Context, refs []ChunkRef) (chunks []HotChunk, missing []ChunkRef, err error)
+	// Load reads claimed chunks. Undecodable chunks are quarantined: moved
+	// out of the way, unless they changed since they were read, so that
+	// they do not block flushing.
+	Load(ctx context.Context, refs []ChunkRef) (LoadResult, error)
 	// Complete deletes persisted chunks. A chunk that changed since it was
 	// loaded is kept and re-processed after its lease expires.
 	Complete(ctx context.Context, chunks []HotChunk) error
@@ -77,12 +104,22 @@ type HotStore interface {
 // identify the version of the chunk that was persisted: if the same window
 // is persisted again with different content (for example after Redis was
 // restored from an older snapshot), it is stored as a separate version
-// instead of overwriting a more complete one. Reads merge all versions.
+// instead of overwriting a more complete one.
+//
+// Reads merge all versions of a window. Where versions disagree on the
+// value at a timestamp, the version that is greatest in (Fragment, Total,
+// Digest) order wins: the latest incarnation, then the latest state of an
+// incarnation (the most records appended). Versions that are equal in
+// (Fragment, Total) can only come from diverging histories of one
+// incarnation, after a restore or a failover; which one is newer cannot be
+// known, and the digest decides, deterministically but arbitrarily.
 type ColdChunk struct {
 	Series   model.SeriesID
 	Start    int64
 	Fragment int64
-	Total    int    // samples in the whole chunk
+	// Total is the number of samples appended to the incarnation in the hot
+	// tier (HotChunk.Records), including overwritten ones.
+	Total    int
 	Digest   uint64 // hash of the whole chunk's samples
 	Part     int
 	MaxT     int64
@@ -99,9 +136,31 @@ type ColdStore interface {
 	Ping(ctx context.Context) error
 }
 
+// ErrSeriesCollision means that a series ID is already used by a different
+// label set. It is wrapped in a *SeriesCollisionError.
+var ErrSeriesCollision = errors.New("series ID collision")
+
+// SeriesCollisionError reports that two label sets hash to the same series
+// ID. The series that recorded the ID first keeps it.
+type SeriesCollisionError struct {
+	ID       model.SeriesID
+	Labels   labels.Labels // the series that was refused
+	Existing labels.Labels // the series that owns the ID
+}
+
+func (e *SeriesCollisionError) Error() string {
+	return fmt.Sprintf("series ID %s of %s is already used by %s", e.ID, e.Labels, e.Existing)
+}
+
+// Unwrap returns ErrSeriesCollision.
+func (e *SeriesCollisionError) Unwrap() error { return ErrSeriesCollision }
+
 // IndexWriter records which series and label values exist on a given day.
 // All writes are idempotent.
 type IndexWriter interface {
+	// WriteSeries records a series and its postings for a day. If the ID
+	// already belongs to a different label set, nothing is written and a
+	// *SeriesCollisionError is returned.
 	WriteSeries(ctx context.Context, day int32, id model.SeriesID, lset labels.Labels) error
 	WriteLabelValue(ctx context.Context, day int32, name, value string) error
 	WriteLabelName(ctx context.Context, day int32, name string) error

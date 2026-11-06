@@ -23,6 +23,17 @@ func TestCommands(t *testing.T) {
 	if code := run([]string{"all", "extra", "-config.file=x.yaml"}, &out, &errOut); code != 2 {
 		t.Fatalf("positional argument: exit %d", code)
 	}
+	for _, args := range [][]string{
+		{"quarantine"},
+		{"quarantine", "bogus"},
+		{"quarantine", "list", "extra"},
+		{"quarantine", "delete"},                       // neither keys nor -all
+		{"quarantine", "delete", "-all", "xt:{0}:q:x"}, // both
+	} {
+		if code := run(args, &out, &errOut); code != 2 {
+			t.Fatalf("%v: exit %d", args, code)
+		}
+	}
 }
 
 func TestConfigCommandRedactsSecrets(t *testing.T) {

@@ -10,13 +10,41 @@ import (
 
 	"github.com/cespare/xxhash/v2"
 	pmodel "github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 )
 
-// Sample is a single float sample. T is a Unix timestamp in milliseconds.
+// Sample is a single sample. T is a Unix timestamp in milliseconds. A
+// sample is either a float (V) or, when H is set, a native histogram;
+// integer histograms are held as float histograms, which represent them
+// exactly.
 type Sample struct {
 	T int64
 	V float64
+	H *histogram.FloatHistogram
+}
+
+// IsHistogram reports whether the sample is a native histogram.
+func (s Sample) IsHistogram() bool { return s.H != nil }
+
+// MaxHistogramBuckets bounds the buckets, spans and custom bounds of one
+// native histogram (Prometheus histograms have at most a few hundred
+// buckets), so that a single histogram stays far below the size limits of a
+// hot chunk and of a cold-tier row. A larger one could be stored in Redis
+// but never flushed.
+const MaxHistogramBuckets = 16384
+
+// ValidateHistogram checks that a histogram is consistent and not too large.
+func ValidateHistogram(h *histogram.FloatHistogram) error {
+	switch {
+	case len(h.PositiveBuckets)+len(h.NegativeBuckets) > MaxHistogramBuckets:
+		return fmt.Errorf("histogram has %d buckets, more than %d", len(h.PositiveBuckets)+len(h.NegativeBuckets), MaxHistogramBuckets)
+	case len(h.PositiveSpans)+len(h.NegativeSpans) > MaxHistogramBuckets:
+		return fmt.Errorf("histogram has %d spans, more than %d", len(h.PositiveSpans)+len(h.NegativeSpans), MaxHistogramBuckets)
+	case len(h.CustomValues) > MaxHistogramBuckets:
+		return fmt.Errorf("histogram has %d custom bounds, more than %d", len(h.CustomValues), MaxHistogramBuckets)
+	}
+	return h.Validate()
 }
 
 // MetricName is the label that holds the metric name.
@@ -88,8 +116,22 @@ const separator = '\xff'
 // ID computes the series ID of canonical labels. The hash input is fixed
 // (name, 0xff, value, 0xff, ...) and does not depend on the in-memory label
 // representation, so IDs are stable across builds and versions.
-func ID(lset labels.Labels) SeriesID {
-	d := xxhash.New()
+//
+// Different label sets can share an ID (about n²/2⁶⁵ for n series). The
+// index detects this when it records a series; see Check.
+func ID(lset labels.Labels) SeriesID { return SeriesID(hash(lset, 0)) }
+
+// checkSeed makes Check independent of ID.
+const checkSeed = 0x9e3779b97f4a7c15
+
+// Check is a second hash of canonical labels, independent of ID. Two label
+// sets with the same ID almost certainly have different checks, which lets
+// caches of known series tell colliding series apart without holding their
+// labels. It is not part of the storage format.
+func Check(lset labels.Labels) uint64 { return hash(lset, checkSeed) }
+
+func hash(lset labels.Labels, seed uint64) uint64 {
+	d := xxhash.NewWithSeed(seed)
 	var buf [1]byte
 	buf[0] = separator
 	lset.Range(func(l labels.Label) {
@@ -98,7 +140,7 @@ func ID(lset labels.Labels) SeriesID {
 		_, _ = d.WriteString(l.Value)
 		_, _ = d.Write(buf[:])
 	})
-	return SeriesID(d.Sum64())
+	return d.Sum64()
 }
 
 // Layout describes how series are spread over shards and how their samples

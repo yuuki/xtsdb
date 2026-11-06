@@ -5,6 +5,7 @@ package cassandra
 import (
 	"fmt"
 	"log/slog"
+	"strings"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 
@@ -23,6 +24,12 @@ func NewSession(cfg config.CassandraConfig, logger *slog.Logger, useKeyspace boo
 		cluster.Keyspace = cfg.Keyspace
 	}
 	cluster.Consistency = consistency
+	// Lightweight transactions (series IDs) stay in the local datacenter
+	// when the configured level does.
+	cluster.SerialConsistency = gocql.Serial
+	if strings.HasPrefix(strings.ToUpper(cfg.Consistency), "LOCAL_") {
+		cluster.SerialConsistency = gocql.LocalSerial
+	}
 	cluster.Timeout = cfg.Timeout.D()
 	cluster.ConnectTimeout = cfg.ConnectTimeout.D()
 	if cfg.NumConns > 0 {

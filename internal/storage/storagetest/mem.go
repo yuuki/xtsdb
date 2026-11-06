@@ -78,6 +78,9 @@ func (h *Hot) Append(_ context.Context, batch []storage.SeriesSamples) (storage.
 			}
 			c.raw = append(c.raw, s)
 			res.Accepted++
+			if s.IsHistogram() {
+				res.AcceptedHistograms++
+			}
 		}
 	}
 	return res, nil
@@ -105,24 +108,22 @@ func (h *Hot) Claim(_ context.Context, shard, limit int) ([]storage.ChunkRef, er
 }
 
 // Load implements storage.HotStore.
-func (h *Hot) Load(_ context.Context, refs []storage.ChunkRef) ([]storage.HotChunk, []storage.ChunkRef, error) {
+func (h *Hot) Load(_ context.Context, refs []storage.ChunkRef) (storage.LoadResult, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	var (
-		out     []storage.HotChunk
-		missing []storage.ChunkRef
-	)
+	var res storage.LoadResult
 	for _, ref := range refs {
 		c := h.chunks[ref]
 		if c == nil {
-			missing = append(missing, ref)
+			res.Missing = append(res.Missing, ref)
 			continue
 		}
-		out = append(out, storage.HotChunk{
-			Ref: ref, Fragment: c.fragment, Size: size(c), Samples: chunk.Normalize(slices.Clone(c.raw)),
+		res.Chunks = append(res.Chunks, storage.HotChunk{
+			Ref: ref, Fragment: c.fragment, Size: size(c), Records: len(c.raw),
+			Samples: chunk.Normalize(slices.Clone(c.raw)),
 		})
 	}
-	return out, missing, nil
+	return res, nil
 }
 
 // Complete implements storage.HotStore.
@@ -273,8 +274,10 @@ func (c *Cold) Read(_ context.Context, ids []model.SeriesID, mint, maxt int64) (
 		keys = append(keys, k)
 	}
 	slices.SortFunc(keys, func(a, b coldKey) int {
+		// The clustering order of the Cassandra table, which stores the
+		// digest as a signed bigint.
 		return cmp.Or(cmp.Compare(a.start, b.start), cmp.Compare(a.fragment, b.fragment),
-			cmp.Compare(a.total, b.total), cmp.Compare(a.digest, b.digest), cmp.Compare(a.part, b.part))
+			cmp.Compare(a.total, b.total), cmp.Compare(int64(a.digest), int64(b.digest)), cmp.Compare(a.part, b.part))
 	})
 	out := make(map[model.SeriesID][]model.Sample)
 	for _, id := range ids {
@@ -353,6 +356,9 @@ func (x *Index) WriteSeries(_ context.Context, day int32, id model.SeriesID, lse
 	defer x.mu.Unlock()
 	if x.FailWrites != nil {
 		return x.FailWrites
+	}
+	if old, ok := x.series[id]; ok && !labels.Equal(old, lset) {
+		return &storage.SeriesCollisionError{ID: id, Labels: lset, Existing: old}
 	}
 	x.Writes++
 	x.series[id] = lset

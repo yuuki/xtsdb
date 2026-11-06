@@ -3,6 +3,7 @@ package ingest
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -18,12 +20,15 @@ import (
 
 	"github.com/klauspost/compress/s2"
 	"github.com/klauspost/compress/snappy"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/prompb"
 	writev2 "github.com/prometheus/prometheus/prompb/io/prometheus/write/v2"
 
+	"github.com/yuuki/xtsdb/internal/config"
 	"github.com/yuuki/xtsdb/internal/model"
 	"github.com/yuuki/xtsdb/internal/storage/storagetest"
+	"github.com/yuuki/xtsdb/internal/tlstest"
 )
 
 var testLayout = model.Layout{Shards: 4, ChunkRange: time.Hour.Milliseconds(), Grace: time.Minute.Milliseconds()}
@@ -109,6 +114,86 @@ func TestWriterDoesNotStoreUnindexedSamples(t *testing.T) {
 	}
 }
 
+// Samples beyond the maximum chunk size are rejected and reported, so that
+// remote write answers 400 instead of dropping them silently.
+func TestWriterReportsFullChunks(t *testing.T) {
+	w, hot, _ := newTestWriter(t)
+	hot.MaxChunk = 2
+	h := RemoteWriteHandler(w, testRWOptions, slog.New(slog.DiscardHandler))
+	now := time.Now().UnixMilli()
+	req := &prompb.WriteRequest{Timeseries: []prompb.TimeSeries{{
+		Labels:  []prompb.Label{{Name: "__name__", Value: "busy"}},
+		Samples: []prompb.Sample{{Timestamp: now, Value: 1}, {Timestamp: now + 1, Value: 2}, {Timestamp: now + 2, Value: 3}},
+	}}}
+	body, _ := req.Marshal()
+	rec := post(t, h, "", body)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "maximum size") {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	res, err := w.Write(context.Background(), []Series{{Labels: labels.FromStrings("__name__", "busy"),
+		Samples: []model.Sample{{T: now + 3, V: 4}}}})
+	if err != nil || res.ChunkFull != 1 || res.Rejected() != 1 {
+		t.Fatalf("result %+v %v", res, err)
+	}
+}
+
+// Two label sets with the same series ID: the one recorded first keeps the
+// ID, samples of the other are rejected and none of its index entries are
+// written.
+func TestWriterRejectsCollidingSeries(t *testing.T) {
+	w, hot, index := newTestWriter(t)
+	w.idOf = func(labels.Labels) model.SeriesID { return 42 } // every series collides
+	ctx := context.Background()
+	now := time.Now().UnixMilli()
+	a := labels.FromStrings("__name__", "up", "job", "a")
+	b := labels.FromStrings("__name__", "up", "job", "b")
+	write := func(lset labels.Labels, ts int64) Result {
+		t.Helper()
+		res, err := w.Write(ctx, []Series{{Labels: lset, Samples: []model.Sample{{T: ts, V: 1}, {T: ts + 1, V: 2}}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	if res := write(a, now); res.Accepted != 2 {
+		t.Fatalf("first series: %+v", res)
+	}
+	if res := write(b, now+10); res.Collision != 2 || res.Accepted != 0 || res.Rejected() != 2 {
+		t.Fatalf("colliding series must be rejected: %+v", res)
+	}
+	// The owner keeps writing (from the cache), the other one is still
+	// rejected without asking the index again.
+	writes := index.Writes
+	if res := write(a, now+20); res.Accepted != 2 {
+		t.Fatalf("owner: %+v", res)
+	}
+	if res := write(b, now+30); res.Collision != 2 {
+		t.Fatalf("colliding series must stay rejected: %+v", res)
+	}
+	if index.Writes != writes {
+		t.Fatalf("index written %d more times", index.Writes-writes)
+	}
+	// Both in one batch.
+	res, err := w.Write(ctx, []Series{
+		{Labels: b, Samples: []model.Sample{{T: now + 40, V: 1}}},
+		{Labels: a, Samples: []model.Sample{{T: now + 41, V: 1}}},
+	})
+	if err != nil || res.Accepted != 1 || res.Collision != 1 {
+		t.Fatalf("mixed batch: %+v %v", res, err)
+	}
+	got, err := hot.Read(ctx, []model.SeriesID{42}, now-1000, now+1000)
+	if err != nil || len(got[42]) != 5 {
+		t.Fatalf("hot tier holds %v for ID 42, want the 5 samples of the owner (%v)", got[42], err)
+	}
+	vals, _ := index.LabelValues(ctx, model.Day(now), "job")
+	if fmt.Sprint(vals) != "[a]" {
+		t.Fatalf("label values of the colliding series must not be indexed: %v", vals)
+	}
+	if !strings.Contains(describeRejections(Result{Collision: 3}), "collides") {
+		t.Fatal("collisions must be described")
+	}
+}
+
 func TestParseGraphiteLine(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	cases := []struct {
@@ -179,6 +264,105 @@ func TestGraphiteServer(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("graphite samples were not stored")
+}
+
+// Over TLS with client certificates, only clients with a certificate from
+// the configured CA can write, and UDP is not served.
+func TestGraphiteServerTLS(t *testing.T) {
+	w, hot, _ := newTestWriter(t)
+	f := tlstest.Generate(t, t.TempDir())
+	g := NewGraphiteServer("127.0.0.1:0", 16, w, nil, slog.New(slog.DiscardHandler))
+	var err error
+	g.TLS, err = config.ServerTLSConfig{CertFile: f.ServerCert, KeyFile: f.ServerKey, ClientCAFile: f.CA}.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer g.Stop(context.Background())
+	if g.UDPAddr() != nil {
+		t.Fatal("UDP must be disabled with TLS")
+	}
+	now := time.Now().Unix()
+	send := func(withCert bool, host string) error {
+		conn, err := tls.Dial("tcp", g.Addr().String(), f.ClientConfig(t, withCert))
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+		if _, err := fmt.Fprintf(conn, "tls.metric;host=%s 1 %d\n", host, now); err != nil {
+			return err
+		}
+		// TLS 1.3 reports a rejected client certificate on the first read.
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+		_, err = conn.Read(make([]byte, 1))
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return nil
+		}
+		return err
+	}
+	if err := send(false, "anonymous"); err == nil {
+		t.Fatal("a client without a certificate must be refused")
+	}
+	if err := send(true, "trusted"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(readAll(t, hot, labels.FromStrings("__name__", "tls.metric", "host", "trusted"))) == 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(readAll(t, hot, labels.FromStrings("__name__", "tls.metric", "host", "trusted"))) != 1 {
+		t.Fatal("the sample sent over TLS was not stored")
+	}
+	if len(readAll(t, hot, labels.FromStrings("__name__", "tls.metric", "host", "anonymous"))) != 0 {
+		t.Fatal("the sample of the refused client was stored")
+	}
+}
+
+// Clients that connect without completing the TLS handshake give their
+// connection slot back after the handshake timeout, so that they cannot
+// lock out senders with valid certificates.
+func TestGraphiteTLSHandshakeTimeout(t *testing.T) {
+	defer func(d time.Duration) { graphiteHandshakeTimeout = d }(graphiteHandshakeTimeout)
+	graphiteHandshakeTimeout = 200 * time.Millisecond
+	w, hot, _ := newTestWriter(t)
+	f := tlstest.Generate(t, t.TempDir())
+	const maxConns = 2
+	g := NewGraphiteServer("127.0.0.1:0", maxConns, w, nil, slog.New(slog.DiscardHandler))
+	var err error
+	g.TLS, err = config.ServerTLSConfig{CertFile: f.ServerCert, KeyFile: f.ServerKey, ClientCAFile: f.CA}.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer g.Stop(context.Background())
+	for range maxConns { // idle connections that never send a ClientHello
+		c, err := net.Dial("tcp", g.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+	}
+	time.Sleep(graphiteHandshakeTimeout + 300*time.Millisecond)
+	conn, err := tls.Dial("tcp", g.Addr().String(), f.ClientConfig(t, true))
+	if err != nil {
+		t.Fatalf("a trusted client must be served once idle handshakes time out: %v", err)
+	}
+	fmt.Fprintf(conn, "tls.slots 1 %d\n", time.Now().Unix())
+	conn.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && len(readAll(t, hot, labels.FromStrings("__name__", "tls.slots"))) == 0 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(readAll(t, hot, labels.FromStrings("__name__", "tls.slots"))) != 1 {
+		t.Fatal("the trusted client's sample was not stored")
+	}
 }
 
 var testRWOptions = RemoteWriteOptions{
@@ -324,21 +508,80 @@ func TestRemoteWriteLimits(t *testing.T) {
 	}
 }
 
-func TestRemoteWriteRejectsHistogramsButKeepsFloats(t *testing.T) {
+func testHistogram(i int) *histogram.Histogram {
+	return &histogram.Histogram{
+		Schema:          0,
+		Count:           uint64(3 + i),
+		Sum:             float64(i),
+		ZeroThreshold:   0.001,
+		ZeroCount:       1,
+		PositiveSpans:   []histogram.Span{{Offset: 0, Length: 2}},
+		PositiveBuckets: []int64{1, int64(i)}, // deltas: 1, 1+i
+	}
+}
+
+// Native histograms are stored next to float samples, in both protocol
+// versions; invalid ones are rejected.
+func TestRemoteWriteHistograms(t *testing.T) {
 	w, hot, _ := newTestWriter(t)
 	h := RemoteWriteHandler(w, testRWOptions, slog.New(slog.DiscardHandler))
 	now := time.Now().UnixMilli()
-	req := &prompb.WriteRequest{Timeseries: []prompb.TimeSeries{
+
+	v1 := &prompb.WriteRequest{Timeseries: []prompb.TimeSeries{
 		{Labels: []prompb.Label{{Name: "__name__", Value: "f"}}, Samples: []prompb.Sample{{Timestamp: now, Value: 1}}},
-		{Labels: []prompb.Label{{Name: "__name__", Value: "h"}}, Histograms: []prompb.Histogram{{Timestamp: now}}},
+		{Labels: []prompb.Label{{Name: "__name__", Value: "h1"}}, Histograms: []prompb.Histogram{
+			prompb.FromIntHistogram(now, testHistogram(1)),
+			prompb.FromFloatHistogram(now+1000, testHistogram(2).ToFloat(nil)),
+		}},
 	}}
-	body, _ := req.Marshal()
-	rec := post(t, h, "", body)
-	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "histogram") {
-		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	body, _ := v1.Marshal()
+	if rec := post(t, h, "", body); rec.Code != http.StatusNoContent {
+		t.Fatalf("v1: status %d: %s", rec.Code, rec.Body)
 	}
-	if got := readAll(t, hot, labels.FromStrings("__name__", "f")); len(got) != 1 {
-		t.Fatal("float samples of the same request must be stored")
+	got := readAll(t, hot, labels.FromStrings("__name__", "h1"))
+	if len(got) != 2 || got[0].H == nil || !got[0].H.Equals(testHistogram(1).ToFloat(nil)) || got[1].H.Count != 5 {
+		t.Fatalf("v1 histograms stored as %v", got)
+	}
+	if got := readAll(t, hot, labels.FromStrings("__name__", "f")); len(got) != 1 || got[0].H != nil {
+		t.Fatalf("float samples stored as %v", got)
+	}
+
+	st := writev2.NewSymbolTable()
+	custom := &histogram.FloatHistogram{
+		Schema: histogram.CustomBucketsSchema, Count: 3, Sum: 2,
+		PositiveSpans: []histogram.Span{{Offset: 0, Length: 2}}, PositiveBuckets: []float64{1, 2},
+		CustomValues: []float64{0.5, 1},
+	}
+	v2 := &writev2.Request{Timeseries: []writev2.TimeSeries{{
+		LabelsRefs: st.SymbolizeLabels(labels.FromStrings("__name__", "h2"), nil),
+		Samples:    []writev2.Sample{{Timestamp: now, Value: 7}},
+		Histograms: []writev2.Histogram{
+			writev2.FromIntHistogram(0, now+1000, testHistogram(3)),
+			writev2.FromFloatHistogram(0, now+2000, custom),
+		},
+	}}, Symbols: st.Symbols()}
+	body, _ = v2.Marshal()
+	rec := post(t, h, "application/x-protobuf;proto=io.prometheus.write.v2.Request", body)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("v2: status %d: %s", rec.Code, rec.Body)
+	}
+	if s, hs := rec.Header().Get(headerSamplesWritten), rec.Header().Get(headerHistogramsWritten); s != "1" || hs != "2" {
+		t.Fatalf("written headers: samples %q, histograms %q", s, hs)
+	}
+	got = readAll(t, hot, labels.FromStrings("__name__", "h2"))
+	if len(got) != 3 || got[0].V != 7 || got[2].H == nil || !got[2].H.Equals(custom) {
+		t.Fatalf("v2 samples stored as %v", got)
+	}
+
+	// A histogram whose count does not match its buckets is rejected.
+	bad := testHistogram(4)
+	bad.Count = 1
+	v1 = &prompb.WriteRequest{Timeseries: []prompb.TimeSeries{
+		{Labels: []prompb.Label{{Name: "__name__", Value: "bad"}}, Histograms: []prompb.Histogram{prompb.FromIntHistogram(now, bad)}},
+	}}
+	body, _ = v1.Marshal()
+	if rec := post(t, h, "", body); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "histogram") {
+		t.Fatalf("invalid histogram: status %d: %s", rec.Code, rec.Body)
 	}
 }
 
@@ -453,5 +696,41 @@ func TestGraphiteStopIsPromptAndFlushes(t *testing.T) {
 	}
 	if countStored(t, hot, "pending") != 1 {
 		t.Fatal("buffered line was not written on shutdown")
+	}
+}
+
+// A histogram with millions of buckets is a few bytes per bucket on the
+// wire; it is refused before it is decoded, and a large one that gets
+// through is rejected instead of creating a chunk that cannot be flushed.
+func TestRemoteWriteBoundsHistogramBuckets(t *testing.T) {
+	w, hot, _ := newTestWriter(t)
+	h := RemoteWriteHandler(w, testRWOptions, slog.New(slog.DiscardHandler))
+	now := time.Now().UnixMilli()
+	big := func(buckets int) *histogram.Histogram {
+		return &histogram.Histogram{Schema: 0, PositiveSpans: []histogram.Span{{Length: uint32(buckets)}},
+			PositiveBuckets: make([]int64, buckets)}
+	}
+	post1 := func(hist *histogram.Histogram) *httptest.ResponseRecorder {
+		req := &prompb.WriteRequest{Timeseries: []prompb.TimeSeries{{
+			Labels: []prompb.Label{{Name: "__name__", Value: "big"}}, Histograms: []prompb.Histogram{prompb.FromIntHistogram(now, hist)},
+		}}}
+		body, _ := req.Marshal()
+		return post(t, h, "", body)
+	}
+	// Beyond the element limit of the request: refused on the wire.
+	if rec := post1(big(testRWOptions.Limits.MaxSamples + 1)); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	// Within the request limits but beyond MaxHistogramBuckets: invalid.
+	res, err := w.Write(context.Background(), []Series{{Labels: labels.FromStrings("__name__", "big"),
+		Samples: []model.Sample{{T: now, H: big(model.MaxHistogramBuckets + 1).ToFloat(nil)}}}})
+	if err != nil || res.Invalid != 1 || !strings.Contains(fmt.Sprint(res.FirstInvalid), "buckets") {
+		t.Fatalf("result %+v %v", res, err)
+	}
+	if got := readAll(t, hot, labels.FromStrings("__name__", "big")); len(got) != 0 {
+		t.Fatalf("the oversized histogram was stored: %d samples", len(got))
+	}
+	if rec := post1(big(100)); rec.Code != http.StatusNoContent {
+		t.Fatalf("a normal histogram must be accepted: %d %s", rec.Code, rec.Body)
 	}
 }

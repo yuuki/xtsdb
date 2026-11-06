@@ -7,7 +7,11 @@ import (
 	"log/slog"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
+	"time"
+
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 
 	"github.com/yuuki/xtsdb/internal/config"
 )
@@ -19,6 +23,9 @@ var tables = []string{
 	// version (fragment, total, digest) stored in one or more parts. More
 	// versions appear only when a window is persisted again with different
 	// content, for example after Redis was restored from an older snapshot.
+	// The clustering order is the precedence of versions on reads: later
+	// fragments, then more records (total), then the digest as a signed
+	// 64-bit value.
 	`CREATE TABLE IF NOT EXISTS chunks (
 		series_id bigint,
 		day       int,
@@ -42,21 +49,28 @@ var tables = []string{
 		labels    frozen<map<text, text>>
 	)`,
 
-	// Inverted index: label pair -> series active on that day.
+	// Inverted index: label pair -> series active on that day. The series of
+	// a label pair are spread over storage.index_buckets partitions by
+	// series ID, so that a pair shared by millions of series does not make
+	// one huge partition.
 	`CREATE TABLE IF NOT EXISTS postings (
 		day       int,
 		name      text,
 		value     text,
+		bucket    smallint,
 		series_id bigint,
-		PRIMARY KEY ((day, name, value), series_id)
+		PRIMARY KEY ((day, name, value, bucket), series_id)
 	) WITH compaction = {'class': 'TimeWindowCompactionStrategy', 'compaction_window_unit': 'DAYS', 'compaction_window_size': 1}
 	  AND gc_grace_seconds = 86400`,
 
+	// Values of a label name seen on a day, spread over
+	// storage.index_buckets partitions by a hash of the value.
 	`CREATE TABLE IF NOT EXISTS label_values (
-		day   int,
-		name  text,
-		value text,
-		PRIMARY KEY ((day, name), value)
+		day    int,
+		name   text,
+		bucket smallint,
+		value  text,
+		PRIMARY KEY ((day, name, bucket), value)
 	) WITH gc_grace_seconds = 86400`,
 
 	`CREATE TABLE IF NOT EXISTS label_names (
@@ -64,7 +78,17 @@ var tables = []string{
 		name text,
 		PRIMARY KEY (day, name)
 	) WITH gc_grace_seconds = 86400`,
+
+	// Layout parameters the data was written with (see CheckLayout).
+	`CREATE TABLE IF NOT EXISTS meta (
+		name  text PRIMARY KEY,
+		value text
+	)`,
 }
+
+// bucketedTables are the tables whose partition key gained a bucket column.
+// Tables created by earlier builds cannot be changed in place.
+var bucketedTables = []string{"postings", "label_values"}
 
 // Migrate creates the keyspace and tables if they do not exist.
 func Migrate(ctx context.Context, cfg config.CassandraConfig, logger *slog.Logger) error {
@@ -84,6 +108,9 @@ func Migrate(ctx context.Context, cfg config.CassandraConfig, logger *slog.Logge
 	if err := s.Query(stmt).ExecContext(ctx); err != nil {
 		return fmt.Errorf("create keyspace: %w", err)
 	}
+	if err := checkBucketedTables(ctx, s, cfg.Keyspace); err != nil {
+		return err
+	}
 	for _, t := range tables {
 		stmt := strings.Replace(t, "IF NOT EXISTS ", "IF NOT EXISTS "+cfg.Keyspace+".", 1)
 		if err := s.Query(stmt).ExecContext(ctx); err != nil {
@@ -95,6 +122,58 @@ func Migrate(ctx context.Context, cfg config.CassandraConfig, logger *slog.Logge
 	}
 	if logger != nil {
 		logger.Info("cassandra schema is up to date", "keyspace", cfg.Keyspace)
+	}
+	return nil
+}
+
+// checkBucketedTables refuses to migrate a keyspace whose index tables were
+// created without buckets: CREATE TABLE IF NOT EXISTS would keep them, and
+// every index write would then fail.
+func checkBucketedTables(ctx context.Context, s *gocql.Session, keyspace string) error {
+	for _, table := range bucketedTables {
+		iter := s.Query(`SELECT column_name FROM system_schema.columns WHERE keyspace_name = ? AND table_name = ?`,
+			keyspace, table).IterContext(ctx)
+		var (
+			col     string
+			columns int
+			bucket  bool
+		)
+		for iter.Scan(&col) {
+			columns++
+			bucket = bucket || col == "bucket"
+		}
+		if err := iter.Close(); err != nil {
+			return fmt.Errorf("read schema of %s.%s: %w", keyspace, table, err)
+		}
+		if columns > 0 && !bucket {
+			return fmt.Errorf("table %s.%s was created by an earlier build without index buckets and cannot be changed in place; "+
+				"drop the postings and label_values tables and run the migration again (series indexed before become "+
+				"discoverable again once they are written to), or use a new keyspace", keyspace, table)
+		}
+	}
+	return nil
+}
+
+// CheckLayout records the layout of the Cassandra data on first use and
+// refuses to run with a different one: changing the number of index buckets
+// would make index entries unreachable, and changing the chunk range would
+// make reads miss chunks that start before the queried range.
+func CheckLayout(ctx context.Context, s *gocql.Session, indexBuckets int, chunkRange time.Duration) error {
+	fields := []struct{ name, value, option string }{
+		{"index_buckets", strconv.Itoa(indexBuckets), "storage.index_buckets"},
+		{"chunk_range_ms", strconv.FormatInt(chunkRange.Milliseconds(), 10), "storage.chunk_range"},
+	}
+	for _, f := range fields {
+		existing := make(map[string]any)
+		applied, err := s.Query(`INSERT INTO meta (name, value) VALUES (?, ?) IF NOT EXISTS`, f.name, f.value).
+			MapScanCASContext(ctx, existing)
+		if err != nil {
+			return fmt.Errorf("cassandra meta: %w (run xtsdb migrate)", err)
+		}
+		if got, _ := existing["value"].(string); !applied && got != f.value {
+			return fmt.Errorf("%s is %s but the data in Cassandra was written with %s (%s); "+
+				"changing it is not supported", f.option, f.value, got, f.name)
+		}
 	}
 	return nil
 }

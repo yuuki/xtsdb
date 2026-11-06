@@ -20,6 +20,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/yuuki/xtsdb/internal/chunk"
+	"github.com/yuuki/xtsdb/internal/model"
 	"github.com/yuuki/xtsdb/internal/storage"
 )
 
@@ -42,13 +43,14 @@ type Flusher struct {
 	opts Options
 	log  *slog.Logger
 
-	chunks     *prometheus.CounterVec
-	samples    prometheus.Counter
-	bytes      prometheus.Counter
-	batchTime  prometheus.Histogram
-	pending    prometheus.Gauge
-	inflight   prometheus.Gauge
-	lagSeconds prometheus.Gauge
+	chunks      *prometheus.CounterVec
+	samples     prometheus.Counter
+	bytes       prometheus.Counter
+	batchTime   prometheus.Histogram
+	pending     prometheus.Gauge
+	inflight    prometheus.Gauge
+	quarantined prometheus.Gauge
+	lagSeconds  prometheus.Gauge
 }
 
 // New creates a Flusher.
@@ -87,6 +89,10 @@ func New(hot storage.HotStore, cold storage.ColdStore, opts Options) *Flusher {
 		inflight: reg.NewGauge(prometheus.GaugeOpts{
 			Name: "xtsdb_hot_inflight_chunks",
 			Help: "Chunks claimed by flushers and not completed yet.",
+		}),
+		quarantined: reg.NewGauge(prometheus.GaugeOpts{
+			Name: "xtsdb_hot_quarantined_chunks",
+			Help: "Undecodable chunks kept in quarantine in the hot tier (see `xtsdb quarantine`).",
 		}),
 		lagSeconds: reg.NewGauge(prometheus.GaugeOpts{
 			Name: "xtsdb_flusher_lag_seconds",
@@ -176,14 +182,18 @@ func (f *Flusher) flushBatch(ctx context.Context, refs []storage.ChunkRef) int {
 	leaseEnd := start.Add(f.opts.Lease)
 
 	loadCtx, cancel := context.WithTimeout(work, f.opts.Lease)
-	chunks, missing, err := f.hot.Load(loadCtx, refs)
+	loaded, err := f.hot.Load(loadCtx, refs)
 	cancel()
 	if err != nil {
 		f.log.Error("load failed", "chunks", len(refs), "err", err)
 		f.chunks.WithLabelValues("error").Add(float64(len(refs)))
 		return 0
 	}
-	finished := 0
+	chunks, missing := loaded.Chunks, loaded.Missing
+	finished := loaded.Quarantined
+	if loaded.Quarantined > 0 {
+		f.chunks.WithLabelValues("quarantined").Add(float64(loaded.Quarantined))
+	}
 	if len(missing) > 0 {
 		rctx, cancel := context.WithTimeout(work, completeTimeout)
 		if err := f.hot.Release(rctx, missing); err != nil {
@@ -243,40 +253,66 @@ func (f *Flusher) flushBatch(ctx context.Context, refs []storage.ChunkRef) int {
 	return finished + len(done)
 }
 
-// samplesPerPart bounds the size of one cold-tier row (well below the
-// Cassandra mutation size limit even for incompressible values).
-const samplesPerPart = 100_000
+// samplesPerPart and bytesPerPart bound the size of one cold-tier row, well
+// below the Cassandra mutation size limit even for incompressible values and
+// large native histograms.
+const (
+	samplesPerPart = 100_000
+	bytesPerPart   = 4 << 20
+)
 
 func (f *Flusher) persist(ctx context.Context, c storage.HotChunk) error {
-	if len(c.Samples) == 0 {
-		return nil
-	}
-	digest := xxhash.Sum64(chunk.AppendRaw(nil, c.Samples))
-	for part, i := 0, 0; i < len(c.Samples); part, i = part+1, i+samplesPerPart {
-		samples := c.Samples[i:min(i+samplesPerPart, len(c.Samples))]
-		data, err := chunk.EncodeXOR(samples)
-		if err != nil {
-			return err
-		}
-		err = f.cold.WriteChunk(ctx, storage.ColdChunk{
-			Series:   c.Ref.Series,
-			Start:    c.Ref.Start,
-			Fragment: c.Fragment,
-			Total:    len(c.Samples),
-			Digest:   digest,
-			Part:     part,
-			MaxT:     samples[len(samples)-1].T,
-			Count:    len(samples),
-			Encoding: chunk.EncodingXOR,
-			Data:     data,
-		})
-		if err != nil {
-			return err
-		}
-		f.bytes.Add(float64(len(data)))
+	n, err := WriteCold(ctx, f.cold, c.Ref.Series, c.Ref.Start, c.Fragment, c.Records, c.Samples)
+	f.bytes.Add(float64(n))
+	if err != nil {
+		return err
 	}
 	f.samples.Add(float64(len(c.Samples)))
 	return nil
+}
+
+// WriteCold writes one version of a chunk window to the cold tier, in parts
+// of at most 100,000 samples and 4 MiB, and returns the number of compressed
+// bytes written. samples must be sorted and de-duplicated; total is the
+// number of records of the version (see storage.ColdChunk). Writing the same
+// version again writes the same rows: parts are cut deterministically.
+func WriteCold(ctx context.Context, cold storage.ColdStore, series model.SeriesID, start, fragment int64,
+	total int, samples []model.Sample) (int, error) {
+	if len(samples) == 0 {
+		return 0, nil
+	}
+	digest := xxhash.Sum64(chunk.AppendRaw(nil, samples))
+	written := 0
+	for part, i := 0, 0; i < len(samples); part++ {
+		n := min(samplesPerPart, len(samples)-i)
+		enc, data, err := chunk.Encode(samples[i : i+n])
+		for err == nil && len(data) > bytesPerPart && n > 1 {
+			n /= 2
+			enc, data, err = chunk.Encode(samples[i : i+n])
+		}
+		if err != nil {
+			return written, err
+		}
+		p := samples[i : i+n]
+		i += n
+		err = cold.WriteChunk(ctx, storage.ColdChunk{
+			Series:   series,
+			Start:    start,
+			Fragment: fragment,
+			Total:    total,
+			Digest:   digest,
+			Part:     part,
+			MaxT:     p[len(p)-1].T,
+			Count:    len(p),
+			Encoding: enc,
+			Data:     data,
+		})
+		if err != nil {
+			return written, err
+		}
+		written += len(data)
+	}
+	return written, nil
 }
 
 // reportBacklog periodically exports how much work is waiting.
@@ -288,6 +324,7 @@ func (f *Flusher) reportBacklog(ctx context.Context) {
 		if err == nil {
 			f.pending.Set(float64(b.PendingChunks))
 			f.inflight.Set(float64(b.InflightChunks))
+			f.quarantined.Set(float64(b.QuarantinedChunks))
 			lag := 0.0
 			if b.OldestDue > 0 {
 				lag = max(0, float64(time.Now().UnixMilli()-b.OldestDue)/1000)

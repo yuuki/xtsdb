@@ -33,6 +33,12 @@ series ID is the xxhash64 of `name 0xff value 0xff ...` over the sorted
 labels. Because the hash input is fixed, IDs do not depend on label order
 or on the in-memory label representation; a golden test pins the function.
 
+Two different label sets can hash to the same ID: over the series held
+during the retention period, the probability is about n²/2⁶⁵ (2.7e-4 for
+10⁸ series, 2.7% for 10⁹). Such collisions are detected when the series
+is indexed (see [Series index](#series-index-cassandra)): the series that
+recorded the ID first keeps it, and samples of the other one are rejected.
+
 **Shards.** A series belongs to hot-tier shard
 `(id >> 32) mod storage.shards`. All keys of a shard share the Redis hash
 tag `{N}`, so they live in one Redis Cluster slot and Lua scripts over a
@@ -49,19 +55,45 @@ A window is *due* at `start + chunk_range + grace_period`.
 ## Hot tier (Redis)
 
 ```
-<prefix>:{N}:c:<series>:<window>   chunk: 16-byte header + 16-byte records
-<prefix>:{N}:due                   ZSET  member -> due time (ms), not yet claimed
-<prefix>:{N}:inf                   ZSET  member -> lease expiry (ms), claimed
-<prefix>:{N}:infdue                ZSET  member -> due time (ms), claimed
-<prefix>:{N}:q:<series>:<window>   quarantined chunk (undecodable)
-<prefix>:meta                      HASH  layout parameters (shards, chunk range)
+<prefix>:{N}:c:<series>:<window>           chunk: 16-byte header + 16-byte records
+<prefix>:{N}:due                           ZSET  member -> due time (ms), not yet claimed
+<prefix>:{N}:inf                           ZSET  member -> lease expiry (ms), claimed
+<prefix>:{N}:infdue                        ZSET  member -> due time (ms), claimed
+<prefix>:{N}:clock                         last fragment issued in the shard
+<prefix>:{N}:w:<series>                    ZSET  window start -> window start, chunks of the series
+<prefix>:{N}:q:<series>:<window>:<digest>  quarantined chunk (undecodable)
+<prefix>:{N}:qidx                          ZSET  quarantine key -> expiry time (ms)
+<prefix>:meta                              HASH  layout parameters (shards, chunk range)
 ```
 
-The chunk header is the creation time of the chunk in microseconds as
-16 ASCII digits, taken from the Redis server clock. It identifies this
-incarnation of the window (its *fragment*). Records are a big-endian
-timestamp (ms) and IEEE-754 value, appended in arrival order, so an append
-never reads the chunk. A chunk is limited to 32 MiB (about two million
+The chunk header is the chunk's *fragment*: 16 ASCII digits that identify
+this incarnation of the window and order it after every earlier
+incarnation. It comes from a hybrid clock per shard: the Redis server time
+in microseconds, or one more than the last fragment issued in the shard
+(`<prefix>:{N}:clock`) when the server clock is behind it. Fragments
+therefore keep increasing when the Redis clock steps backwards (an NTP step,
+or a failover to a node with a slower clock); after a restore from an
+older snapshot, which rewinds the shard clock, the server time has normally
+moved past the fragments issued before. Records are appended in arrival
+order, so an append never reads the chunk:
+
+- a float sample is 16 bytes: a big-endian timestamp (ms) and IEEE-754
+  value;
+- a native histogram is 16 bytes, its timestamp and `0x7ff4 << 48 | length`,
+  followed by the histogram as a Remote Write 2.0 protobuf `Histogram`,
+  padded to a multiple of 16 bytes. That value word is a NaN that float
+  records never hold: incoming NaNs with the same top 16 bits are stored as
+  the standard NaN, which PromQL does not tell apart (the stale marker is a
+  different NaN and is kept). Chunks therefore stay a multiple of 16 bytes,
+  and a series may change between floats and histograms.
+
+Integer histograms are stored as float histograms, which represent them
+exactly; remote write validates them as integer histograms first. A
+histogram may have at most 16,384 buckets, spans and custom bounds each
+(`outcome="invalid"` otherwise), and the buckets of a remote write request
+count towards `ingester.max_samples_per_request` before it is decoded. A hot
+record that does not decode into a valid histogram is treated as corruption
+and quarantined. A chunk is limited to 32 MiB (about two million
 samples); samples beyond that are rejected (`outcome="chunk_full"`) rather
 than creating a chunk that cannot be flushed.
 
@@ -82,7 +114,8 @@ Before anything is stored, the ingester:
   skew) or further than `max_sample_future` in the future, so that
   out-of-range timestamps never reach the index;
 - writes the index, so that a stored sample always belongs to a
-  discoverable series.
+  discoverable series, and rejects the samples of a series whose ID is
+  already used by a different label set (`outcome="collision"`).
 
 Graphite TCP lines wait at most one second in a batch, whether or not more
 data arrives. Connections are capped (`graphite_max_connections`), idle
@@ -95,7 +128,8 @@ datagrams are dropped and counted (`outcome="dropped"`).
 
 One Lua script call per shard and batch (`internal/hot/scripts.go`):
 
-1. Read the server time with `TIME`.
+1. Read the server time with `TIME` and compute the fragment for chunks
+   created by this call.
 2. For every chunk in the batch: if the window is due, or the chunk is
    currently claimed by a flusher, reject its samples (`too_old`); if the
    chunk would exceed its size limit, reject them (`chunk_full`).
@@ -143,6 +177,11 @@ Invariants:
   chunk was loaded (possible only after a failover to a lagging replica)
   are not deleted: the chunk is re-processed after its lease.
 - **No leaks.** In-flight entries whose chunk no longer exists are released.
+- **Fenced quarantine.** A chunk that cannot be decoded is moved to a
+  quarantine key so that it does not block flushing, but only if its first
+  16 bytes and its length are still those that were read, exactly like
+  `complete`. A healthy newer incarnation of the window is never moved
+  away. See [Quarantined chunks](#quarantined-chunks).
 - **Flushing works when Redis is full.** claim, complete and quarantine are
   flagged `allow-oom`; with `noeviction`, flushing is the only way memory is
   freed, so it must not be refused.
@@ -165,11 +204,37 @@ left data in Redis forever.
 | Redis out of memory (`noeviction`) | Appends are refused (503, clients retry); claim and complete keep working, so flushing frees memory. |
 | Redis restart / `SCRIPT FLUSH` | Scripts are reloaded automatically. Unflushed data loss is bounded by the Redis persistence settings. |
 | Redis restored from an older snapshot, or failover to a lagging replica | Chunks flushed since the snapshot may be flushed again with less data; they are stored as separate versions and never overwrite the complete one. |
-| Undecodable chunk | Moved to a quarantine key and logged; it does not block flushing. |
-| Very large chunk | Persisted in parts of 100,000 samples, below Cassandra's mutation limit. |
+| Undecodable chunk | Moved to a quarantine key (fenced, see below), logged and counted; it does not block flushing. |
+| Very large chunk | Persisted in parts of at most 100,000 samples and 4 MiB, below Cassandra's mutation limit. A single native histogram is limited to 16,384 buckets (about 130 KB), so every part fits. |
 | Sample for a closed window | Rejected and counted (`outcome="too_old"`); remote write returns 400. |
-| Redis clock moves backwards | A claimed chunk still rejects appends (the in-flight check). A chunk re-created after completion is a new fragment and is stored as a separate version; reads merge versions. |
+| Redis clock moves backwards | A claimed chunk still rejects appends (the in-flight check). A chunk re-created after completion gets a larger fragment from the shard clock and is stored as a separate version that takes precedence; reads merge versions. |
 | Index write fails | The batch fails with 503 before any sample is stored; the client retries. |
+
+### Quarantined chunks
+
+A chunk that cannot be decoded (its length is not a whole number of
+records, or its header is not a timestamp) can only be the result of a bug
+or of tampering with Redis, but it must neither block flushing nor be lost
+silently:
+
+- It is renamed to `<prefix>:{N}:q:<series>:<window>:<digest>`, where
+  `digest` is the xxhash64 of its content. Different chunks of the same
+  window therefore never overwrite each other in quarantine.
+- The rename is fenced on the first 16 bytes and the length that were read.
+  If the chunk changed since (a newer incarnation after a failover or a
+  clock step), it stays in flight and is read again after its lease.
+- The quarantine key is recorded in `<prefix>:{N}:qidx` and expires after
+  `flusher.quarantine_ttl` (30 days by default; 0 keeps it until it is
+  deleted).
+- `xtsdb_flusher_chunks_total{outcome="quarantined"}` counts quarantines and
+  `xtsdb_hot_quarantined_chunks` reports how many are held. Queries do not
+  read quarantined chunks.
+
+`xtsdb quarantine list` shows every quarantined chunk with its series ID,
+window, size, header and expiry; `redis-cli GET <key>` returns the raw
+content (16-byte header followed by 16-byte big-endian records of
+timestamp and IEEE-754 value). `xtsdb quarantine delete <key>...` or
+`xtsdb quarantine delete -all` deletes them.
 
 ## Cold tier (Cassandra)
 
@@ -184,25 +249,71 @@ CREATE TABLE chunks (
 
 `day` is the UTC day of the window start, which bounds partition size.
 `(fragment, total, digest)` identify a version of a window, `part` splits
-large versions into rows of at most 100,000 samples. The blob is a sequence
-of length-prefixed Prometheus XOR chunks of sorted, de-duplicated samples
+large versions into rows of at most 100,000 samples and 4 MiB. The blob of a
+window with float samples only (`encoding` 1) is a sequence of
+length-prefixed Prometheus XOR chunks of sorted, de-duplicated samples
 (Gorilla encoding; typically 1–2 bytes per sample compared to 16 in Redis).
-Rows carry `USING TTL` from `storage.retention`, and TWCS drops whole
-SSTables when they expire.
+A window with native histograms (`encoding` 2) is a sequence of segments,
+each a Prometheus chunk encoding byte (XOR or float histogram), the chunk's
+length and the chunk, in time order; a new histogram chunk starts at a
+counter reset or an incompatible bucket layout, as in the Prometheus TSDB.
+A row expires `storage.retention` after its last sample (`USING TTL`), and
+TWCS drops whole SSTables when they expire. Index entries of a day expire two
+days after the samples of that day; series rows two days after they were
+last written. Data that is already older than the retention is not written,
+which matters for imports.
+
+`total` is the number of samples appended to the incarnation in Redis,
+including samples that were overwritten by a later sample with the same
+timestamp: an incarnation only grows, so a larger `total` is a later state
+of it.
 
 Reads for `[mint, maxt]` query the day partitions of
 `[mint - chunk_range, maxt]` with a clustering range on `start_ms`,
 concatenate the parts of each version and merge versions in clustering
-order, so later incarnations and more complete versions win on equal
-timestamps.
+order. Where versions disagree on the value at a timestamp, the version
+that sorts last wins:
+
+1. the larger `fragment`: a later incarnation of the window;
+2. then the larger `total`: a later state of the same incarnation, for
+   example the complete chunk rather than what an older snapshot held;
+3. then the larger `digest` as a signed 64-bit value. Versions with equal
+   `fragment` and `total` but different content can only come from diverging
+   histories of one incarnation (a restore or a failover to a lagging
+   replica, followed by different writes to the same window). Which one is
+   newer cannot be known; the digest makes the choice deterministic and the
+   same for every reader, but arbitrary.
+
+All of this matters only when a client writes different values for the same
+timestamp of a series and, around the same time, Redis fails over, is
+restored or its clock steps.
+
+## Imports
+
+`xtsdb import` reads Prometheus TSDB blocks (with the index, chunks and
+tombstones readers of the Prometheus TSDB; deleted samples are left out) or
+OpenMetrics text, and writes every series the way the ingester and the
+flusher together would: index entries first, for every day the series has
+samples on (with the same collision detection), then one version per chunk
+window, cut on the same window boundaries.
+
+Imported versions have fragment 0. Every fragment issued by the hot tier is
+a timestamp in microseconds, so imported versions sort before ingested ones
+and lose wherever both have a sample at the same timestamp: an import fills
+gaps but never overrides data xtsdb received itself. The fragment being
+constant also makes imports idempotent: importing the same samples again
+writes the same primary keys. A window cut in several parts (two blocks
+that both cover it, or OpenMetrics input imported in slices to bound memory)
+is stored as several versions, which reads merge.
 
 ## Series index (Cassandra)
 
 ```sql
 series       (series_id) -> labels map
-postings     ((day, name, value), series_id)
-label_values ((day, name), value)
+postings     ((day, name, value, bucket), series_id)   bucket = series_id mod B
+label_values ((day, name, bucket), value)              bucket = xxhash64(value) mod B
 label_names  (day, name)
+meta         (name) -> value                           index_buckets = B
 ```
 
 The ingester writes the entries of a series once per UTC day it has samples
@@ -210,6 +321,49 @@ on, guarded by an LRU cache and de-duplicated within a batch. Index rows
 live two days longer than samples. Day partitions keep postings bounded and
 make lookups time aware: a series that disappeared last month is not a
 candidate for today's queries.
+
+**Buckets.** A label pair shared by many series, such as the metric name of
+a large metric, would otherwise put all of them in one partition per day
+(a million series make a partition of a million rows), which Cassandra warns
+about and which slows down compaction, repair and every query using that
+matcher. Postings and label values are therefore spread over
+B = `storage.index_buckets` partitions (16 by default): a write goes to one
+bucket, and a lookup reads all B buckets in parallel and concatenates them
+(buckets are disjoint). B is recorded in the `meta` table on first start and
+xtsdb refuses to start with a different value, because entries would then be
+looked up in the wrong buckets. With B = 1 every lookup reads one partition,
+as before; larger values bound partitions further at the cost of more,
+smaller reads per lookup. A stress test (`XTSDB_TEST_STRESS=1`) indexes a
+million series sharing one pair: the largest partition holds about 63,000
+rows and reading all postings back takes about 1.5 s on one local node.
+
+Keyspaces created by builds without buckets cannot be migrated in place
+(the partition key of `postings` and `label_values` changed): `xtsdb
+migrate` refuses them and explains how to proceed.
+
+**Collision detection.** The `series` row is written with one lightweight
+transaction per series and day:
+
+```sql
+UPDATE series USING TTL ? SET labels = ? WHERE series_id = ?
+  IF labels IN (?, null)
+```
+
+It creates the row, or refreshes its TTL when it already holds the same
+labels. When the ID belongs to different labels, nothing is written: the
+ingester rejects the samples of the new series (`outcome="collision"`,
+remote write answers 400), counts the series in
+`xtsdb_ingester_series_collisions_total`, logs both label sets and does not
+write its postings or label values. Later samples of that series are
+rejected from a small cache without asking Cassandra again. The ingester's
+cache of indexed series is keyed by the ID and a second, independent hash
+of the labels, so a colliding series is never taken for the cached one.
+Transactions use `LOCAL_SERIAL` when `cassandra.consistency` is a `LOCAL_`
+level and `SERIAL` otherwise.
+
+The transaction costs a few more round trips than a plain write, once per
+series and day. 128-bit series IDs would make collisions practically
+impossible, but would change the storage format.
 
 ## Read path
 
@@ -219,9 +373,9 @@ candidate for today's queries.
    `querier.max_concurrent_queries` queries run at once, each bounded by
    `querier.timeout`, including the series and label endpoints.
 2. **Resolve matchers** for each day of the range. Matchers that do not
-   match the empty string select postings: `=` reads one partition, `=~` with
-   a literal alternation reads one partition per alternative, other matchers
-   filter `label_values` first. Cheap matchers run first; once 1,024 or fewer
+   match the empty string select postings: `=` reads one pair (its B
+   buckets), `=~` with a literal alternation reads one pair per alternative,
+   other matchers filter `label_values` first. Cheap matchers run first; once 1,024 or fewer
    candidates remain, expensive matchers are not resolved through the index
    but applied to the labels. Postings are intersected across matchers and
    unioned across days. Selectors without such a matcher are rejected, as in
@@ -247,6 +401,28 @@ same argument to hold.
 Redis is read for at least `querier.hot_lookback` and, using the oldest due
 time in the `due` and `infdue` sets (refreshed every 10 seconds), back to the
 oldest chunk Redis still holds, so data stays visible while flushing lags.
+
+**Window index.** Every series has a sorted set of the windows it holds in
+Redis (`<prefix>:{N}:w:<series>`). The append script adds a window when it
+creates its chunk; `complete` and `quarantine` remove it in the same atomic
+step that deletes or renames the chunk. A read first fetches the windows of
+every series in the range (`ZRANGEBYSCORE`, one command per series) and then
+only the chunks that exist (one `GET` per chunk), in pipelines. The cost of
+a read is therefore one command per series plus one per chunk, independent
+of the length of the range and of `chunk_range`; enumerating every possible
+window instead would cost `(range / chunk_range) + 1` commands per series,
+for example 361 with a 6 hour range and a one minute `chunk_range`, and more
+while flushing lags. Chunks written by builds that predate the window index
+are registered once, from the `due` and `inf` sets, when xtsdb starts and
+`<prefix>:meta` has no `window_index` field; a chunk is registered only if
+it still exists, atomically, so a chunk completed meanwhile leaves no entry.
+Chunks that such builds create while they still run (during a rolling
+upgrade) are not indexed, so queries miss their samples until they are
+flushed to Cassandra: at most `chunk_range` + `grace_period` after the last
+older ingester stopped. Older flushers do not remove window index entries,
+and older builds cannot read native histogram records. When upgrading from
+an earlier v2 build, stop all its processes (ingesters and flushers) before
+starting the new ones.
 
 ## Changes from 0.x
 

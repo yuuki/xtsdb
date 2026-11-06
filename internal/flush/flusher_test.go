@@ -227,3 +227,35 @@ func TestStaleVersionDoesNotOverwriteCompleteOne(t *testing.T) {
 		t.Fatalf("persisting a stale version lost data: %v", got[4])
 	}
 }
+
+// A window rewritten in Redis and persisted twice from the same incarnation
+// (as after a restore from an older snapshot) keeps the latest value: the
+// version with more appended records wins, even when both versions have the
+// same number of distinct timestamps.
+func TestLaterStateOfIncarnationWins(t *testing.T) {
+	ctx := context.Background()
+	for _, order := range []string{"stale first", "complete first"} {
+		f, _, cold, c := setup(t)
+		t0 := c.ms(0)
+		ref := storage.ChunkRef{Series: 1, Start: t0}
+		stale := storage.HotChunk{Ref: ref, Fragment: 7, Records: 2,
+			Samples: []model.Sample{{T: t0, V: 1}, {T: t0 + 1, V: 2}}}
+		// t0+1 rewritten. With these values the digest of the stale version
+		// is the larger one, so the digest alone would pick the wrong value.
+		complete := storage.HotChunk{Ref: ref, Fragment: 7, Records: 3,
+			Samples: []model.Sample{{T: t0, V: 1}, {T: t0 + 1, V: 11}}}
+		chunks := []storage.HotChunk{stale, complete}
+		if order == "complete first" {
+			chunks = []storage.HotChunk{complete, stale}
+		}
+		for _, hc := range chunks {
+			if err := f.persist(ctx, hc); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got, err := cold.Read(ctx, []model.SeriesID{1}, t0, t0+10)
+		if err != nil || len(got[1]) != 2 || got[1][1].V != 11 {
+			t.Fatalf("%s: got %v %v, want the rewritten value 11", order, got[1], err)
+		}
+	}
+}

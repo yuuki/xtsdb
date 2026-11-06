@@ -2,9 +2,11 @@ package hot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -19,7 +21,7 @@ import (
 // Integration tests run against a real server. Set XTSDB_TEST_REDIS_ADDRS
 // to a comma separated list of addresses (several addresses or
 // XTSDB_TEST_REDIS_CLUSTER=1 select cluster mode).
-func newTestStore(t *testing.T, layout model.Layout, lease time.Duration) (*Store, redis.UniversalClient) {
+func newTestStore(t testing.TB, layout model.Layout, lease time.Duration) (*Store, redis.UniversalClient) {
 	t.Helper()
 	addrs := os.Getenv("XTSDB_TEST_REDIS_ADDRS")
 	if addrs == "" {
@@ -45,7 +47,7 @@ func newTestStore(t *testing.T, layout model.Layout, lease time.Duration) (*Stor
 	return s, client
 }
 
-func deleteKeys(t *testing.T, client redis.UniversalClient, prefix string) {
+func deleteKeys(t testing.TB, client redis.UniversalClient, prefix string) {
 	ctx := context.Background()
 	del := func(ctx context.Context, c *redis.Client) error {
 		iter := c.Scan(ctx, 0, prefix+":*", 1000).Iterator()
@@ -66,6 +68,12 @@ func deleteKeys(t *testing.T, client redis.UniversalClient, prefix string) {
 }
 
 func nowMs() int64 { return time.Now().UnixMilli() }
+
+// load returns the loaded and missing chunks.
+func load(ctx context.Context, s *Store, refs []storage.ChunkRef) ([]storage.HotChunk, []storage.ChunkRef, error) {
+	res, err := s.Load(ctx, refs)
+	return res.Chunks, res.Missing, err
+}
 
 func TestAppendAndRead(t *testing.T) {
 	layout := model.Layout{Shards: 8, ChunkRange: time.Hour.Milliseconds(), Grace: time.Minute.Milliseconds()}
@@ -177,7 +185,7 @@ func TestFlushLifecycle(t *testing.T) {
 		t.Fatalf("late sample must be rejected, got %+v", res)
 	}
 
-	chunks, missing, err := s.Load(ctx, refs)
+	chunks, missing, err := load(ctx, s, refs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +240,7 @@ func TestCompleteIgnoresNewerIncarnation(t *testing.T) {
 		t.Fatal(err)
 	}
 	refs := waitClaim(t, s, 0)
-	chunks, _, err := s.Load(ctx, refs)
+	chunks, _, err := load(ctx, s, refs)
 	if err != nil || len(chunks) != 1 {
 		t.Fatalf("load: %v %v", chunks, err)
 	}
@@ -250,6 +258,7 @@ func TestCompleteIgnoresNewerIncarnation(t *testing.T) {
 func TestQuarantinesCorruptChunks(t *testing.T) {
 	layout := model.Layout{Shards: 1, ChunkRange: 300, Grace: 0}
 	s, client := newTestStore(t, layout, time.Minute)
+	s.quarantineTTL = time.Hour
 	ctx := context.Background()
 	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: 5, Samples: []model.Sample{{T: nowMs(), V: 1}}}}); err != nil {
 		t.Fatal(err)
@@ -257,15 +266,115 @@ func TestQuarantinesCorruptChunks(t *testing.T) {
 	refs := waitClaim(t, s, 0)
 	m := member(refs[0].Series, refs[0].Start)
 	client.Append(ctx, s.chunkKey(0, m), "x") // break record alignment
-	chunks, missing, err := s.Load(ctx, refs)
-	if err != nil || len(chunks) != 0 || len(missing) != 0 {
-		t.Fatalf("corrupt chunk must be skipped: %v %v %v", chunks, missing, err)
+	content := client.Get(ctx, s.chunkKey(0, m)).Val()
+	res, err := s.Load(ctx, refs)
+	if err != nil || len(res.Chunks) != 0 || len(res.Missing) != 0 || res.Quarantined != 1 {
+		t.Fatalf("corrupt chunk must be quarantined and skipped: %+v %v", res, err)
 	}
-	if client.Exists(ctx, s.quarantineKey(0, m)).Val() != 1 {
+	qkey := s.quarantineKey(0, m, []byte(content))
+	if client.Get(ctx, qkey).Val() != content {
 		t.Fatal("corrupt chunk was not quarantined")
 	}
-	if client.ZCard(ctx, s.inflightKey(0)).Val() != 0 {
+	if ttl := client.PTTL(ctx, qkey).Val(); ttl <= 0 || ttl > time.Hour {
+		t.Fatalf("quarantined chunk must expire after the TTL, got %v", ttl)
+	}
+	if client.ZCard(ctx, s.inflightKey(0)).Val() != 0 || client.ZCard(ctx, s.inflightDueKey(0)).Val() != 0 {
 		t.Fatal("quarantined chunk is still in flight")
+	}
+	if b, err := s.Backlog(ctx); err != nil || b.QuarantinedChunks != 1 {
+		t.Fatalf("backlog must count the quarantined chunk: %+v %v", b, err)
+	}
+	list, err := s.ListQuarantined(ctx)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("list: %+v %v", list, err)
+	}
+	if q := list[0]; q.Key != qkey || q.Series != 5 || q.Start != refs[0].Start || q.Bytes != int64(len(content)) ||
+		q.Header != content[:16] || q.Expires.IsZero() {
+		t.Fatalf("unexpected listing %+v", q)
+	}
+}
+
+// A second corrupt incarnation of the same window must not overwrite the
+// first one in quarantine.
+func TestQuarantineKeepsEveryIncarnation(t *testing.T) {
+	layout := model.Layout{Shards: 1, ChunkRange: 300, Grace: 0}
+	s, client := newTestStore(t, layout, time.Minute)
+	ctx := context.Background()
+	id := model.SeriesID(5)
+	var start int64
+	for i := range 2 {
+		now := nowMs()
+		if i == 1 {
+			now = start + 1 // same window as the first incarnation
+		}
+		key := s.chunkKey(0, member(id, layout.WindowStart(id, now)))
+		start = layout.WindowStart(id, now)
+		// Re-create the window as it would be after a restore, then corrupt it.
+		client.Set(ctx, key, fmt.Sprintf("%016d", 1000+i)+strings.Repeat("y", 17+i), 0)
+		client.ZAdd(ctx, s.inflightKey(0), redis.Z{Score: 0, Member: member(id, start)})
+		res, err := s.Load(ctx, []storage.ChunkRef{{Shard: 0, Series: id, Start: start}})
+		if err != nil || res.Quarantined != 1 {
+			t.Fatalf("incarnation %d: %+v %v", i, res, err)
+		}
+	}
+	list, err := s.ListQuarantined(ctx)
+	if err != nil || len(list) != 2 {
+		t.Fatalf("both incarnations must be kept, got %+v %v", list, err)
+	}
+	if !list[0].Expires.IsZero() || !list[1].Expires.IsZero() {
+		t.Fatal("without a TTL quarantined chunks must not expire")
+	}
+	n, err := s.DeleteQuarantined(ctx, []string{list[0].Key, list[1].Key})
+	if err != nil || n != 2 {
+		t.Fatalf("delete: %d %v", n, err)
+	}
+	if list, _ := s.ListQuarantined(ctx); len(list) != 0 {
+		t.Fatalf("deleted chunks still listed: %+v", list)
+	}
+	if b, _ := s.Backlog(ctx); b.QuarantinedChunks != 0 {
+		t.Fatalf("deleted chunks still counted: %+v", b)
+	}
+	if _, err := s.DeleteQuarantined(ctx, []string{s.chunkKey(0, member(id, start))}); err == nil {
+		t.Fatal("deleting a key that is not quarantined must be refused")
+	}
+}
+
+// Quarantine is fenced like Complete: a chunk that changed after it was
+// read (a newer incarnation) is not moved away.
+func TestQuarantineIsFenced(t *testing.T) {
+	layout := model.Layout{Shards: 1, ChunkRange: 300, Grace: 0}
+	s, client := newTestStore(t, layout, time.Minute)
+	ctx := context.Background()
+	ref := storage.ChunkRef{Shard: 0, Series: 5, Start: layout.WindowStart(5, nowMs())}
+	m := member(ref.Series, ref.Start)
+	key := s.chunkKey(0, m)
+	corrupt := []byte("0000000000001000x")
+	client.Set(ctx, key, "0000000000002000", 0) // healthy newer incarnation
+	client.ZAdd(ctx, s.inflightKey(0), redis.Z{Score: 0, Member: m})
+	if s.quarantine(ctx, ref, corrupt, errors.New("test")) {
+		t.Fatal("a newer incarnation must not be quarantined")
+	}
+	if client.Get(ctx, key).Val() != "0000000000002000" {
+		t.Fatal("the newer incarnation was moved away")
+	}
+	if client.ZCard(ctx, s.inflightKey(0)).Val() != 1 {
+		t.Fatal("the chunk must stay in flight to be retried after its lease")
+	}
+	// Same header, different length: samples were appended since the read.
+	client.Set(ctx, key, "0000000000001000xyz", 0)
+	if s.quarantine(ctx, ref, corrupt, errors.New("test")) {
+		t.Fatal("a chunk that grew must not be quarantined")
+	}
+	// A chunk that disappeared is released.
+	client.Del(ctx, key)
+	if s.quarantine(ctx, ref, corrupt, errors.New("test")) {
+		t.Fatal("a missing chunk cannot be quarantined")
+	}
+	if client.ZCard(ctx, s.inflightKey(0)).Val() != 0 {
+		t.Fatal("a missing chunk must be released")
+	}
+	if list, _ := s.ListQuarantined(ctx); len(list) != 0 {
+		t.Fatalf("nothing must be quarantined, got %+v", list)
 	}
 }
 
@@ -339,7 +448,7 @@ func TestCompleteKeepsChunkThatGrew(t *testing.T) {
 		t.Fatal(err)
 	}
 	refs := waitClaim(t, s, 0)
-	chunks, _, err := s.Load(ctx, refs)
+	chunks, _, err := load(ctx, s, refs)
 	if err != nil || len(chunks) != 1 {
 		t.Fatalf("load: %v %v", chunks, err)
 	}
@@ -355,7 +464,7 @@ func TestCompleteKeepsChunkThatGrew(t *testing.T) {
 	}
 	// It is handed out again after the lease and can then be completed.
 	again := waitClaim(t, s, 0)
-	chunks, _, err = s.Load(ctx, again)
+	chunks, _, err = load(ctx, s, again)
 	if err != nil || len(chunks) != 1 || len(chunks[0].Samples) != 2 {
 		t.Fatalf("reload: %v %v", chunks, err)
 	}
@@ -376,7 +485,7 @@ func TestReleaseMissingChunks(t *testing.T) {
 	}
 	refs := waitClaim(t, s, 0)
 	client.Del(ctx, s.chunkKey(0, member(refs[0].Series, refs[0].Start)))
-	chunks, missing, err := s.Load(ctx, refs)
+	chunks, missing, err := load(ctx, s, refs)
 	if err != nil || len(chunks) != 0 || len(missing) != 1 {
 		t.Fatalf("load: %v %v %v", chunks, missing, err)
 	}
@@ -437,11 +546,15 @@ func TestClaimWorksAtMaxmemory(t *testing.T) {
 		!strings.Contains(err.Error(), "OOM") {
 		t.Fatalf("precondition: append must be refused at maxmemory, got %v", err)
 	}
+	// A flusher that starts now must be able to open the store.
+	if _, err := New(ctx, client, Options{Prefix: s.prefix, Layout: layout, Lease: 300 * time.Millisecond}); err != nil {
+		t.Fatalf("opening the store must work at maxmemory once the layout is recorded: %v", err)
+	}
 	again, err := s.Claim(ctx, 0, 100)
 	if err != nil || len(again) == 0 {
 		t.Fatalf("claim must work at maxmemory: %d refs, %v", len(again), err)
 	}
-	chunks, _, err := s.Load(ctx, again)
+	chunks, _, err := load(ctx, s, again)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -473,5 +586,91 @@ func TestManySeriesAcrossShards(t *testing.T) {
 	}
 	if len(got) != 2000 {
 		t.Fatalf("read %d series, want 2000", len(got))
+	}
+}
+
+// Fragments come from a hybrid clock per shard: they keep increasing when
+// the Redis clock is behind the last fragment issued (a clock step
+// backwards, or a failover to a node with a slower clock).
+func TestFragmentsSurviveClockStep(t *testing.T) {
+	layout := model.Layout{Shards: 1, ChunkRange: 300, Grace: 0}
+	s, client := newTestStore(t, layout, time.Minute)
+	ctx := context.Background()
+	fragment := func(id model.SeriesID) int64 {
+		t.Helper()
+		now := nowMs()
+		if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: id, Samples: []model.Sample{{T: now, V: 1}}}}); err != nil {
+			t.Fatal(err)
+		}
+		hdr := client.GetRange(ctx, s.chunkKey(0, member(id, layout.WindowStart(id, now))), 0, 15).Val()
+		f, err := strconv.ParseInt(hdr, 10, 64)
+		if err != nil {
+			t.Fatalf("header %q: %v", hdr, err)
+		}
+		return f
+	}
+	first := fragment(1)
+	if us := time.Now().UnixMicro(); first < us-int64(time.Minute/time.Microsecond) || first > us {
+		t.Fatalf("fragment %d does not follow the server clock (%d)", first, us)
+	}
+	// The last fragment issued is ahead of the clock, as if the clock had
+	// stepped back by a day.
+	ahead := time.Now().Add(24 * time.Hour).UnixMicro()
+	client.Set(ctx, s.clockKey(0), strconv.FormatInt(ahead, 10), 0)
+	if f := fragment(2); f != ahead+1 {
+		t.Fatalf("fragment %d, want %d", f, ahead+1)
+	}
+	if f := fragment(3); f != ahead+2 {
+		t.Fatalf("fragment %d, want %d", f, ahead+2)
+	}
+	// Appending to an existing chunk does not advance the clock.
+	_ = fragment(3)
+	if got := client.Get(ctx, s.clockKey(0)).Val(); got != fmt.Sprintf("%016d", ahead+2) {
+		t.Fatalf("shard clock %s, want %d", got, ahead+2)
+	}
+	// Chunks with such fragments are completed normally.
+	refs := waitClaim(t, s, 0)
+	chunks, _, err := load(ctx, s, refs)
+	if err != nil || len(chunks) == 0 {
+		t.Fatalf("load: %v %v", chunks, err)
+	}
+	if err := s.Complete(ctx, chunks); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range chunks {
+		want := 1
+		if c.Ref.Series == 3 {
+			want = 2
+		}
+		if c.Records != want {
+			t.Fatalf("series %d: %d records, want %d", c.Ref.Series, c.Records, want)
+		}
+		if client.Exists(ctx, s.chunkKey(0, member(c.Ref.Series, c.Ref.Start))).Val() != 0 {
+			t.Fatalf("chunk %+v was not completed", c.Ref)
+		}
+	}
+}
+
+// Quarantine keys of earlier builds (<prefix>:{N}:q:<series>:<window>, not
+// in the quarantine index) are listed and deleted too.
+func TestListsUnindexedQuarantineKeys(t *testing.T) {
+	layout := model.Layout{Shards: 4, ChunkRange: 300, Grace: 0}
+	s, client := newTestStore(t, layout, time.Minute)
+	ctx := context.Background()
+	old := s.tag(2) + ":q:" + member(0x2a, 1_700_000_000_000)
+	client.Set(ctx, old, "0000000000000001xyz", time.Hour)
+	list, err := s.ListQuarantined(ctx)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("list: %+v %v", list, err)
+	}
+	if c := list[0]; c.Key != old || c.Shard != 2 || c.Series != 0x2a || c.Start != 1_700_000_000_000 ||
+		c.Bytes != 19 || c.Expires.IsZero() {
+		t.Fatalf("unexpected listing %+v", c)
+	}
+	if n, err := s.DeleteQuarantined(ctx, []string{old}); err != nil || n != 1 {
+		t.Fatalf("delete: %d %v", n, err)
+	}
+	if globEscape(`a*b?[c]\`) != `a\*b\?\[c\]\\` {
+		t.Fatalf("glob escaping is wrong: %s", globEscape(`a*b?[c]\`))
 	}
 }

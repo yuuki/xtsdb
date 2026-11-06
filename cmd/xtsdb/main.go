@@ -13,6 +13,8 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"text/tabwriter"
+	"time"
 
 	yaml "go.yaml.in/yaml/v4"
 
@@ -30,10 +32,30 @@ Commands:
   flusher    Move closed chunks from Redis to Cassandra
   querier    Serve the Prometheus-compatible query API
   migrate    Create or update the Cassandra schema and exit
+  import     Import historical data (Prometheus TSDB blocks, OpenMetrics)
+  quarantine Inspect or delete undecodable chunks kept in Redis
   config     Print the effective configuration and exit
   version    Print version information and exit
 
 Run 'xtsdb <command> -h' for the flags of a command.
+`
+
+const importUsage = `Usage: xtsdb import [flags] <path>...
+
+Imports historical samples directly into Cassandra, bypassing Redis.
+With -format=tsdb, each path is a Prometheus data directory or a block
+directory; with -format=openmetrics, each path is an OpenMetrics text file
+in which every sample has a timestamp ("-" reads standard input). Importing
+the same data again is safe; -state-file skips the blocks and files that
+were imported completely.
+
+Flags:
+`
+
+const quarantineUsage = `Usage:
+  xtsdb quarantine list   [flags]           List quarantined chunks
+  xtsdb quarantine delete [flags] <key>...  Delete quarantined chunks
+  xtsdb quarantine delete [flags] -all      Delete every quarantined chunk
 `
 
 func main() {
@@ -57,19 +79,53 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	fs := flag.NewFlagSet("xtsdb "+cmd, flag.ContinueOnError)
+	name, rest := cmd, args[1:]
+	var sub string
+	if cmd == "quarantine" {
+		if len(rest) == 0 || (rest[0] != "list" && rest[0] != "delete") {
+			fmt.Fprint(stderr, quarantineUsage)
+			return 2
+		}
+		sub, rest = rest[0], rest[1:]
+		name += " " + sub
+	}
+	fs := flag.NewFlagSet("xtsdb "+name, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	configFile := fs.String("config.file", "", "Path to the YAML configuration file.")
 	expandEnv := fs.Bool("config.expand-env", false, "Expand ${VAR} references in the configuration file.")
 	logLevel := fs.String("log.level", "", "Override log.level (debug, info, warn, error).")
-	if err := fs.Parse(args[1:]); err != nil {
+	var all *bool
+	if sub == "delete" {
+		all = fs.Bool("all", false, "Delete every quarantined chunk.")
+	}
+	var imp importOptions
+	if cmd == "import" {
+		fs.StringVar(&imp.format, "format", "tsdb", "Input format: tsdb (Prometheus TSDB blocks) or openmetrics.")
+		fs.StringVar(&imp.stateFile, "state-file", "", "File recording the blocks and files imported completely; they are skipped when the import is run again.")
+		fs.IntVar(&imp.concurrency, "concurrency", 16, "Series imported at a time.")
+		fs.IntVar(&imp.maxBuffered, "max-buffered-samples", 10_000_000,
+			"OpenMetrics: samples held in memory before they are imported (about 32 bytes each); input files are mapped into memory, standard input is read completely.")
+		fs.Usage = func() {
+			fmt.Fprint(stderr, importUsage)
+			fs.PrintDefaults()
+		}
+	}
+	if err := fs.Parse(rest); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
 		return 2
 	}
-	if fs.NArg() > 0 {
-		fmt.Fprintf(stderr, "error: unexpected argument %q (flags must come after the command, e.g. xtsdb %s -config.file=...)\n", fs.Arg(0), cmd)
+	if cmd == "import" && fs.NArg() == 0 {
+		fs.Usage()
+		return 2
+	}
+	if fs.NArg() > 0 && sub != "delete" && cmd != "import" {
+		fmt.Fprintf(stderr, "error: unexpected argument %q (flags must come after the command, e.g. xtsdb %s -config.file=...)\n", fs.Arg(0), name)
+		return 2
+	}
+	if sub == "delete" && (fs.NArg() > 0) == *all {
+		fmt.Fprint(stderr, "error: give either quarantine keys or -all\n\n"+quarantineUsage)
 		return 2
 	}
 
@@ -101,6 +157,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		redacted := *cfg
 		redacted.Redis.Password = redact(cfg.Redis.Password)
 		redacted.Cassandra.Password = redact(cfg.Cassandra.Password)
+		redacted.Server.Auth.Read = cfg.Server.Auth.Read.Redacted()
+		redacted.Server.Auth.Write = cfg.Server.Auth.Write.Redacted()
 		out, err := yaml.Marshal(&redacted)
 		if err != nil {
 			fmt.Fprintf(stderr, "error: %v\n", err)
@@ -111,6 +169,18 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "migrate":
 		if err := cassandra.Migrate(ctx, cfg.Cassandra, logger); err != nil {
 			logger.Error("migration failed", "err", err)
+			return 1
+		}
+		return 0
+	case "import":
+		if err := runImport(ctx, cfg, logger, imp, fs.Args(), stdout); err != nil {
+			logger.Error("import failed", "err", err)
+			return 1
+		}
+		return 0
+	case "quarantine":
+		if err := quarantine(ctx, cfg, logger, sub, fs.Args(), stdout); err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
 			return 1
 		}
 		return 0
@@ -131,6 +201,51 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// quarantine lists or deletes undecodable chunks that the flusher moved
+// out of the way.
+func quarantine(ctx context.Context, cfg *config.Config, logger *slog.Logger, sub string, keys []string, stdout io.Writer) error {
+	store, client, err := app.OpenHot(ctx, cfg, logger)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	if sub == "delete" && len(keys) > 0 {
+		n, err := store.DeleteQuarantined(ctx, keys)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "deleted %d quarantined chunks\n", n)
+		return nil
+	}
+	chunks, err := store.ListQuarantined(ctx)
+	if err != nil {
+		return err
+	}
+	if sub == "delete" {
+		keys := make([]string, len(chunks))
+		for i, c := range chunks {
+			keys[i] = c.Key
+		}
+		n, err := store.DeleteQuarantined(ctx, keys)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "deleted %d quarantined chunks\n", n)
+		return nil
+	}
+	tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "KEY\tSERIES\tWINDOW START\tBYTES\tHEADER\tEXPIRES")
+	for _, c := range chunks {
+		expires := "never"
+		if !c.Expires.IsZero() {
+			expires = c.Expires.UTC().Format(time.RFC3339)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%q\t%s\n", c.Key, c.Series,
+			time.UnixMilli(c.Start).UTC().Format(time.RFC3339Nano), c.Bytes, c.Header, expires)
+	}
+	return tw.Flush()
 }
 
 func redact(secret string) string {
