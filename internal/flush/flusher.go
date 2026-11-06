@@ -112,7 +112,7 @@ func New(hot storage.HotStore, cold storage.ColdStore, opts Options) *Flusher {
 		}),
 		compactions: reg.NewCounterVec(prometheus.CounterOpts{
 			Name: "xtsdb_flusher_compaction_chunks_total",
-			Help: "Open hot chunks processed by compaction, by outcome (compacted, changed: retried at the next compaction, failed: undecodable).",
+			Help: "Open hot chunks processed by compaction, by outcome (compacted; kept: left raw because compaction would not help; changed: retried at the next compaction; failed: undecodable).",
 		}, []string{"outcome"}),
 		compactInBytes: reg.NewCounter(prometheus.CounterOpts{
 			Name: "xtsdb_flusher_compaction_input_bytes_total",
@@ -199,7 +199,7 @@ func (f *Flusher) flushShard(ctx context.Context, shard int) {
 // shards are offered ten times per interval, in random order, to compact
 // each of them soon after its interval has passed.
 func (f *Flusher) compactLoop(ctx context.Context) {
-	tick := max(f.opts.CompactionInterval/10, f.opts.PollInterval, 10*time.Millisecond)
+	tick := max(f.opts.CompactionInterval/10, 10*time.Millisecond)
 	shards := make(chan int)
 	var wg sync.WaitGroup
 	for range f.opts.Concurrency {
@@ -242,6 +242,7 @@ func (f *Flusher) compactShard(ctx context.Context, shard int) {
 		return
 	}
 	f.compactions.WithLabelValues("compacted").Add(float64(res.Compacted))
+	f.compactions.WithLabelValues("kept").Add(float64(res.Kept))
 	f.compactions.WithLabelValues("changed").Add(float64(res.Changed))
 	f.compactions.WithLabelValues("failed").Add(float64(res.Failed))
 	f.compactInBytes.Add(float64(res.BytesBefore))

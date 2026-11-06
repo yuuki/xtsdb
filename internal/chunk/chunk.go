@@ -4,8 +4,8 @@
 // followed by raw records appended in arrival order, which lets Redis append
 // without reading. A float sample is one 16-byte record; a native histogram
 // is a 16-byte record followed by its encoding, padded to a multiple of 16
-// bytes. The compacted part holds the samples that compaction moved out of
-// the raw part, encoded like the cold tier.
+// bytes. The compacted part holds the float samples that compaction moved
+// out of the raw part, XOR-encoded like the cold tier.
 // The cold tier stores sorted, de-duplicated samples compressed with the
 // Gorilla XOR encoding from the Prometheus TSDB, and native histograms with
 // its float histogram encoding.
@@ -136,18 +136,21 @@ func parseHeader(b []byte) (int64, error) {
 	return fragment, nil
 }
 
-// maxCompactedRecords bounds the record count of a compacted part. Records
-// are stored as a 32-bit total in the cold tier.
-const maxCompactedRecords = math.MaxInt32
+// maxCompactedRecords bounds the record count of a compacted part, so that
+// it and the records of the raw part still fit the 32-bit total of the cold
+// tier.
+const maxCompactedRecords = 1 << 30
 
 // EncodeCompacted returns the compacted part of a hot chunk:
 //
 //	header    the 16-byte header of the raw part, which identifies the incarnation
 //	records   uvarint, the number of raw records folded into it, overwritten ones included
-//	encoding  one byte, an Encoding
-//	data      the samples, as Encode writes them
+//	encoding  one byte, EncodingXOR
+//	data      the samples, as EncodeXOR writes them
 //
-// samples must be sorted and de-duplicated.
+// samples must be sorted, de-duplicated floats. Native histograms are not
+// compacted: their decoding from chunks loses the counter reset hints they
+// were written with, and gauge histograms can grow when re-encoded.
 func EncodeCompacted(header []byte, records int, samples []model.Sample) ([]byte, error) {
 	if len(header) != HeaderLen {
 		return nil, fmt.Errorf("header of %d bytes", len(header))
@@ -155,14 +158,17 @@ func EncodeCompacted(header []byte, records int, samples []model.Sample) ([]byte
 	if records < len(samples) || records > maxCompactedRecords {
 		return nil, fmt.Errorf("%d records for %d samples", records, len(samples))
 	}
-	enc, data, err := Encode(samples)
+	if slices.ContainsFunc(samples, model.Sample.IsHistogram) {
+		return nil, errors.New("native histograms cannot be compacted")
+	}
+	data, err := EncodeXOR(samples)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]byte, 0, HeaderLen+binary.MaxVarintLen64+1+len(data))
 	out = append(out, header...)
 	out = binary.AppendUvarint(out, uint64(records))
-	out = append(out, byte(enc))
+	out = append(out, byte(EncodingXOR))
 	return append(out, data...), nil
 }
 
@@ -181,12 +187,14 @@ func DecodeCompacted(b []byte) ([]model.Sample, int, error) {
 		return nil, 0, fmt.Errorf("%w: compacted part header", ErrCorrupt)
 	}
 	b = b[HeaderLen+n:]
-	samples, err := Decode(Encoding(b[0]), b[1:])
+	if Encoding(b[0]) != EncodingXOR {
+		return nil, 0, fmt.Errorf("%w: compacted part with encoding %d", ErrCorrupt, b[0])
+	}
+	// Stop as soon as the samples outnumber the records, so that corrupt
+	// data cannot make decoding allocate much more than it claims.
+	samples, err := decodeXOR(b[1:], int(records))
 	if err != nil {
 		return nil, 0, err
-	}
-	if uint64(len(samples)) > records {
-		return nil, 0, fmt.Errorf("%w: %d samples in a compacted part of %d records", ErrCorrupt, len(samples), records)
 	}
 	for i := 1; i < len(samples); i++ {
 		if samples[i].T <= samples[i-1].T {
@@ -433,7 +441,12 @@ func EncodeXOR(samples []model.Sample) ([]byte, error) {
 }
 
 // DecodeXOR decompresses a blob produced by EncodeXOR.
-func DecodeXOR(b []byte) ([]model.Sample, error) {
+func DecodeXOR(b []byte) ([]model.Sample, error) { return decodeXOR(b, -1) }
+
+// decodeXOR decompresses a blob produced by EncodeXOR. It fails as soon as
+// it has decoded more than limit samples, unless limit is negative. The
+// sample count of a segment is checked before the segment is decoded.
+func decodeXOR(b []byte, limit int) ([]model.Sample, error) {
 	var out []model.Sample
 	var it chunkenc.Iterator
 	for len(b) > 0 {
@@ -442,6 +455,9 @@ func DecodeXOR(b []byte) ([]model.Sample, error) {
 			return nil, fmt.Errorf("%w: bad segment length", ErrCorrupt)
 		}
 		b = b[sz:]
+		if limit >= 0 && n >= 2 && len(out)+int(binary.BigEndian.Uint16(b)) > limit {
+			return nil, fmt.Errorf("%w: more than %d samples", ErrCorrupt, limit)
+		}
 		var err error
 		if out, it, err = decodeChunk(out, it, chunkenc.EncXOR, b[:n]); err != nil {
 			return nil, err
@@ -474,7 +490,17 @@ func decodeTyped(b []byte) ([]model.Sample, error) {
 	return out, nil
 }
 
-func decodeChunk(out []model.Sample, it chunkenc.Iterator, enc chunkenc.Encoding, b []byte) ([]model.Sample, chunkenc.Iterator, error) {
+// decodeChunk appends the samples of a Prometheus chunk to out. The
+// chunkenc iterators trust their input and panic on some corrupt chunks;
+// the data comes from Redis or the persistent tier, so a panic is returned
+// as ErrCorrupt, and the iterator must not be reused after an error.
+func decodeChunk(out []model.Sample, it chunkenc.Iterator, enc chunkenc.Encoding, b []byte) (
+	res []model.Sample, iter chunkenc.Iterator, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			res, iter, err = nil, nil, fmt.Errorf("%w: decode: %v", ErrCorrupt, r)
+		}
+	}()
 	c, err := chunkenc.FromData(enc, b)
 	if err != nil {
 		return nil, it, fmt.Errorf("%w: %w", ErrCorrupt, err)

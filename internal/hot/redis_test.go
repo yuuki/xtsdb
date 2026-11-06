@@ -271,7 +271,7 @@ func TestQuarantinesCorruptChunks(t *testing.T) {
 	if err != nil || len(res.Chunks) != 0 || len(res.Missing) != 0 || res.Quarantined != 1 {
 		t.Fatalf("corrupt chunk must be quarantined and skipped: %+v %v", res, err)
 	}
-	qkey := s.quarantineKey(0, m, []byte(content))
+	qkey := s.quarantineKey(0, m, []byte(content), nil)
 	if client.Get(ctx, qkey).Val() != content {
 		t.Fatal("corrupt chunk was not quarantined")
 	}

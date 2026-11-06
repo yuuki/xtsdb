@@ -304,7 +304,7 @@ func Default() *Config {
 			Concurrency:        8,
 			LeaseDuration:      Duration(2 * time.Minute),
 			QuarantineTTL:      Duration(30 * 24 * time.Hour),
-			CompactionInterval: Duration(5 * time.Minute),
+			CompactionInterval: Duration(10 * time.Minute),
 		},
 		Querier: QuerierConfig{
 			LookbackDelta:     Duration(5 * time.Minute),

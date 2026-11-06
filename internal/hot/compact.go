@@ -4,31 +4,33 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 
 	"github.com/yuuki/xtsdb/internal/chunk"
+	"github.com/yuuki/xtsdb/internal/model"
 	"github.com/yuuki/xtsdb/internal/storage"
 )
 
-// Compaction moves the raw records of open chunks into their compacted
-// part, encoded like the persistent tier, so that they take a fraction of
-// the memory until they are flushed (see docs/architecture.md, Compaction).
-// The encoding work is done here, outside Redis; Redis only checks that the
-// chunk did not change and swaps the parts.
+// Compaction moves the raw float records of open chunks into their
+// compacted part, XOR-encoded like the persistent tier, so that they take a
+// fraction of the memory until they are flushed (see docs/architecture.md,
+// Compaction). The encoding work is done here, outside Redis; Redis only
+// checks that the chunk did not change and swaps the parts.
 
-const (
-	// compactPage is how many open chunks are listed at a time.
-	compactPage = 1000
-	// compactCallBytes bounds the arguments of one compaction script call.
-	compactCallBytes = 8 << 20
-)
+// compactCallBytes bounds the arguments of one compaction script call.
+const compactCallBytes = 8 << 20
 
 // Compact implements storage.HotStore.
+//
+// A pass stops once it has run for an interval, so that passes over a large
+// shard do not pile up; the rest of the shard is compacted at the next one.
 func (s *Store) Compact(ctx context.Context, shard int, interval time.Duration) (storage.CompactResult, error) {
 	var res storage.CompactResult
+	start := time.Now()
 	err := compactLeaseScript.Run(ctx, s.client, []string{s.compactLeaseKey(shard)},
 		max(interval.Milliseconds(), 1)).Err()
 	if errors.Is(err, redis.Nil) {
@@ -40,24 +42,40 @@ func (s *Store) Compact(ctx context.Context, shard int, interval time.Duration) 
 	}
 	// Chunks closing soon are left to the flusher. The script checks the due
 	// time again with the clock of Redis.
-	minDue := strconv.FormatInt(time.Now().Add(s.compactMargin).UnixMilli(), 10)
-	for offset := int64(0); ; offset += compactPage {
-		members, err := s.client.ZRangeByScore(ctx, s.dueKey(shard), &redis.ZRangeBy{
-			Min: "(" + minDue, Max: "+inf", Offset: offset, Count: compactPage,
+	minDue := "(" + strconv.FormatInt(start.Add(s.compactMargin).UnixMilli(), 10)
+	// Pages follow the scores: an offset would make Redis walk the set from
+	// its start for every page. skip counts the members of the last score
+	// that were already listed.
+	skip := 0
+	for {
+		page, err := s.client.ZRangeByScoreWithScores(ctx, s.dueKey(shard), &redis.ZRangeBy{
+			Min: minDue, Max: "+inf", Offset: int64(skip), Count: int64(s.compactPage),
 		}).Result()
 		if err != nil {
 			return res, fmt.Errorf("list open chunks of shard %d: %w", shard, err)
 		}
+		members := make([]string, len(page))
+		for i, z := range page {
+			members[i], _ = z.Member.(string)
+		}
 		if err := s.compactMembers(ctx, shard, members, &res); err != nil {
 			return res, err
 		}
-		if len(members) < compactPage {
+		if len(page) < s.compactPage || time.Since(start) >= interval {
 			return res, nil
+		}
+		last := strconv.FormatFloat(page[len(page)-1].Score, 'f', -1, 64)
+		if last != minDue {
+			minDue, skip = last, 0
+		}
+		for i := len(page) - 1; i >= 0 && page[i].Score == page[len(page)-1].Score; i-- {
+			skip++
 		}
 	}
 }
 
-// compactMembers compacts the chunks among members that have raw records.
+// compactMembers compacts the chunks among members that have enough raw
+// records.
 func (s *Store) compactMembers(ctx context.Context, shard int, members []string, res *storage.CompactResult) error {
 	lengths := make([]*redis.IntCmd, len(members))
 	if err := s.pipelined(ctx, len(members), func(pipe redis.Pipeliner, i int) {
@@ -67,7 +85,7 @@ func (s *Store) compactMembers(ctx context.Context, shard int, members []string,
 	}
 	var todo []string
 	for i, m := range members {
-		if lengths[i].Val() > chunk.HeaderLen {
+		if lengths[i].Val() >= int64(chunk.HeaderLen+s.compactMinRaw) {
 			todo = append(todo, m)
 		}
 	}
@@ -108,23 +126,32 @@ func (s *Store) compactBatch(ctx context.Context, shard int, members []string, r
 		if err != nil {
 			return fmt.Errorf("read chunk: %w", err)
 		}
-		if !ok || len(raw) <= chunk.HeaderLen {
+		if !ok || len(raw) < chunk.HeaderLen+s.compactMinRaw {
 			continue // completed, or compacted by someone else, since it was listed
 		}
 		_, samples, records, err := chunk.DecodeHot(raw, compacted)
-		if err == nil && records > limit {
-			// Further records stay raw, up to the size limit of the raw
-			// part: a chunk holds at most twice the records of a full raw
-			// part.
+		if err != nil {
+			res.Failed++
+			s.logger.Warn("cannot compact undecodable chunk; it is left as it is", "shard", shard, "member", members[i], "err", err)
 			continue
 		}
-		var next []byte
-		if err == nil {
-			next, err = chunk.EncodeCompacted(raw[:chunk.HeaderLen], records, samples)
+		// Chunks with native histograms stay raw (see EncodeCompacted).
+		// Beyond the record limit, further records stay raw up to the size
+		// limit of the raw part: a chunk holds at most twice the records of
+		// a full raw part.
+		if records > limit || slices.ContainsFunc(samples, model.Sample.IsHistogram) {
+			res.Kept++
+			continue
 		}
+		next, err := chunk.EncodeCompacted(raw[:chunk.HeaderLen], records, samples)
 		if err != nil {
 			res.Failed++
 			s.logger.Warn("cannot compact chunk; it is left as it is", "shard", shard, "member", members[i], "err", err)
+			continue
+		}
+		before := len(raw) - chunk.HeaderLen + len(compacted)
+		if len(next) >= before {
+			res.Kept++ // incompressible: compaction would take more memory
 			continue
 		}
 		n := len(raw) + len(compacted) + len(next)
@@ -137,7 +164,7 @@ func (s *Store) compactBatch(ctx context.Context, shard int, members []string, r
 		}
 		call.keys = append(call.keys, s.chunkKey(shard, members[i]), s.compactedKey(shard, members[i]))
 		call.args = append(call.args, members[i], raw, compacted, next)
-		cur = append(cur, compactSizes{before: len(raw) - chunk.HeaderLen + len(compacted), after: len(next)})
+		cur = append(cur, compactSizes{before: before, after: len(next)})
 		bytes += n
 	}
 	if len(cur) > 0 {

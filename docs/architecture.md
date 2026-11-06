@@ -97,11 +97,13 @@ order, so an append never reads the chunk:
 A chunk may also have a compacted part (`z`), which
 [compaction](#compaction) writes and nothing else changes: the 16-byte
 header of the chunk it belongs to, the number of records folded into it
-(uvarint), then the samples in the encoding of the cold tier (a
-[`chunk.Encoding`](#cold-tier-cassandra) byte and the blob). The raw
+(uvarint), then float samples XOR-encoded as in the cold tier (the
+[`chunk.Encoding`](#cold-tier-cassandra) byte 1 and the blob). The raw
 records were appended after every sample of the compacted part, so reading
 the chunk merges `compacted ++ raw` and the latest write still wins; its
-records are those of both parts.
+records are those of both parts. A compacted part that does not decode
+(another encoding, more samples than records, samples out of order, a
+header that is not the chunk's) makes the chunk undecodable.
 
 Integer histograms are stored as float histograms, which represent them
 exactly; remote write validates them as integer histograms first. A
@@ -111,9 +113,9 @@ count towards `ingester.max_samples_per_request` before it is decoded. A hot
 record that does not decode into a valid histogram is treated as corruption
 and quarantined. The raw part of a chunk is limited to 32 MiB (about two
 million samples); samples beyond that are rejected (`outcome="chunk_full"`)
-rather than creating a chunk that cannot be flushed. Compaction stops
-folding records once the compacted part holds as many as a full raw part,
-so a chunk holds at most about four million samples.
+rather than creating a chunk that cannot be flushed. Compaction stops once
+a chunk holds more records, in both parts, than a full raw part, so a chunk
+holds at most about four million float samples.
 
 xtsdb refuses to start if `storage.shards` or `storage.chunk_range` differ
 from the values recorded in `<prefix>:meta`, because either change would make
@@ -166,11 +168,13 @@ Raw records take 16 bytes per sample, and Redis grows a string greedily on
 held 28 bytes per sample on average. Gorilla compression at append time
 would need the state of the previous sample in a stateless ingester that
 does not read the chunk; the evaluation in
-[hot-compression.md](hot-compression.md) chose to compress open chunks in
-the background instead. With compaction every 5 minutes, Redis holds about
-9 bytes per sample instead of 30 (generated data, Redis 7.0).
+[hot-compression.md](hot-compression.md) chose to compress the float
+samples of open chunks in the background instead. With compaction every
+10 minutes, Redis holds about 9 bytes per sample instead of 29, for 22% more
+CPU time of the Redis main thread (generated data at a 15 s interval,
+Redis 7.0).
 
-Every `flusher.compaction_interval` (5 minutes by default, 0 disables it),
+Every `flusher.compaction_interval` (10 minutes by default, 0 disables it),
 the flushers compact each shard:
 
 1. A flusher takes the compaction lease of the shard,
@@ -179,13 +183,19 @@ the flushers compact each shard:
    ago, it moves on. Flushers offer every shard ten times per interval, in
    random order, so a shard is compacted about once per interval whatever
    the number of flushers.
-2. It lists the open chunks of the shard from the due set, leaving out
-   those that close within a minute (the flusher compresses them soon
-   anyway), and keeps those with raw records (`STRLEN` above 16 bytes).
+2. It lists the open chunks of the shard from the due set, in pages that
+   follow the due times, leaving out those that close within a minute (the
+   flusher compresses them soon anyway), and keeps those with at least
+   12 raw records (`STRLEN` of 16 + 192 bytes or more). With fewer, creating
+   the compacted part can take more memory than the records it replaces,
+   and the cost of a compaction would be spread over few samples.
 3. It reads each chunk and its compacted part with one `MGET`, merges them
    (`Normalize(compacted ++ raw)`) and encodes the result, with the record
    count of both parts, as the new compacted part. Encoding runs in the
-   flusher, with the encoders of the cold tier.
+   flusher, with the XOR encoder of the cold tier. A chunk is left as it is
+   (`outcome="kept"`) if it holds native histograms, more records than a
+   full raw part, or if the new compacted part would not be smaller than
+   the raw records and compacted part it replaces.
 4. The compaction script swaps the parts, for up to 256 chunks per call.
    For each chunk it checks that:
    - the window is still open by the clock of the Redis node (the due time
@@ -196,6 +206,8 @@ the flushers compact each shard:
    Then it sets the compacted part and rewrites the chunk as its header
    followed by the records appended since it was read. A chunk that fails a
    check is left for the next compaction.
+5. A pass stops once it has run for an interval, so that passes over a
+   large shard do not pile up; the next pass goes on.
 
 Properties:
 
@@ -204,26 +216,38 @@ Properties:
 - **A due window is immutable.** Compaction, like append, acts only before
   the due time by the node's clock, so once `claim` can see a chunk nothing
   changes it, and the fences of `complete` and `quarantine` stay valid.
-- **Samples never change.** The compacted part holds exactly the samples the
-  records it replaced resolved to, and their count. Reads, flushes, the
-  `total` and the digest of a version are the same with or without
-  compaction.
+- **Samples never change.** The compacted part holds exactly the float
+  samples the records it replaced resolved to, bit for bit, and their
+  count. Reads, flushes, the `total` and the digest of a version are the
+  same with or without compaction. Native histograms are not compacted:
+  decoding them from a Prometheus chunk would change their counter reset
+  hints, and with them what PromQL sees.
 - **Fenced by content.** Comparing lengths would not do: after a failover to
   a lagging replica, other records of the same length may have been
   appended, and a retried remote write can append the same bytes again after
   another compaction. The compacted part changes with every compaction (its
   record count grows), and the raw part is compared byte for byte.
 - **Works when Redis is full.** The lease and compaction scripts are flagged
-  `allow-oom`: they release more memory than they allocate.
+  `allow-oom`: with 12 records or more, every compaction frees memory, also
+  the first one, which creates the compacted part (measured in
+  [hot-compression.md](hot-compression.md#memory-effect-of-one-compaction)).
 - **Atomic for readers.** Reads load both parts with one `MGET`, so they
   never see a compaction half done.
 
-The cost is Redis time for listing, reading and swapping: about 0.9 µs per
-sample with compaction every 5 minutes at a 15 s interval, 17% of the time
-of appending it (see [hot-compression.md](hot-compression.md#results-of-the-implementation)).
-`xtsdb_flusher_compaction_chunks_total`,
+The cost is CPU time of the Redis main thread for listing, reading and
+swapping, and for appending again to a raw part that compaction shortened:
+22% more than without compaction every 10 minutes, 29% every 5 minutes, at
+a 15 s interval. Compaction trades CPU for memory: it lets a Redis main
+thread hold more series when memory limits it (below about 14 GB per thread
+at these rates), and fewer when CPU does; see
+[hot-compression.md](hot-compression.md#comparison-under-the-same-conditions).
+`xtsdb_flusher_compaction_chunks_total{outcome}` counts the chunks processed
+(`compacted`, `kept`, `changed`, `failed`);
 `xtsdb_flusher_compaction_input_bytes_total` and
-`xtsdb_flusher_compaction_output_bytes_total` show what it does.
+`xtsdb_flusher_compaction_output_bytes_total` count the bytes compaction
+read and replaced (raw records and the earlier compacted part, which is
+counted again at every compaction) and the compacted parts it wrote. The
+memory saved shows in `used_memory` of Redis.
 
 ### Hand-off protocol (flusher)
 
@@ -260,9 +284,13 @@ Invariants:
   still those that were persisted. A flusher whose lease
   expired cannot delete a newer incarnation, and samples appended after the
   chunk was loaded (possible only after a failover to a lagging replica)
-  are not deleted: the chunk is re-processed after its lease.
+  are not deleted: the chunk is re-processed after its lease. The fence
+  compares lengths: if, after such a failover, the chunk diverged so that
+  both its lengths are those that were loaded (the same number of other
+  records, and a compaction that left the compacted part as long), those
+  records are deleted unpersisted.
 - **No leaks.** In-flight entries whose chunk no longer exists are released,
-  with a compacted part left behind.
+  and a compacted part left behind is deleted.
 - **Fenced quarantine.** A chunk that cannot be decoded is moved to a
   quarantine key so that it does not block flushing, but only if its first
   16 bytes, its length and the length of its compacted part are still those
@@ -294,6 +322,8 @@ left data in Redis forever.
 | Chunk changes during a compaction (an append, another compaction, its window closes, a new incarnation) | Appended records are kept; in the other cases the compaction of that chunk does nothing (`outcome="changed"`) and is retried at the next interval if the window is still open. |
 | Flusher dies during a compaction | The swap is one atomic script: either both parts changed or neither. The shard waits for its lease to expire, at most one interval. |
 | Compaction is disabled or slow | Raw records stay as they are; nothing but memory use depends on it. |
+| Redis clock steps back | The compaction lease of a shard (a `PX` expiry) lasts longer by the size of the step, and the shard is not compacted meanwhile. |
+| Keys evicted (a `maxmemory-policy` other than `noeviction`) | A chunk evicted without its compacted part leaves it next to the next incarnation of the window, which is then undecodable and quarantined when flushed; a compacted part evicted alone loses the samples it held. Use `noeviction`. |
 | Very large chunk | Persisted in parts of at most 100,000 samples and 4 MiB, below Cassandra's mutation limit (TiKV stores parts in segments of 8 KiB). A single native histogram is limited to 16,384 buckets (about 130 KB), so every part fits. |
 | Sample for a closed window | Rejected and counted (`outcome="too_old"`); remote write returns 400. |
 | Redis clock moves backwards | A claimed chunk still rejects appends (the in-flight check). A chunk re-created after completion gets a larger fragment from the shard clock and is stored as a separate version that takes precedence; reads merge versions. |
@@ -302,16 +332,19 @@ left data in Redis forever.
 ### Quarantined chunks
 
 A chunk that cannot be decoded (its length is not a whole number of
-records, or its header is not a timestamp) can only be the result of a bug
-or of tampering with Redis, but it must neither block flushing nor be lost
-silently:
+records, its header is not a timestamp, or its compacted part does not
+decode or belongs to another incarnation) can only be the result of a bug,
+of eviction or of tampering with Redis, but it must neither block flushing
+nor be lost silently:
 
 - It is renamed to `<prefix>:{N}:q:<series>:<window>:<digest>`, where
-  `digest` is the xxhash64 of its content followed by its compacted part.
+  `digest` is the xxhash64 of the length of its content, its content and
+  its compacted part.
   Different chunks of the same window therefore never overwrite each other
   in quarantine. Its compacted part, if any, is renamed to the same key with
   `qz` for `q`, and expires with it.
-- The rename is fenced on the first 16 bytes and the length that were read.
+- The rename is fenced on the first 16 bytes, the length and the length of
+  the compacted part that were read.
   If the chunk changed since (a newer incarnation after a failover or a
   clock step), it stays in flight and is read again after its lease.
 - The quarantine key is recorded in `<prefix>:{N}:qidx` and expires after

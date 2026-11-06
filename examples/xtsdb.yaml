@@ -142,11 +142,13 @@ flusher:
   # flushing, and kept this long for inspection (`xtsdb quarantine list`).
   # 0 keeps them until they are deleted (`xtsdb quarantine delete`).
   quarantine_ttl: 30d
-  # Compress the raw samples of open chunks in Redis this often, so that
-  # they take a fraction of the memory until they are flushed. Each shard is
-  # compacted at most once per interval across all flushers; chunks that
-  # close within a minute are left as they are. 0 disables compaction.
-  compaction_interval: 5m
+  # Compress the raw float samples of open chunks in Redis this often, so
+  # that they take about a third of the memory until they are flushed, for
+  # about a fifth more Redis CPU. Each shard is compacted at most once per
+  # interval across all flushers. Chunks that close within a minute, chunks
+  # with fewer than 12 raw samples and chunks with native histograms are left
+  # as they are. 0 disables compaction (see docs/hot-compression.md).
+  compaction_interval: 10m
 
 querier:
   lookback_delta: 5m

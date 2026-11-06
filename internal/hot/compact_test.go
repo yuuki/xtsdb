@@ -39,12 +39,23 @@ func compactAll(t *testing.T, s *Store, client redis.UniversalClient) storage.Co
 			t.Fatalf("shard %d skipped without a lease", shard)
 		}
 		total.Compacted += res.Compacted
+		total.Kept += res.Kept
 		total.Changed += res.Changed
 		total.Failed += res.Failed
 		total.BytesBefore += res.BytesBefore
 		total.BytesAfter += res.BytesAfter
 	}
 	return total
+}
+
+// run returns n samples of value v, one millisecond apart from t: enough
+// records that their compacted part is smaller than they are.
+func run(t int64, n int, v float64) []model.Sample {
+	out := make([]model.Sample, n)
+	for i := range out {
+		out[i] = model.Sample{T: t + int64(i), V: v}
+	}
+	return out
 }
 
 // atWindowStart waits until a window of the series has just opened, so that
@@ -98,9 +109,6 @@ func TestCompactionKeepsSamples(t *testing.T) {
 			for i := range n {
 				ts := now - int64(r.IntN(20))*1000 // out of order, with overwrites
 				smp := model.Sample{T: ts, V: []float64{float64(i), r.Float64(), math.NaN()}[r.IntN(3)]}
-				if r.IntN(10) == 0 {
-					smp = model.Sample{T: ts, H: compactHistogram(i)}
-				}
 				batch = append(batch, smp)
 			}
 			if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: id, Samples: batch}}); err != nil {
@@ -179,6 +187,7 @@ func TestCompactedChunkIsFlushed(t *testing.T) {
 	layout := model.Layout{Shards: 1, ChunkRange: 1500, Grace: 0}
 	s, client := newTestStore(t, layout, time.Minute)
 	s.compactMargin = 0
+	s.compactMinRaw = chunk.RecordLen
 	ctx := context.Background()
 	id := model.SeriesID(42)
 	start := layout.WindowStart(id, atWindowStart(layout, id))
@@ -221,14 +230,15 @@ func TestCompactedChunkIsFlushed(t *testing.T) {
 func TestCompactionKeepsConcurrentAppends(t *testing.T) {
 	layout := model.Layout{Shards: 1, ChunkRange: time.Hour.Milliseconds(), Grace: time.Hour.Milliseconds()}
 	s, client := newTestStore(t, layout, time.Minute)
+	s.compactMinRaw = chunk.RecordLen
 	ctx := context.Background()
 	id := model.SeriesID(7)
 	now := nowMs()
-	all := []model.Sample{{T: now, V: 1}, {T: now + 1, V: 2}}
+	all := run(now, 4, 1)
 	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: id, Samples: all}}); err != nil {
 		t.Fatal(err)
 	}
-	late := []model.Sample{{T: now + 1, V: 20}, {T: now + 2, V: 3}}
+	late := []model.Sample{{T: now + 1, V: 20}, {T: now + 4, V: 3}}
 	s.beforeCompact = func() {
 		if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: id, Samples: late}}); err != nil {
 			t.Error(err)
@@ -254,12 +264,14 @@ func TestCompactionKeepsConcurrentAppends(t *testing.T) {
 func TestCompactionIsFenced(t *testing.T) {
 	layout := model.Layout{Shards: 1, ChunkRange: time.Hour.Milliseconds(), Grace: time.Hour.Milliseconds()}
 	s, client := newTestStore(t, layout, time.Minute)
+	s.compactMinRaw = chunk.RecordLen
 	ctx := context.Background()
 	id := model.SeriesID(7)
 	now := nowMs()
 	m := member(id, layout.WindowStart(id, now))
 	key, zkey := s.chunkKey(0, m), s.compactedKey(0, m)
-	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: id, Samples: []model.Sample{{T: now, V: 1}, {T: now + 1, V: 2}}}}); err != nil {
+	base := run(now, 4, 1)
+	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: id, Samples: base}}); err != nil {
 		t.Fatal(err)
 	}
 	header := client.GetRange(ctx, key, 0, 15).Val()
@@ -271,11 +283,11 @@ func TestCompactionIsFenced(t *testing.T) {
 		// Different records of the same length, as after a failover to a
 		// lagging replica that received other appends.
 		{"diverged records", func() {
-			client.Set(ctx, key, string(chunk.AppendRaw([]byte(header), []model.Sample{{T: now, V: 9}, {T: now + 1, V: 9}})), 0)
+			client.Set(ctx, key, string(chunk.AppendRaw([]byte(header), run(now, 4, 9))), 0)
 		}},
 		// A newer incarnation of the window.
 		{"new incarnation", func() {
-			client.Set(ctx, key, string(chunk.AppendRaw([]byte("9999999999999999"), []model.Sample{{T: now, V: 1}, {T: now + 1, V: 2}})), 0)
+			client.Set(ctx, key, string(chunk.AppendRaw([]byte("9999999999999999"), base)), 0)
 		}},
 		// Another compaction in between.
 		{"concurrent compaction", func() {
@@ -285,7 +297,7 @@ func TestCompactionIsFenced(t *testing.T) {
 			}
 			// The same records arrive again (a retried remote write), so the
 			// raw part looks as it did when it was read.
-			if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: id, Samples: []model.Sample{{T: now, V: 1}, {T: now + 1, V: 2}}}}); err != nil {
+			if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: id, Samples: base}}); err != nil {
 				t.Error(err)
 			}
 		}},
@@ -293,7 +305,7 @@ func TestCompactionIsFenced(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			client.Del(ctx, zkey)
-			client.Set(ctx, key, string(chunk.AppendRaw([]byte(header), []model.Sample{{T: now, V: 1}, {T: now + 1, V: 2}})), 0)
+			client.Set(ctx, key, string(chunk.AppendRaw([]byte(header), base)), 0)
 			s.beforeCompact = c.change
 			client.Del(ctx, s.compactLeaseKey(0))
 			res, err := s.Compact(ctx, 0, time.Hour)
@@ -311,7 +323,7 @@ func TestCompactionIsFenced(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sameSamples(t, got[id], []model.Sample{{T: now, V: 1}, {T: now + 1, V: 2}})
+	sameSamples(t, got[id], base)
 }
 
 // Chunks that closed, or were claimed, are never compacted: a due window
@@ -320,18 +332,19 @@ func TestCompactionLeavesClosedChunks(t *testing.T) {
 	layout := model.Layout{Shards: 1, ChunkRange: 600, Grace: 0}
 	s, client := newTestStore(t, layout, time.Minute)
 	s.compactMargin = 0
+	s.compactMinRaw = chunk.RecordLen
 	ctx := context.Background()
 	id := model.SeriesID(3)
-	now := nowMs()
-	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: id, Samples: []model.Sample{{T: now, V: 1}}}}); err != nil {
+	now := atWindowStart(layout, id)
+	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: id, Samples: run(now, 4, 1)}}); err != nil {
 		t.Fatal(err)
 	}
 	due := layout.Due(layout.WindowStart(id, now))
 	// The window closes between the read and the swap.
 	s.beforeCompact = func() { time.Sleep(time.Until(time.UnixMilli(due + 50))) }
 	res := compactAll(t, s, client)
-	if res.Compacted != 0 {
-		t.Fatalf("a closed window was compacted: %+v", res)
+	if res.Compacted != 0 || res.Changed != 1 {
+		t.Fatalf("a closed window must not be compacted: %+v", res)
 	}
 	s.beforeCompact = nil
 	m := member(id, layout.WindowStart(id, now))
@@ -354,10 +367,11 @@ func TestCompleteIsFencedOnCompactedPart(t *testing.T) {
 	layout := model.Layout{Shards: 1, ChunkRange: 1500, Grace: 0}
 	s, client := newTestStore(t, layout, time.Minute)
 	s.compactMargin = 0
+	s.compactMinRaw = chunk.RecordLen
 	ctx := context.Background()
 	id := model.SeriesID(5)
 	now := atWindowStart(layout, id)
-	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: id, Samples: []model.Sample{{T: now, V: 1}}}}); err != nil {
+	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: id, Samples: run(now, 4, 1)}}); err != nil {
 		t.Fatal(err)
 	}
 	if res := compactAll(t, s, client); res.Compacted != 1 {
@@ -382,11 +396,12 @@ func TestQuarantineMovesCompactedPart(t *testing.T) {
 	layout := model.Layout{Shards: 1, ChunkRange: 1500, Grace: 0}
 	s, client := newTestStore(t, layout, time.Minute)
 	s.compactMargin = 0
+	s.compactMinRaw = chunk.RecordLen
 	s.quarantineTTL = time.Hour
 	ctx := context.Background()
 	id := model.SeriesID(5)
 	now := atWindowStart(layout, id)
-	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: id, Samples: []model.Sample{{T: now, V: 1}, {T: now + 1, V: 2}}}}); err != nil {
+	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: id, Samples: run(now, 4, 1)}}); err != nil {
 		t.Fatal(err)
 	}
 	if res := compactAll(t, s, client); res.Compacted != 1 {
@@ -461,6 +476,7 @@ func TestCompactionRecordLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s2.compactMinRaw = chunk.RecordLen
 	now := nowMs()
 	var all []model.Sample
 	add := func(n int) {
@@ -533,10 +549,11 @@ func TestCompactionWorksAtMaxmemory(t *testing.T) {
 func TestCompactionSkipsUndecodableChunks(t *testing.T) {
 	layout := model.Layout{Shards: 1, ChunkRange: time.Hour.Milliseconds(), Grace: time.Hour.Milliseconds()}
 	s, client := newTestStore(t, layout, time.Minute)
+	s.compactMinRaw = chunk.RecordLen
 	ctx := context.Background()
 	now := nowMs()
 	for _, id := range []model.SeriesID{1, 2} {
-		if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: id, Samples: []model.Sample{{T: now, V: 1}}}}); err != nil {
+		if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: id, Samples: run(now, 4, 1)}}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -549,5 +566,157 @@ func TestCompactionSkipsUndecodableChunks(t *testing.T) {
 	}
 	if client.Get(ctx, bad).Val() != content {
 		t.Fatal("an undecodable chunk was changed")
+	}
+}
+
+// A corrupt compacted part must not crash compaction, reads or the
+// flusher: it is reported, skipped, and quarantined when flushed.
+func TestCorruptCompactedPart(t *testing.T) {
+	layout := model.Layout{Shards: 1, ChunkRange: 1500, Grace: 0}
+	s, client := newTestStore(t, layout, time.Minute)
+	s.compactMargin = 0
+	s.compactMinRaw = chunk.RecordLen
+	ctx := context.Background()
+	id := model.SeriesID(5)
+	now := atWindowStart(layout, id)
+	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: id, Samples: []model.Sample{{T: now, V: 1}}}}); err != nil {
+		t.Fatal(err)
+	}
+	m := member(id, layout.WindowStart(id, now))
+	header := client.GetRange(ctx, s.chunkKey(0, m), 0, 15).Val()
+	// One record, XOR encoding, a segment of one byte: chunkenc would panic.
+	client.Set(ctx, s.compactedKey(0, m), header+"\x01\x01\x01\x00", 0)
+	if res := compactAll(t, s, client); res.Failed != 1 {
+		t.Fatalf("unexpected compaction %+v", res)
+	}
+	if got, err := s.Read(ctx, []model.SeriesID{id}, now-1000, now+1000); err != nil || len(got[id]) != 0 {
+		t.Fatalf("read: %v %v", got, err)
+	}
+	refs := waitClaim(t, s, 0)
+	res, err := s.Load(ctx, refs)
+	if err != nil || res.Quarantined != 1 {
+		t.Fatalf("load: %+v %v", res, err)
+	}
+}
+
+// Chunks with fewer than storage.CompactMinRecords raw records are left
+// alone: creating their compacted part could take more memory than it
+// frees.
+func TestCompactionWaitsForRecords(t *testing.T) {
+	layout := model.Layout{Shards: 1, ChunkRange: time.Hour.Milliseconds(), Grace: time.Hour.Milliseconds()}
+	s, client := newTestStore(t, layout, time.Minute)
+	ctx := context.Background()
+	now := nowMs()
+	add := func(id model.SeriesID, n int) {
+		var samples []model.Sample
+		for i := range n {
+			samples = append(samples, model.Sample{T: now + int64(i), V: 1})
+		}
+		if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: id, Samples: samples}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add(1, storage.CompactMinRecords-1)
+	add(2, storage.CompactMinRecords)
+	if res := compactAll(t, s, client); res.Compacted != 1 || res.Kept+res.Changed+res.Failed != 0 {
+		t.Fatalf("unexpected compaction %+v", res)
+	}
+	if client.Exists(ctx, s.compactedKey(0, member(1, layout.WindowStart(1, now)))).Val() != 0 {
+		t.Fatal("a chunk with too few records was compacted")
+	}
+}
+
+// Chunks with native histograms, and chunks that would not get smaller,
+// stay raw.
+func TestCompactionKeepsWhatItCannotShrink(t *testing.T) {
+	layout := model.Layout{Shards: 1, ChunkRange: 24 * time.Hour.Milliseconds(), Grace: time.Hour.Milliseconds()}
+	s, client := newTestStore(t, layout, time.Minute)
+	ctx := context.Background()
+	r := rand.New(rand.NewPCG(3, 4))
+	now := nowMs()
+	var hist, noise []model.Sample
+	start := layout.WindowStart(2, now)
+	ts := start
+	for i := range storage.CompactMinRecords {
+		hist = append(hist, model.Sample{T: now + int64(i), V: 1})
+		// Random gaps of up to 90 minutes and random bits: the XOR encoding
+		// takes more than 16 bytes per sample.
+		ts += 1 + r.Int64N(90*time.Minute.Milliseconds())
+		noise = append(noise, model.Sample{T: ts, V: math.Float64frombits(r.Uint64() &^ (0x7ff << 52))})
+	}
+	hist[3] = model.Sample{T: hist[3].T, H: compactHistogram(3)}
+	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: 1, Samples: hist}, {ID: 2, Samples: noise}}); err != nil {
+		t.Fatal(err)
+	}
+	res := compactAll(t, s, client)
+	if res.Compacted != 0 || res.Kept != 2 {
+		t.Fatalf("unexpected compaction %+v", res)
+	}
+	if n, _ := client.Keys(ctx, s.prefix+":{*}:z:*").Result(); len(n) != 0 {
+		t.Fatalf("compacted parts written: %v", n)
+	}
+}
+
+// Chunks that close within storage.CompactMargin are left to the flusher.
+func TestCompactionLeavesChunksClosingSoon(t *testing.T) {
+	layout := model.Layout{Shards: 1, ChunkRange: 30 * time.Second.Milliseconds(), Grace: 0}
+	s, client := newTestStore(t, layout, time.Minute)
+	s.compactMinRaw = chunk.RecordLen
+	ctx := context.Background()
+	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: 1, Samples: []model.Sample{{T: nowMs(), V: 1}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if res := compactAll(t, s, client); res.Compacted+res.Changed+res.Kept != 0 {
+		t.Fatalf("a chunk closing within the margin was considered: %+v", res)
+	}
+}
+
+// Open chunks are listed page by page, following their due times, also
+// when many share one.
+func TestCompactionPages(t *testing.T) {
+	layout := model.Layout{Shards: 1, ChunkRange: time.Hour.Milliseconds(), Grace: time.Hour.Milliseconds()}
+	s, client := newTestStore(t, layout, time.Minute)
+	s.compactMinRaw = chunk.RecordLen
+	s.compactPage = 3
+	ctx := context.Background()
+	now := nowMs()
+	var batch []storage.SeriesSamples
+	for k := range 10 { // the same window offset: the same due time
+		batch = append(batch, storage.SeriesSamples{ID: model.SeriesID(1 + int64(k)*layout.ChunkRange), Samples: run(now, 4, 1)})
+	}
+	for k := range 5 {
+		batch = append(batch, storage.SeriesSamples{ID: model.SeriesID(2 + k), Samples: run(now, 4, 1)})
+	}
+	if _, err := s.Append(ctx, batch); err != nil {
+		t.Fatal(err)
+	}
+	if res := compactAll(t, s, client); res.Compacted != len(batch) {
+		t.Fatalf("compacted %d chunks, want %d: %+v", res.Compacted, len(batch), res)
+	}
+}
+
+// A pass stops after an interval; the next one goes on.
+func TestCompactionPassIsBounded(t *testing.T) {
+	layout := model.Layout{Shards: 1, ChunkRange: time.Hour.Milliseconds(), Grace: time.Hour.Milliseconds()}
+	s, client := newTestStore(t, layout, time.Minute)
+	s.compactMinRaw = chunk.RecordLen
+	s.compactPage = 3
+	ctx := context.Background()
+	now := nowMs()
+	var batch []storage.SeriesSamples
+	for k := range 9 {
+		batch = append(batch, storage.SeriesSamples{ID: model.SeriesID(2 + k), Samples: run(now, 4, 1)})
+	}
+	if _, err := s.Append(ctx, batch); err != nil {
+		t.Fatal(err)
+	}
+	s.beforeCompact = func() { time.Sleep(60 * time.Millisecond) }
+	res, err := s.Compact(ctx, 0, 50*time.Millisecond)
+	if err != nil || res.Compacted != 3 {
+		t.Fatalf("first pass: %+v %v", res, err)
+	}
+	s.beforeCompact = nil
+	if total := res.Compacted + compactAll(t, s, client).Compacted; total != 9 {
+		t.Fatalf("compacted %d chunks in two passes, want 9", total)
 	}
 }

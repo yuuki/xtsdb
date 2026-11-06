@@ -38,18 +38,20 @@ func TestDecodeHotMergesCompactedPart(t *testing.T) {
 	// Compaction folded five records (one overwritten) into the compacted
 	// part; the raw part holds what was appended since.
 	folded := Normalize(rawRoundTrip(t, []model.Sample{
-		{T: 1000, V: 1}, {T: 2000, V: 2}, {T: 3000, V: 3}, {T: 2000, V: 2.5}, {T: 5000, H: testHistogram(1, false)},
+		{T: 1000, V: 1}, {T: 2000, V: 2}, {T: 3000, V: 3}, {T: 2000, V: 2.5}, {T: 5000, V: 5},
 	}))
 	compacted, err := EncodeCompacted(header, 5, folded)
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw := AppendRaw(append([]byte{}, header...), []model.Sample{{T: 3000, V: 30}, {T: 4000, V: 4}, {T: 3000, V: 31}})
+	raw := AppendRaw(append([]byte{}, header...), []model.Sample{
+		{T: 3000, V: 30}, {T: 4000, V: 4}, {T: 3000, V: 31}, {T: 5000, H: testHistogram(1, false)},
+	})
 	frag, got, records, err := DecodeHot(raw, compacted)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if frag != 1793881662314273 || records != 8 {
+	if frag != 1793881662314273 || records != 9 {
 		t.Fatalf("fragment = %d, records = %d", frag, records)
 	}
 	// Raw records were written after the compacted samples and win.
@@ -103,11 +105,42 @@ func TestCompactedRejectsCorruptInput(t *testing.T) {
 			t.Errorf("%s: expected ErrCorrupt, got %v", name, err)
 		}
 	}
+	// Samples out of order: compaction writes them sorted, so this is
+	// corruption.
+	unsorted, err := EncodeXOR([]model.Sample{{T: 2, V: 2}, {T: 1, V: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := append(append(append([]byte{}, header...), 2, byte(EncodingXOR)), unsorted...)
+	if _, _, err := DecodeCompacted(b); !errors.Is(err, ErrCorrupt) {
+		t.Errorf("out of order: expected ErrCorrupt, got %v", err)
+	}
 	if _, err := EncodeCompacted(header, 1, []model.Sample{{T: 1}, {T: 2}}); err == nil {
 		t.Error("fewer records than samples must be refused")
 	}
 	if _, err := EncodeCompacted(header[:4], 1, nil); err == nil {
 		t.Error("a short header must be refused")
+	}
+	if _, err := EncodeCompacted(header, 1, []model.Sample{{T: 1, H: testHistogram(1, false)}}); err == nil {
+		t.Error("native histograms must not be compacted")
+	}
+	// Only XOR-encoded floats: a typed blob is corruption.
+	_, typed, err := Encode([]model.Sample{{T: 1, H: testHistogram(1, false)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b = append(append(append([]byte{}, header...), 1, byte(EncodingTyped)), typed...)
+	if _, _, err := DecodeCompacted(b); !errors.Is(err, ErrCorrupt) {
+		t.Errorf("typed encoding: expected ErrCorrupt, got %v", err)
+	}
+	// More samples than records claimed.
+	many, err := EncodeXOR([]model.Sample{{T: 1}, {T: 2}, {T: 3}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b = append(append(append([]byte{}, header...), 2, byte(EncodingXOR)), many...)
+	if _, _, err := DecodeCompacted(b); !errors.Is(err, ErrCorrupt) {
+		t.Errorf("more samples than records: expected ErrCorrupt, got %v", err)
 	}
 }
 
@@ -326,4 +359,42 @@ func TestLargestHistogramFits(t *testing.T) {
 	if raw := AppendRaw(nil, []model.Sample{{T: 1, H: h}}); len(raw) > 1<<20 {
 		t.Fatalf("hot record of %d bytes", len(raw))
 	}
+}
+
+// Corrupt chunks must be reported as ErrCorrupt, never panic: the flusher
+// would crash on every chunk it claims after the corrupt one.
+func FuzzDecodeHot(f *testing.F) {
+	header := []byte("1793881662314273")
+	good, err := EncodeCompacted(header, 2, []model.Sample{{T: 1, V: 1}, {T: 2, V: 2}})
+	if err != nil {
+		f.Fatal(err)
+	}
+	_, typed, err := Encode([]model.Sample{{T: 1, H: testHistogram(1, false)}})
+	if err != nil {
+		f.Fatal(err)
+	}
+	hist := append(append(append([]byte{}, header...), 1, byte(EncodingTyped)), typed...)
+	raw := AppendRaw(append([]byte{}, header...), []model.Sample{{T: 3, V: 3}, {T: 4, H: testHistogram(2, false)}})
+	for _, z := range [][]byte{
+		nil, good, hist,
+		append(append([]byte{}, header...), 1, byte(EncodingXOR), 1, 0),      // XOR segment of 1 byte
+		append(append([]byte{}, header...), 1, byte(EncodingXOR), 0),         // XOR segment of 0 bytes
+		append(append([]byte{}, header...), 1, byte(EncodingTyped), 7, 1, 0), // histogram segment of 1 byte
+		good[:len(good)-1],
+	} {
+		f.Add(raw, z)
+		f.Add(header, z)
+	}
+	f.Fuzz(func(t *testing.T, raw, compacted []byte) {
+		_, samples, records, err := DecodeHot(raw, compacted)
+		if err != nil {
+			if !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("error is not ErrCorrupt: %v", err)
+			}
+			return
+		}
+		if records < len(samples) {
+			t.Fatalf("%d records for %d samples", records, len(samples))
+		}
+	})
 }

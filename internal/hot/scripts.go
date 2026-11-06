@@ -229,7 +229,9 @@ return redis.call('SET', KEYS[1], '1', 'NX', 'PX', ARGV[1])
 // records of the same length may have been appended. Records appended after
 // the read are kept after the header.
 //
-// It runs when Redis is out of memory: it releases more than it allocates.
+// It runs when Redis is out of memory: for the chunks Store.Compact passes
+// (at least storage.CompactMinRecords raw records, and a smaller compacted
+// part), a swap frees more memory than it allocates (docs/hot-compression.md).
 //
 // KEYS[1] = due set, KEYS[2..] = (chunk key, compacted key) for every chunk
 // ARGV = (member, chunk as read, compacted part as read (empty if none), new

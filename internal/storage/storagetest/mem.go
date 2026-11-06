@@ -33,22 +33,27 @@ func (c *hotChunk) samples() []model.Sample {
 
 // Hot is an in-memory storage.HotStore.
 type Hot struct {
-	mu          sync.Mutex
-	Layout      model.Layout
-	Lease       time.Duration
-	Now         func() time.Time
-	MaxChunk    int // maximum samples per chunk; 0 means unlimited
-	chunks      map[storage.ChunkRef]*hotChunk
-	inflight    map[storage.ChunkRef]int64
-	leases      map[int]int64 // compaction lease expiry per shard
-	compactions int
-	seq         int64
+	mu       sync.Mutex
+	Layout   model.Layout
+	Lease    time.Duration
+	Now      func() time.Time
+	MaxChunk int // maximum samples per chunk; 0 means unlimited
+	// CompactMinRecords is the number of raw records a chunk needs to be
+	// compacted: storage.CompactMinRecords unless a test lowers it.
+	CompactMinRecords int
+	chunks            map[storage.ChunkRef]*hotChunk
+	inflight          map[storage.ChunkRef]int64
+	leases            map[int]int64 // compaction lease expiry per shard
+	compactions       int
+	seq               int64
 }
 
 func size(c *hotChunk) int { return 16 + 16*len(c.raw) }
 
-// compactedSize grows with every compaction of a chunk, as the size of a
-// real compacted part changes.
+// compactedSize stands for the size of the compacted part, which fences
+// compare once the window has closed and compaction no longer runs. It grows
+// with every compaction; a real compacted part may keep its size when the
+// records it folds only overwrite samples, which those fences never see.
 func compactedSize(c *hotChunk) int {
 	if c.compactedRecords == 0 {
 		return 0
@@ -59,12 +64,13 @@ func compactedSize(c *hotChunk) int {
 // NewHot creates a Hot store.
 func NewHot(layout model.Layout, lease time.Duration) *Hot {
 	return &Hot{
-		Layout:   layout,
-		Lease:    lease,
-		Now:      time.Now,
-		chunks:   make(map[storage.ChunkRef]*hotChunk),
-		inflight: make(map[storage.ChunkRef]int64),
-		leases:   make(map[int]int64),
+		Layout:            layout,
+		Lease:             lease,
+		Now:               time.Now,
+		CompactMinRecords: storage.CompactMinRecords,
+		chunks:            make(map[storage.ChunkRef]*hotChunk),
+		inflight:          make(map[storage.ChunkRef]int64),
+		leases:            make(map[int]int64),
 	}
 }
 
@@ -119,7 +125,17 @@ func (h *Hot) Compact(_ context.Context, shard int, interval time.Duration) (sto
 	}
 	h.leases[shard] = now + interval.Milliseconds()
 	for ref, c := range h.chunks {
-		if ref.Shard != shard || len(c.raw) == 0 || c.due <= now+storage.CompactMargin.Milliseconds() {
+		if ref.Shard != shard || len(c.raw) == 0 || len(c.raw) < h.CompactMinRecords ||
+			c.due <= now+storage.CompactMargin.Milliseconds() {
+			continue
+		}
+		// Chunks with native histograms are not compacted.
+		if slices.ContainsFunc(c.raw, model.Sample.IsHistogram) || slices.ContainsFunc(c.compacted, model.Sample.IsHistogram) {
+			continue
+		}
+		// As in Redis, a chunk holds at most twice the records of a full raw
+		// part: compaction stops beyond that.
+		if h.MaxChunk > 0 && c.compactedRecords+len(c.raw) > h.MaxChunk {
 			continue
 		}
 		if _, busy := h.inflight[ref]; busy {

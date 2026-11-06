@@ -83,6 +83,12 @@ type Backlog struct {
 // by HotStore.Compact: the flusher compresses it soon anyway.
 const CompactMargin = time.Minute
 
+// CompactMinRecords is the number of raw float records (16 bytes each, or
+// their size in histogram records) a chunk needs before HotStore.Compact
+// compacts it. With fewer, creating the compacted part can take more memory
+// than it frees, and the cost of a compaction is spread over few samples.
+const CompactMinRecords = 12
+
 // CompactResult reports what HotStore.Compact did.
 type CompactResult struct {
 	// Skipped means that the shard was compacted less than an interval
@@ -98,6 +104,10 @@ type CompactResult struct {
 	// Failed counts chunks that could not be decoded or encoded. They are
 	// left as they are; flushing quarantines undecodable chunks.
 	Failed int
+	// Kept counts chunks left raw because compaction would not help: they
+	// hold native histograms, too many records, or their compacted part
+	// would not be smaller than what it replaces.
+	Kept int
 	// BytesBefore is the size of the raw records and compacted parts that
 	// were replaced, and BytesAfter the size of the new compacted parts.
 	BytesBefore, BytesAfter int64
@@ -115,8 +125,9 @@ type HotStore interface {
 	Append(ctx context.Context, batch []SeriesSamples) (AppendResult, error)
 	// Compact moves the raw records of the open chunks of a shard into their
 	// compacted part, at most once per interval per shard across all
-	// callers. The samples a chunk holds do not change, and chunks whose
-	// window is closed or closes within CompactMargin are left alone.
+	// callers. The samples a chunk holds do not change. Chunks whose window
+	// is closed or closes within CompactMargin, and chunks with fewer than
+	// CompactMinRecords raw records, are left alone.
 	Compact(ctx context.Context, shard int, interval time.Duration) (CompactResult, error)
 	Claim(ctx context.Context, shard, limit int) ([]ChunkRef, error)
 	// Load reads claimed chunks. Undecodable chunks are quarantined: moved
