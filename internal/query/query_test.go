@@ -18,6 +18,8 @@ import (
 
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
+	promstorage "github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 
 	"github.com/yuuki/xtsdb/internal/chunk"
 	"github.com/yuuki/xtsdb/internal/flush"
@@ -70,6 +72,16 @@ func newFixture(t *testing.T) *fixture {
 // add indexes a series and stores samples in the hot tier.
 func (f *fixture) add(t *testing.T, lset labels.Labels, samples ...model.Sample) model.SeriesID {
 	t.Helper()
+	id := f.indexSeries(t, lset, samples)
+	if _, err := f.hot.Append(context.Background(), []storage.SeriesSamples{{ID: id, Samples: samples}}); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// indexSeries indexes a series for the days of samples.
+func (f *fixture) indexSeries(t *testing.T, lset labels.Labels, samples []model.Sample) model.SeriesID {
+	t.Helper()
 	ctx := context.Background()
 	id := model.ID(lset)
 	for _, day := range model.Days(samples[0].T, samples[len(samples)-1].T) {
@@ -80,9 +92,6 @@ func (f *fixture) add(t *testing.T, lset labels.Labels, samples ...model.Sample)
 			_ = f.index.WriteLabelValue(ctx, day, l.Name, l.Value)
 			_ = f.index.WriteLabelName(ctx, day, l.Name)
 		})
-	}
-	if _, err := f.hot.Append(ctx, []storage.SeriesSamples{{ID: id, Samples: samples}}); err != nil {
-		t.Fatal(err)
 	}
 	return id
 }
@@ -618,5 +627,91 @@ func TestNativeHistograms(t *testing.T) {
 	res := body["data"].(map[string]any)["result"].([]any)[0].(map[string]any)
 	if _, ok := res["histogram"]; code != http.StatusOK || !ok {
 		t.Fatalf("raw histogram not rendered: %d %v", code, res)
+	}
+}
+
+// Histograms give the same results from both tiers, also when the engine
+// overwrites histograms it was given: it does so with points that leave the
+// range of a matrix selector when a sample falls on an evaluation timestamp.
+// Histograms decoded from one chunk of the persistent tier share their spans,
+// so handing them out uncopied mixed up the buckets of a range that spans two
+// chunks with different layouts, or made the query fail.
+func TestHistogramsFromBothTiersAgree(t *testing.T) {
+	base := ms(-20*time.Minute) / 30_000 * 30_000 // on the evaluation steps
+	// New histograms for every fixture: the in-memory hot store keeps them.
+	makeSamples := func() []model.Sample {
+		var samples []model.Sample
+		for i := range 60 {
+			h := &histogram.FloatHistogram{Schema: 0, PositiveSpans: []histogram.Span{{Offset: 0, Length: 2}, {Offset: 2, Length: 2}}}
+			n := i
+			if i >= 30 { // a counter reset to another layout starts a new chunk
+				h.PositiveSpans, n = []histogram.Span{{Offset: 5, Length: 3}, {Offset: 1, Length: 3}}, i-30
+			}
+			for j := range countSpans(h.PositiveSpans) {
+				h.PositiveBuckets = append(h.PositiveBuckets, float64(n+j))
+				h.Count += float64(n + j)
+			}
+			h.Sum = h.Count
+			samples = append(samples, model.Sample{T: base + int64(i)*15_000, H: h})
+		}
+		return samples
+	}
+	end := makeSamples()[59].T / 1000
+	for _, q := range []string{
+		`sum_over_time(%s[2m])`,
+		`histogram_quantile(0.5, sum_over_time(%s[2m]))`,
+		`histogram_quantile(0.5, rate(%s[2m]))`,
+	} {
+		results := map[string]string{}
+		for _, tier := range []string{"hot", "cold"} {
+			f := newFixture(t)
+			lset, samples := labels.FromStrings("__name__", "h"), makeSamples()
+			if tier == "hot" {
+				f.add(t, lset, samples...)
+			} else {
+				f.persist(t, f.indexSeries(t, lset, samples), samples...)
+			}
+			code, body := f.get(t, "/api/v1/query_range", url.Values{"query": {fmt.Sprintf(q, "h")},
+				"start": {fmt.Sprint(base / 1000)}, "end": {fmt.Sprint(end)}, "step": {"30"}})
+			if code != http.StatusOK {
+				t.Fatalf("%s from the %s tier: %d %v", q, tier, code, body)
+			}
+			b, err := json.Marshal(body["data"])
+			if err != nil {
+				t.Fatal(err)
+			}
+			results[tier] = string(b)
+		}
+		if results["hot"] != results["cold"] {
+			t.Errorf("%s differs between tiers:\nhot  %s\ncold %s", q, results["hot"], results["cold"])
+		}
+	}
+}
+
+func countSpans(spans []histogram.Span) int {
+	n := 0
+	for _, s := range spans {
+		n += int(s.Length)
+	}
+	return n
+}
+
+// The iterator copies histograms, so that the engine can overwrite them.
+func TestIteratorCopiesHistograms(t *testing.T) {
+	h := &histogram.FloatHistogram{Count: 1, PositiveSpans: []histogram.Span{{Length: 1}}, PositiveBuckets: []float64{1}}
+	stored := h.Copy()
+	it := copyingIterator{promstorage.NewListSeriesIterator(sampleList{{T: 1, H: stored}, {T: 2, V: 1}})}
+	if it.Next() != chunkenc.ValFloatHistogram {
+		t.Fatal("expected a histogram")
+	}
+	_, got := it.AtFloatHistogram(nil)
+	got.PositiveSpans[0].Offset, got.PositiveBuckets[0] = 7, 7
+	into := &histogram.FloatHistogram{PositiveSpans: make([]histogram.Span, 1), PositiveBuckets: make([]float64, 1)}
+	if _, got = it.AtFloatHistogram(into); got != into || !into.Equals(h) {
+		t.Fatalf("AtFloatHistogram(fh) = %v, want a copy of %v in fh", got, h)
+	}
+	into.PositiveSpans[0].Offset, into.PositiveBuckets[0] = 9, 9
+	if !stored.Equals(h) {
+		t.Fatalf("the stored histogram was modified: %v", stored)
 	}
 }

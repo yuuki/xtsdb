@@ -93,11 +93,12 @@ order, so an append never reads the chunk:
 
 Integer histograms are stored as float histograms, which represent them
 exactly; remote write validates them as integer histograms first. A
-histogram may have at most 16,384 buckets, spans and custom bounds each
-(`outcome="invalid"` otherwise), and the buckets of a remote write request
-count towards `ingester.max_samples_per_request` before it is decoded. A hot
-record that does not decode into a valid histogram is treated as corruption
-and quarantined. A chunk is limited to 32 MiB (about two million
+histogram may have at most 16,384 buckets, spans and custom bounds each, and
+must have a finite, non-negative zero threshold (`outcome="invalid"`
+otherwise); the buckets of a remote write request count towards
+`ingester.max_samples_per_request` before it is decoded. A hot record that
+does not decode into a valid histogram is treated as corruption and
+quarantined. A chunk is limited to 32 MiB (about two million
 samples); samples beyond that are rejected (`outcome="chunk_full"`) rather
 than creating a chunk that cannot be flushed.
 
@@ -209,7 +210,7 @@ left data in Redis forever.
 | Redis restart / `SCRIPT FLUSH` | Scripts are reloaded automatically. Unflushed data loss is bounded by the Redis persistence settings. |
 | Redis restored from an older snapshot, or failover to a lagging replica | Chunks flushed since the snapshot may be flushed again with less data; they are stored as separate versions and never overwrite the complete one. |
 | Undecodable chunk in Redis | Moved to a quarantine key (fenced, see below), logged and counted; it does not block flushing. |
-| Undecodable part in the persistent tier | Skipped by reads and logged as an error with its key; queries return the other samples. See [Corrupt data in the persistent tier](#corrupt-data-in-the-persistent-tier). |
+| Undecodable part in the persistent tier | Skipped by reads and logged with its key; queries return the other samples, and an older version's value where the part held the newest one. See [Corrupt data in the persistent tier](#corrupt-data-in-the-persistent-tier). |
 | Very large chunk | Persisted in parts of at most 100,000 samples and 4 MiB, below Cassandra's mutation limit (TiKV stores parts in segments of 8 KiB). A single native histogram is limited to 16,384 buckets (about 130 KB), so every part fits. |
 | Sample for a closed window | Rejected and counted (`outcome="too_old"`); remote write returns 400. |
 | Redis clock moves backwards | A claimed chunk still rejects appends (the in-flight check). A chunk re-created after completion gets a larger fragment from the shard clock and is stored as a separate version that takes precedence; reads merge versions. |
@@ -263,8 +264,10 @@ each a Prometheus chunk encoding byte (XOR or float histogram), the chunk's
 length and the chunk, in time order; a new histogram chunk starts at a
 counter reset or an incompatible bucket layout, as in the Prometheus TSDB,
 and also when the bucket layout of the chunk (the union of the layouts of its
-histograms) would exceed what one histogram may have, for example 16,384
-buckets. A chunk holds at most 16,384 samples.
+histograms) would become one that reads refuse, for example one of more than
+16,384 spans (see [Corrupt data in the persistent
+tier](#corrupt-data-in-the-persistent-tier)). A chunk holds at most 16,384
+samples.
 A row expires `storage.retention` after its last sample (`USING TTL`), and
 TWCS drops whole SSTables when they expire. Index entries of a day expire two
 days after the samples of that day; series rows two days after they were
@@ -530,27 +533,47 @@ writes:
 
 - a part holds at most 100,000 samples, and a chunk at most 16,384;
 - the bucket layout of a histogram chunk, which all its histograms share,
-  must be the layout of a histogram that ingestion accepts: a valid schema,
-  at most 16,384 buckets, spans and custom bounds, and the other checks of
-  native histogram validation;
+  must pass native histogram validation (a valid schema, a finite,
+  non-negative zero threshold, at most 16,384 spans and custom bounds, and
+  so on), except for the limit on buckets: the layout of a chunk is the
+  union of the layouts of its histograms, and earlier builds wrote chunks
+  with more buckets than one histogram may have;
 - the chunk must be long enough for the buckets its layout claims, which the
   first histogram of a chunk stores as raw 64-bit floats.
 
 Histograms decoded from one chunk also share a single copy of its spans and
-custom bounds, which would otherwise be copied for each of them. Decoding
-corrupt data then takes about as much memory as decoding valid data of the
-same size, and a panic while decoding is reported as corruption.
+custom bounds, which would otherwise be copied for each of them; the querier
+copies the histograms it hands to the PromQL engine, which overwrites them.
+Decoding corrupt data then takes about as much memory as decoding valid data
+of the same size, and a panic while decoding is reported as corruption.
 
-A part that fails to decode is skipped, deliberately: the read still returns
-the samples of the other parts and versions of the window, and of Redis, and
-logs `skipping undecodable chunk` at error level with the key of the part
-(series, window start, fragment, total, digest and part; and the day with
-Cassandra). Unlike the hot tier, the persistent tier has no quarantine, and
-a part never changes once written, so a read that failed on it would fail
-every query of that series over that window until the part expires. The
-query neither fails nor carries a warning: a corrupt part shows up only as
-missing samples and in the logs. To get rid of it, delete it by that key:
-the row in the `chunks` table, or every segment key of the part in TiKV.
+A part that fails to decode is skipped, deliberately. Unlike the hot tier,
+the persistent tier has no quarantine, and a part normally stays as written
+until it expires, so a read that failed on it would fail every query of that
+series over that window until then. The read still returns the samples of
+the other parts and versions of the window, and of Redis. Where the skipped
+part held the newest value at a timestamp, the value of an older version of
+the window is returned instead, for example an imported one: versions only
+disagree after a client wrote different values for the same timestamp, as
+described for the cold tier above. The query neither fails nor carries a
+warning, and there is no metric: the part shows up only in the logs, once
+for every read that covers it. It is logged at error level as `skipping
+undecodable chunk` with its key: the series (16 hex digits), the window
+start, fragment, total, digest and part, and with Cassandra the day. The
+other values are logged as stored, but the `series_id` column of Cassandra
+holds the series ID as a signed 64-bit integer. TiKV parts carry a checksum
+that is checked first, so bytes that changed after the write are logged as
+`skipping chunk with segments of different writes` (a warning, as for two
+writes mixed) or `skipping chunk with a malformed segment`, with the same
+key.
+
+Cassandra checksums what it stores and TiKV parts carry a checksum, so a
+part that does not decode more likely comes from a bug, or from a build that
+writes what this one refuses, than from bit rot: keep it until the cause is
+known. With Cassandra, `DELETE
+FROM chunks WHERE series_id = ? AND day = ? AND start_ms = ? AND fragment = ?
+AND total = ? AND digest = ? AND part = ?` removes it; xtsdb has no command
+to remove a part from TiKV.
 
 ## Changes from 0.x
 

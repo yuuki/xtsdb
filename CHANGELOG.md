@@ -85,6 +85,10 @@ key prefix. Versions before 2.0.0 were not released.
   parts that fail are skipped and logged with their key, and queries return
   the other samples. The flusher starts a new histogram chunk when the union
   of the bucket layouts of its histograms would exceed those limits.
+- Native histograms with a NaN, infinite or negative zero threshold were
+  accepted; PromQL never finished adding one with a NaN threshold to another
+  histogram. They are now rejected (`outcome="invalid"`), and treated as
+  corruption when read from either tier.
 - Quarantining an undecodable chunk could move a healthy newer incarnation of
   its window away, and overwrote earlier quarantined chunks of the window
   (#3).

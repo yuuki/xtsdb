@@ -161,6 +161,12 @@ type versionReader struct {
 	broken  bool          // the current part cannot be used
 }
 
+// partAttrs returns the key of the part of s as log attributes, so that a
+// part that is skipped can be found (the logger has the series).
+func (s segmentKey) partAttrs() []any {
+	return []any{"start", s.start, "fragment", s.fragment, "total", s.total, "digest", s.digest, "part", s.part}
+}
+
 func (r *versionReader) add(s segmentKey, value []byte) {
 	newPart := !r.started || !s.sameVersion(r.cur) || s.part != r.cur.part
 	if r.started && newPart {
@@ -180,15 +186,15 @@ func (r *versionReader) add(s segmentKey, value []byte) {
 	switch {
 	case err != nil:
 		r.broken = true
-		r.logger.Error("skipping chunk with a malformed segment", "start", s.start, "part", s.part, "segment", s.seg)
+		r.logger.Error("skipping chunk with a malformed segment", append(s.partAttrs(), "segment", s.seg)...)
 	case s.seg != r.next:
 		// A segment is missing: the part is being written, or its write
 		// failed half way and is retried until it succeeds.
 		r.broken = true
-		r.logger.Debug("skipping incomplete chunk", "start", s.start, "part", s.part, "segment", s.seg)
+		r.logger.Debug("skipping incomplete chunk", append(s.partAttrs(), "segment", s.seg)...)
 	case s.seg > 0 && h != r.header:
 		r.broken = true
-		r.logger.Warn("skipping chunk with segments of different writes", "start", s.start, "part", s.part, "segment", s.seg)
+		r.logger.Warn("skipping chunk with segments of different writes", append(s.partAttrs(), "segment", s.seg)...)
 	default:
 		if s.seg == 0 {
 			r.header = h
@@ -204,20 +210,19 @@ func (r *versionReader) endPart() {
 		return
 	}
 	if r.next != r.header.segments {
-		r.logger.Debug("skipping incomplete chunk", "start", r.cur.start, "part", r.cur.part,
-			"segments", r.next, "want", r.header.segments)
+		r.logger.Debug("skipping incomplete chunk", append(r.cur.partAttrs(),
+			"segments", r.next, "want", r.header.segments)...)
 		return
 	}
 	if xxhash.Sum64(r.data) != r.header.sum {
-		r.logger.Warn("skipping chunk with segments of different writes", "start", r.cur.start, "part", r.cur.part)
+		r.logger.Warn("skipping chunk with segments of different writes", r.cur.partAttrs()...)
 		return
 	}
 	samples, err := chunk.Decode(r.header.encoding, r.data)
 	if err != nil {
 		// See storage.ColdStore: skipped, with the key of the part so that
 		// it can be inspected or deleted.
-		r.logger.Error("skipping undecodable chunk", "start", r.cur.start, "fragment", r.cur.fragment,
-			"total", r.cur.total, "digest", r.cur.digest, "part", r.cur.part, "err", err)
+		r.logger.Error("skipping undecodable chunk", append(r.cur.partAttrs(), "err", err)...)
 		return
 	}
 	r.pending = append(r.pending, samples...)

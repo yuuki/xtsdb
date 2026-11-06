@@ -541,7 +541,29 @@ func (s *lazySeries) Iterator(chunkenc.Iterator) chunkenc.Iterator {
 	if err != nil {
 		return errIterator{Iterator: promstorage.NewListSeriesIterator(sampleList(nil)), err: err}
 	}
-	return promstorage.NewListSeriesIterator(sampleList(samples))
+	return copyingIterator{promstorage.NewListSeriesIterator(sampleList(samples))}
+}
+
+// copyingIterator returns copies of the histograms of a sample list, as
+// chunkenc.Iterator.AtFloatHistogram requires: into fh, or into a new
+// histogram if fh is nil. The engine relies on it: it keeps the histograms it
+// is given and later overwrites them with other samples (matrixIterSlice), so
+// the stored histograms themselves, which other samples share parts of (the
+// spans of a chunk decoded from the persistent tier), must never be handed out.
+type copyingIterator struct {
+	chunkenc.Iterator
+}
+
+func (it copyingIterator) AtFloatHistogram(fh *histogram.FloatHistogram) (int64, *histogram.FloatHistogram) {
+	t, h := it.Iterator.AtFloatHistogram(nil)
+	switch {
+	case h == nil:
+		return t, nil
+	case fh == nil:
+		return t, h.Copy()
+	}
+	h.CopyTo(fh)
+	return t, fh
 }
 
 // errIterator is an empty iterator that reports a load error.

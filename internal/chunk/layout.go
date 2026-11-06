@@ -2,6 +2,7 @@ package chunk
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -31,11 +32,14 @@ import (
 const histogramChunkHeaderLen = 3
 
 // checkHistogramChunk returns ErrCorrupt unless the layout of the float
-// histogram chunk b is the layout of a histogram that model.ValidateHistogram
-// accepts (at most model.MaxHistogramBuckets buckets, spans and custom bounds,
-// among others), and b is long enough for its first histogram. Decoding
-// corrupt data then takes about as much memory as valid data of the same
-// size.
+// histogram chunk b is one that model.ValidateHistogramLayout accepts (at
+// most model.MaxHistogramBuckets spans and custom bounds, a valid schema and
+// zero threshold, among others), and b is long enough for the buckets of its
+// first histogram. The number of buckets is not limited otherwise: the
+// layout of a chunk is the union of the layouts of its histograms, and
+// earlier builds wrote chunks with more buckets than one histogram may have.
+// Decoding corrupt data then takes about as much memory as valid data of the
+// same size.
 //
 // The encoder runs the same check, so that it never writes a chunk that
 // decoding refuses.
@@ -59,7 +63,7 @@ func checkHistogramChunk(b []byte) error {
 	}
 	// Validate the layout as the layout of a histogram without observations.
 	h.PositiveBuckets, h.NegativeBuckets = make([]float64, pos), make([]float64, neg)
-	if err := model.ValidateHistogram(h); err != nil {
+	if err := model.ValidateHistogramLayout(h); err != nil {
 		return fmt.Errorf("%w: histogram chunk layout: %w", ErrCorrupt, err)
 	}
 	return nil
@@ -67,10 +71,12 @@ func checkHistogramChunk(b []byte) error {
 
 // readHistogramLayout reads the layout of a float histogram chunk into a
 // histogram without buckets. It reads at most model.MaxHistogramBuckets
-// spans, buckets and custom bounds, and checks that the schema is valid,
-// but leaves the other checks to model.ValidateHistogram.
+// spans and custom bounds, and no more buckets than the rest of the chunk
+// could hold as raw floats, and checks that the schema is valid, but leaves
+// the other checks to model.ValidateHistogramLayout.
 func readHistogramLayout(r *bitReader) (*histogram.FloatHistogram, error) {
 	var h histogram.FloatHistogram
+	maxBuckets := r.remaining() / 64
 	switch zt, err := r.readBits(8); {
 	case err != nil:
 		return nil, err
@@ -110,8 +116,8 @@ func readHistogramLayout(r *bitReader) (*histogram.FloatHistogram, error) {
 			if err != nil {
 				return nil, err
 			}
-			if length > uint64(model.MaxHistogramBuckets-buckets) {
-				return nil, fmt.Errorf("more than %d buckets", model.MaxHistogramBuckets)
+			if length > maxBuckets-uint64(buckets) {
+				return nil, errors.New("more buckets than the chunk can hold")
 			}
 			buckets += int(length)
 			*side = append(*side, histogram.Span{Offset: int32(offset), Length: uint32(length)})
@@ -160,8 +166,9 @@ func countBuckets(spans []histogram.Span) int {
 // thousands of spans, a few hundred kilobytes, would decode into gigabytes.
 // The custom bounds are already shared: chunkenc interns them per chunk.
 //
-// The spans must not be modified: like Prometheus, xtsdb treats decoded
-// histograms as read-only.
+// The spans must therefore not be modified. The PromQL engine overwrites
+// the histograms it is given, so the querier hands it copies (see
+// copyingIterator in internal/query).
 type sharedLayout struct {
 	pos, neg []histogram.Span
 }

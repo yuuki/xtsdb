@@ -300,10 +300,9 @@ func xorChunks(samples []model.Sample) ([]chunkenc.Chunk, error) {
 // histogramChunks encodes float histograms. The appender cuts a new chunk
 // on a counter reset or an incompatible bucket layout, and re-encodes the
 // current one when buckets are added. The layout of a chunk is then the
-// union of the layouts of its histograms; when that would no longer be the
-// layout of a valid histogram, which decoding requires (at most
-// model.MaxHistogramBuckets buckets, for example), a new chunk is cut
-// instead.
+// union of the layouts of its histograms; when that would no longer be a
+// layout that decoding accepts (more than model.MaxHistogramBuckets spans,
+// or offsets that overflow, for example), a new chunk is cut instead.
 func histogramChunks(samples []model.Sample) ([]chunkenc.Chunk, error) {
 	var (
 		out []chunkenc.Chunk

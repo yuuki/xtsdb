@@ -6,6 +6,7 @@ package model
 import (
 	"errors"
 	"fmt"
+	"math"
 	"unicode/utf8"
 
 	"github.com/cespare/xxhash/v2"
@@ -36,13 +37,25 @@ const MaxHistogramBuckets = 16384
 
 // ValidateHistogram checks that a histogram is consistent and not too large.
 func ValidateHistogram(h *histogram.FloatHistogram) error {
+	if n := len(h.PositiveBuckets) + len(h.NegativeBuckets); n > MaxHistogramBuckets {
+		return fmt.Errorf("histogram has %d buckets, more than %d", n, MaxHistogramBuckets)
+	}
+	return ValidateHistogramLayout(h)
+}
+
+// ValidateHistogramLayout is ValidateHistogram without the limit on the
+// number of buckets. The bucket layout of a chunk in the persistent tier is
+// the union of the layouts of its histograms, which can have more buckets
+// than one histogram may.
+func ValidateHistogramLayout(h *histogram.FloatHistogram) error {
 	switch {
-	case len(h.PositiveBuckets)+len(h.NegativeBuckets) > MaxHistogramBuckets:
-		return fmt.Errorf("histogram has %d buckets, more than %d", len(h.PositiveBuckets)+len(h.NegativeBuckets), MaxHistogramBuckets)
 	case len(h.PositiveSpans)+len(h.NegativeSpans) > MaxHistogramBuckets:
 		return fmt.Errorf("histogram has %d spans, more than %d", len(h.PositiveSpans)+len(h.NegativeSpans), MaxHistogramBuckets)
 	case len(h.CustomValues) > MaxHistogramBuckets:
 		return fmt.Errorf("histogram has %d custom bounds, more than %d", len(h.CustomValues), MaxHistogramBuckets)
+	case !(h.ZeroThreshold >= 0 && h.ZeroThreshold <= math.MaxFloat64):
+		// PromQL never finishes adding a histogram with a NaN threshold.
+		return fmt.Errorf("histogram has a zero threshold of %v", h.ZeroThreshold)
 	}
 	return h.Validate()
 }

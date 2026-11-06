@@ -360,11 +360,11 @@ func TestDecodeRejectsCorruptHistogramLayouts(t *testing.T) {
 		bounds[i] = float64(i)
 	}
 	for name, h := range map[string]*histogram.FloatHistogram{
-		"buckets": {Schema: 0, Count: 0, PositiveSpans: []histogram.Span{{Length: uint32(tooMany)}},
-			PositiveBuckets: make([]float64, tooMany)},
-		"spans":           {Schema: 0, PositiveSpans: zeroSpans(tooMany)},
-		"reserved schema": {Schema: 9, Count: 1, PositiveSpans: []histogram.Span{{Length: 1}}, PositiveBuckets: []float64{1}},
-		"unknown schema":  {Schema: -20},
+		"NaN zero threshold":      {Schema: 0, ZeroThreshold: math.NaN()},
+		"negative zero threshold": {Schema: 0, ZeroThreshold: -1},
+		"spans":                   {Schema: 0, PositiveSpans: zeroSpans(tooMany)},
+		"reserved schema":         {Schema: 9, Count: 1, PositiveSpans: []histogram.Span{{Length: 1}}, PositiveBuckets: []float64{1}},
+		"unknown schema":          {Schema: -20},
 		"custom bounds": {Schema: histogram.CustomBucketsSchema, Count: 1,
 			PositiveSpans: []histogram.Span{{Length: 1}}, PositiveBuckets: []float64{1}, CustomValues: bounds},
 		"unsorted custom bounds": {Schema: histogram.CustomBucketsSchema, Count: 1,
@@ -404,16 +404,25 @@ func chunkFromData(t *testing.T, enc chunkenc.Encoding, b []byte) chunkenc.Chunk
 	return c
 }
 
-// The layout of a chunk is the union of the layouts of its histograms, which
-// can exceed what one histogram may have: the encoder must cut chunks so that
-// it never writes what decoding refuses.
-func TestEncodeCutsChunksAtLayoutLimit(t *testing.T) {
-	const n = 10_000 // buckets of each histogram; two layouts make 20,000
-	layout := func(i int, gauge bool) *histogram.FloatHistogram {
-		h := &histogram.FloatHistogram{Schema: 0, PositiveSpans: []histogram.Span{{Offset: int32(i%2) * n, Length: n}},
-			PositiveBuckets: make([]float64, n)}
+// alternating returns 4 histograms of n buckets (in spans of one bucket if
+// sparse) whose layouts alternate between two disjoint ranges, so that the
+// layout of a chunk of all of them, the union of theirs, has 2n buckets.
+func alternating(n int, sparse, gauge bool) []model.Sample {
+	var out []model.Sample
+	for i := range 4 {
+		h := &histogram.FloatHistogram{Schema: 0, PositiveBuckets: make([]float64, n)}
 		if gauge {
 			h.CounterResetHint = histogram.GaugeType
+		}
+		first := int32(i%2) * 1_000_000
+		if sparse {
+			h.PositiveSpans = zeroSpans(n)
+			for j := range h.PositiveSpans {
+				h.PositiveSpans[j].Length = 1
+			}
+			h.PositiveSpans[0].Offset = first
+		} else {
+			h.PositiveSpans = []histogram.Span{{Offset: first, Length: uint32(n)}}
 		}
 		for j := range h.PositiveBuckets {
 			// Counters keep the empty buckets of earlier histograms, so
@@ -423,31 +432,95 @@ func TestEncodeCutsChunksAtLayoutLimit(t *testing.T) {
 			}
 			h.Count += h.PositiveBuckets[j]
 		}
-		return h
+		out = append(out, model.Sample{T: int64(i+1) * 1000, H: h})
 	}
-	for _, gauge := range []bool{false, true} {
-		var in []model.Sample
-		for i := range 4 {
-			in = append(in, model.Sample{T: int64(i+1) * 1000, H: layout(i, gauge)})
+	return out
+}
+
+// countChunks returns the number of chunks in a typed blob.
+func countChunks(t *testing.T, b []byte) int {
+	t.Helper()
+	n := 0
+	for len(b) > 0 {
+		size, sz := binary.Uvarint(b[1:])
+		if sz <= 0 {
+			t.Fatal("bad blob")
 		}
+		b = b[1+sz+int(size):]
+		n++
+	}
+	return n
+}
+
+// The layout of a chunk is the union of the layouts of its histograms. It can
+// have more buckets than one histogram may, which decoding accepts, but the
+// encoder must cut chunks rather than write a layout that decoding refuses,
+// such as one of more than model.MaxHistogramBuckets spans.
+func TestEncodeCutsChunksAtLayoutLimit(t *testing.T) {
+	const n = 10_000 // buckets or spans of each histogram; two layouts make 20,000
+	for _, c := range []struct {
+		sparse, gauge bool
+		chunks        int
+	}{
+		// Counters cut at the counter resets of the last two histograms,
+		// so their first chunk holds the union of two layouts.
+		{false, false, 3}, {false, true, 1}, // a chunk of 20,000 buckets
+		{true, false, 4}, {true, true, 4}, // 20,000 spans would be refused: a chunk per histogram
+	} {
+		in := alternating(n, c.sparse, c.gauge)
 		orig := make([]*histogram.FloatHistogram, len(in))
 		for i, s := range in {
 			orig[i] = s.H.Copy()
 		}
 		enc, b, err := Encode(in)
 		if err != nil {
-			t.Fatalf("gauge %t: %v", gauge, err)
+			t.Fatalf("%+v: %v", c, err)
+		}
+		if n := countChunks(t, b); n != c.chunks {
+			t.Errorf("%+v: %d chunks, want %d", c, n, c.chunks)
 		}
 		out, err := Decode(enc, b)
 		if err != nil {
-			t.Fatalf("gauge %t: %v", gauge, err)
+			t.Fatalf("%+v: %v", c, err)
 		}
 		assertSamples(t, out, in)
 		for i, s := range in {
 			if !s.H.Equals(orig[i]) {
-				t.Fatalf("gauge %t: Encode modified histogram %d", gauge, i)
+				t.Fatalf("%+v: Encode modified histogram %d", c, i)
 			}
 		}
+	}
+}
+
+// Chunks written by earlier builds, which did not cut chunks at any layout
+// size, stay readable when their layout has more buckets than one histogram
+// may.
+func TestDecodeAcceptsLayoutsOfEarlierBuilds(t *testing.T) {
+	for _, gauge := range []bool{false, true} {
+		in := alternating(10_000, false, gauge)
+		if !gauge {
+			in = in[:2] // a counter reset follows
+		}
+		c := chunkenc.Chunk(chunkenc.NewFloatHistogramChunk())
+		app, err := c.Appender()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range in {
+			next, recoded, a, err := app.AppendFloatHistogram(nil, 0, s.T, s.H.Copy(), false)
+			if err != nil || (next != nil && !recoded) {
+				t.Fatalf("gauge %t: %v (new chunk %t)", gauge, err, next != nil)
+			}
+			if next != nil {
+				c = next
+			}
+			app = a
+		}
+		out, err := Decode(EncodingTyped, typedBlob(c))
+		if err != nil {
+			t.Fatalf("gauge %t: %v", gauge, err)
+		}
+		assertSamples(t, out, in)
 	}
 }
 
