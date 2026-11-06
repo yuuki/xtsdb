@@ -209,7 +209,7 @@ left data in Redis forever.
 | Redis restart / `SCRIPT FLUSH` | Scripts are reloaded automatically. Unflushed data loss is bounded by the Redis persistence settings. |
 | Redis restored from an older snapshot, or failover to a lagging replica | Chunks flushed since the snapshot may be flushed again with less data; they are stored as separate versions and never overwrite the complete one. |
 | Undecodable chunk | Moved to a quarantine key (fenced, see below), logged and counted; it does not block flushing. |
-| Very large chunk | Persisted in parts of at most 100,000 samples and 4 MiB, below Cassandra's mutation limit (TiKV stores parts in segments of 64 KiB). A single native histogram is limited to 16,384 buckets (about 130 KB), so every part fits. |
+| Very large chunk | Persisted in parts of at most 100,000 samples and 4 MiB, below Cassandra's mutation limit (TiKV stores parts in segments of 8 KiB). A single native histogram is limited to 16,384 buckets (about 130 KB), so every part fits. |
 | Sample for a closed window | Rejected and counted (`outcome="too_old"`); remote write returns 400. |
 | Redis clock moves backwards | A claimed chunk still rejects appends (the in-flight check). A chunk re-created after completion gets a larger fragment from the shard clock and is stored as a separate version that takes precedence; reads merge versions. |
 | Index write fails | The batch fails with 503 before any sample is stored; the client retries. |
@@ -378,9 +378,9 @@ itself. Every key starts with `storage.key_prefix` and `:`, then a tag:
 ```text
 m <name>                                                    -> value       layout (meta)
 c <series> <start> <fragment> <total> <digest> <part> <seg> -> segment     chunks
-s <series>                                                  -> labels      series
-p <day> <name> <value> <series>                             -> 0x01        postings
-v <day> <name> <value>                                      -> 0x01        label values
+s <series>                                                  -> expiry, labels  series
+p <hash(name, value)> <day> <name> <value> <series>         -> 0x01        postings
+v <hash(name)> <day> <name> <value>                         -> 0x01        label values
 n <day> <name>                                              -> 0x01        label names
 ```
 
@@ -388,49 +388,69 @@ Integers are fixed-width big-endian, signed ones with the sign bit flipped,
 so keys sort like the numbers. Strings are prefixed with their length, so a
 key is unambiguous whatever bytes a label holds (NUL included) and a lookup
 is an exact prefix scan. The longest key, with labels of the maximum length
-(2048 bytes), stays below TiKV's 8 KiB key limit.
+(2048 bytes), stays below TiKV's 8 KiB key limit. The 16-bit hash in front
+of the day of postings and label values places the entries of a new day
+next to those of the same label on earlier days, all over the key space: at
+midnight UTC every active series writes postings for the new day, which
+would otherwise all go to one new range, and so to one region.
 
 **Chunks.** The chunks of a series are one contiguous range ordered by window
 start and then by version in the order of precedence (`fragment`, `total`,
 `digest` as a signed value), the same order as the clustering order in
 Cassandra. A read for `[mint, maxt]` is one range scan per series over the
 window starts in `[mint - chunk_range, maxt]`; no day partitioning is
-needed. A part is split into segments of at most 64 KiB. Each segment value
-holds the encoding, the number of segments of the part, `max_t` and the
-sample count, then its slice of the blob; a part with a missing segment (a
-write that failed half way and was not retried yet) is skipped and logged,
-like an undecodable one. Small values keep every request within TiKV's
-response limit (`server.max-grpc-send-msg-len`, 10 MiB by default): reads
-take as many entries at a time as fit in 8 MiB if every one were as large
-as allowed (127 segments; 2048 or more index entries; about 30 label sets
-for `SeriesLabels`, whose entries can be 260 KB in the worst case).
-Writes are idempotent: the same part always produces the same keys and
-values.
+needed. A part is split into segments of at most 8 KiB; most parts fit in
+one. Each segment value holds the encoding, the number of segments of the
+part, `max_t`, the sample count and a checksum of the whole blob of the
+part, then its slice of the blob. A part is used only if all its segments
+are present, agree on the header and match the checksum: a part that is
+being written, or whose write failed half way and was not retried yet, is
+skipped (logged at debug level; the hot tier still holds its samples), and
+segments of different writes are never mixed (logged as a warning). Segments beyond the count of
+segment 0 are left over from an earlier write of the part in more segments
+(by a build that encoded it differently) and are ignored until they expire.
+Small values keep every request within TiKV's response limit
+(`server.max-grpc-send-msg-len`, 10 MiB by default): reads take as many
+entries at a time as fit in 8 MiB if every one were as large as allowed
+(about 1000 segments; 2048 or more index entries; about 30 label sets for
+`SeriesLabels`, whose entries can be 260 KB in the worst case). Within a
+build, writes are idempotent: the same part always produces the same keys
+and values.
 
 **Retention.** Entries carry RawKV TTLs with the rules of the Cassandra
 backend: chunks expire `storage.retention` after their last sample, index
 entries of a day two days after the samples of that day, series entries two
 days after their last write, and entries that are already expired are not
-written. TiKV must run with `storage.api-version = 2`, or with
-`api-version = 1` and `storage.enable-ttl = true` (`tikv.api_version:
-v1ttl`).
+written. TiKV must run with `storage.api-version = 1` and
+`storage.enable-ttl = true` (`tikv.api_version: v1ttl`, the default), where a
+compaction filter drops expired entries, or with `api-version = 2`. API v2
+keeps versions of every entry and drops expired ones only below the GC safe
+point, which TiDB in the same cluster or a RawKV GC worker advances; on a
+cluster with neither, expired data is never removed from disk.
 
-**Collision detection.** The series entry is claimed with
-`CompareAndSwap(key, absent -> labels)`. If the entry already exists, the
-returned value tells whether it holds the same labels (the series is
-recorded again) or different ones (a collision, handled as with
-Cassandra). Compare-and-swap cannot set a TTL, so the entry is written again
-with one; between the two writes a new entry has no TTL and cannot be
-claimed by another label set. An existing entry is refreshed the same way,
-which leaves a window of a few milliseconds in which an entry that expired at
-exactly that moment (a series not written for the whole retention) could be
-claimed by a colliding series. Compare-and-swap needs the atomic mode of
-RawKV, so xtsdb uses it for every write: TiKV is linearizable for a key only
-if all its writers agree on the mode.
+**Collision detection.** A series entry holds the labels and the time until
+which it owns its ID (retention plus two days after it was written). It is
+claimed with `CompareAndSwap(key, absent -> entry)`. If an entry already
+exists, it decides: the same labels are recorded again; other labels that
+still own the ID are a collision, handled as with Cassandra; an entry whose
+time has passed is taken over with a compare-and-swap on its exact value.
+An entry of the same labels that expires within an hour is also refreshed
+with a compare-and-swap, so that it cannot expire and be claimed by other
+labels in between. Compare-and-swap cannot set a TTL, so the entry is then
+written again with one. Reads and claims go by the time in the entry, not
+by the TTL: an entry whose TTL write failed (a timeout or a crash between
+the two writes) still expires, and the TTL only frees the space.
+Compare-and-swap needs the atomic mode of RawKV, so xtsdb uses it for every
+write: TiKV is linearizable for a key only if all its writers agree on the
+mode.
 
 **Layout.** `format` and `chunk_range_ms` are recorded under meta keys with
 compare-and-swap on first start, and xtsdb refuses to start with a different
-`storage.chunk_range`. `storage.index_buckets` does not apply: a label pair
+`storage.chunk_range`. With a retention, xtsdb also writes an entry with a
+TTL at startup, so that a cluster without TTLs is reported then rather than
+by every write. The Redis meta records `storage.backend`, so that a
+deployment does not switch backends and split its series between two
+stores. `storage.index_buckets` does not apply: a label pair
 shared by a million series is a range of a million keys, which TiKV spreads
 over regions; a lookup reads it in pages of up to 10,240 keys.
 

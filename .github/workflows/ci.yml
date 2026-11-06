@@ -17,6 +17,13 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go vet ./...
+      # The release targets, and the build without the TiKV backend.
+      - name: Cross-build
+        run: |
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            GOOS=${target%/*} GOARCH=${target#*/} CGO_ENABLED=0 go build -o /dev/null ./cmd/xtsdb
+          done
+          go vet -tags notikv ./...
       - uses: golangci/golangci-lint-action@v9
         with:
           version: v2.15.0
@@ -96,7 +103,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        api: [v2, v1ttl]
+        api: [v1ttl, v2]
     services:
       redis:
         image: redis:8.10.3
@@ -114,8 +121,8 @@ jobs:
           API: ${{ matrix.api }}
         run: |
           conf="$PWD/deploy/tikv.toml"
-          if [ "$API" = v1ttl ]; then
-            sed 's/^api-version = 2$/api-version = 1/' deploy/tikv.toml > "$RUNNER_TEMP/tikv.toml"
+          if [ "$API" = v2 ]; then
+            sed 's/^api-version = 1$/api-version = 2/' deploy/tikv.toml > "$RUNNER_TEMP/tikv.toml"
             conf="$RUNNER_TEMP/tikv.toml"
           fi
           docker run -d --network host --name pd pingcap/pd:v8.5.8 \

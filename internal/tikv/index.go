@@ -1,7 +1,8 @@
+//go:build !notikv && (!darwin || cgo)
+
 package tikv
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -42,7 +43,7 @@ var (
 // enforces on label sets (see model.Canonicalize).
 const (
 	maxStringLen   = binary.MaxVarintLen16 + model.MaxLabelLength
-	maxSeriesValue = 1 + 2*model.MaxLabelsPerSeries*maxStringLen
+	maxSeriesValue = seriesValueHeaderLen + 2*model.MaxLabelsPerSeries*maxStringLen
 )
 
 // NewIndex creates an Index.
@@ -66,35 +67,76 @@ func (x *Index) seriesTTL() uint64 {
 	return uint64((x.retention + storage.IndexSlack) / time.Second)
 }
 
+// seriesExpiry is the expiry time recorded in a series entry written at now.
+func (x *Index) seriesExpiry(now time.Time) int64 {
+	if x.retention <= 0 {
+		return 0
+	}
+	return now.Add(x.retention + storage.IndexSlack).UnixMilli()
+}
+
+const (
+	// refreshMargin: an entry of the same labels that expires later than
+	// this is refreshed with a plain write. One that expires sooner is
+	// refreshed with a compare-and-swap, so that it cannot expire and be
+	// claimed by other labels between the read and the write.
+	refreshMargin = time.Hour
+	// claimAttempts bounds the compare-and-swaps of one WriteSeries while
+	// other writers change the entry.
+	claimAttempts = 8
+)
+
 // WriteSeries records a series and its postings for a day.
 //
 // The series entry is claimed with a compare-and-swap that succeeds only if
-// the ID is unused. If it is already used by the same labels, the entry is
-// kept; if by other labels, the IDs collide: no postings are written and a
-// *storage.SeriesCollisionError is returned. The ingester does this once
-// per series and day.
+// the ID is unused, or used by an entry that has expired. If it is used by
+// the same labels, the entry is refreshed; if by other labels, the IDs
+// collide: no postings are written and a *storage.SeriesCollisionError is
+// returned. The ingester does this once per series and day.
 //
 // A compare-and-swap cannot set a TTL, so the entry is then written again
-// with one, which also refreshes the TTL of an existing entry. Between the
-// two, a new entry has no TTL and cannot expire, so no other label set can
-// claim the ID; an existing entry could, if it expired in that instant,
-// after not being written for the whole retention.
+// with one. Ownership goes by the expiry time recorded in the entry, not by
+// the TTL: an entry whose TTL could not be set still expires for reads and
+// claims, and between the two writes nobody else can claim the entry, since
+// its recorded expiry time is in the future.
 func (x *Index) WriteSeries(ctx context.Context, day int32, id model.SeriesID, lset labels.Labels) error {
 	ttl, ok := x.dayTTL(day)
 	if !ok {
 		return nil
 	}
-	key, value := x.db.keys.series(id), encodeLabels(lset)
-	prev, swapped, err := x.db.compareAndSwap(ctx, key, nil, value)
-	if err != nil {
-		return fmt.Errorf("index series %s: %w", id, err)
-	}
-	if !swapped && !bytes.Equal(prev, value) {
-		existing, err := decodeLabels(prev)
+	now := x.now()
+	key, value := x.db.keys.series(id), encodeSeries(lset, x.seriesExpiry(now))
+	var prev []byte // nil: the entry must not exist
+	for attempt := 0; ; attempt++ {
+		if attempt == claimAttempts {
+			return fmt.Errorf("index series %s: the series entry kept changing", id)
+		}
+		cur, swapped, err := x.db.compareAndSwap(ctx, key, prev, value)
+		if err != nil {
+			return fmt.Errorf("index series %s: %w", id, err)
+		}
+		if swapped {
+			break
+		}
+		if cur == nil { // it expired in the meantime
+			prev = nil
+			continue
+		}
+		existing, expires, err := decodeSeries(cur)
 		if err != nil {
 			return fmt.Errorf("index series %s: the series entry is malformed: %w", id, err)
 		}
-		return &storage.SeriesCollisionError{ID: id, Labels: lset, Existing: existing}
+		if !labels.Equal(existing, lset) {
+			if expires == 0 || expires > now.UnixMilli() {
+				return &storage.SeriesCollisionError{ID: id, Labels: lset, Existing: existing}
+			}
+			prev = cur // take over the ID of an expired series
+			continue
+		}
+		if expires == 0 || expires > now.Add(refreshMargin).UnixMilli() {
+			break // the same series, not about to expire: the write below refreshes it
+		}
+		prev = cur
 	}
 	if err := x.db.put(ctx, key, value, x.seriesTTL()); err != nil {
 		return fmt.Errorf("index series %s: %w", id, err)
@@ -212,13 +254,17 @@ func (x *Index) SeriesLabels(ctx context.Context, ids []model.SeriesID) (map[mod
 			if err != nil {
 				return fmt.Errorf("read series: %w", err)
 			}
+			now := x.now().UnixMilli()
 			for i, v := range values {
 				if v == nil {
 					continue
 				}
-				lset, err := decodeLabels(v)
+				lset, expires, err := decodeSeries(v)
 				if err != nil {
 					return fmt.Errorf("read series %s: %w", b[i], err)
+				}
+				if expires != 0 && expires <= now {
+					continue
 				}
 				mu.Lock()
 				out[b[i]] = lset

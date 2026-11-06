@@ -74,8 +74,9 @@ hand-off protocol and its failure handling.
 - **Container image** for linux/amd64 and linux/arm64:
   `docker pull ghcr.io/yuuki/xtsdb:2` (or a full version such as `2.0.0`).
   It runs `xtsdb all` with [examples/xtsdb.yaml](examples/xtsdb.yaml); set
-  `XTSDB_REDIS_ADDRS` and `XTSDB_CASSANDRA_HOSTS`, or mount your own file
-  over `/etc/xtsdb/xtsdb.yaml`.
+  `XTSDB_REDIS_ADDRS` and `XTSDB_CASSANDRA_HOSTS` (or `XTSDB_STORAGE_BACKEND=tikv`
+  and `XTSDB_TIKV_PD_ENDPOINTS`), or mount your own file over
+  `/etc/xtsdb/xtsdb.yaml`.
 - **Binaries** for Linux and macOS (amd64, arm64) are attached to the
   [GitHub releases](https://github.com/yuuki/xtsdb/releases), with
   `sha256sums.txt`:
@@ -86,7 +87,10 @@ hand-off protocol and its failure handling.
   ./xtsdb version
   ```
 
-- **From source** with Go 1.27: `make build` writes `bin/xtsdb`.
+- **From source** with Go 1.27: `make build` writes `bin/xtsdb`. The build
+  tag `notikv` leaves out the TiKV backend, which halves the binary (45 MB to
+  22 MB). Builds for macOS without cgo, such as the release binaries, leave
+  it out too: a dependency of the TiKV client needs cgo there.
 
 Until the first release is tagged, use the Quickstart below, which builds
 the image from source.
@@ -231,20 +235,25 @@ stateless and can be scaled horizontally:
   `TimeWindowCompactionStrategy`.
 
 **TiKV** (`storage.backend: tikv`)
-- Run TiKV with `storage.api-version = 2` (`tikv.api_version: v2`, the
-  default), or with `api-version = 1` and `storage.enable-ttl = true`
-  (`tikv.api_version: v1ttl`): entries expire through RawKV TTLs, with the
-  same rules as in Cassandra. [deploy/tikv.toml](deploy/tikv.toml) has the
-  settings for a development node.
+- Entries expire through RawKV TTLs, with the same rules as in Cassandra.
+  Run TiKV with `storage.api-version = 1` and `storage.enable-ttl = true`
+  (`tikv.api_version: v1ttl`, the default; [deploy/tikv.toml](deploy/tikv.toml)
+  has the settings for a development node), or with `api-version = 2`
+  and `storage.enable-ttl = true` (`tikv.api_version: v2`). With API v2,
+  TiKV removes expired entries from disk only once they are below the GC
+  safe point, which TiDB (in the same cluster) or a RawKV GC worker must
+  advance; otherwise disk usage keeps growing. xtsdb checks at startup that
+  TiKV accepts TTLs.
 - There is no schema: `xtsdb migrate` only checks that TiKV can be reached.
   Keys start with `storage.key_prefix`, so several deployments can share a
-  cluster or an API v2 keyspace (`tikv.keyspace`).
+  cluster or an API v2 keyspace (`tikv.keyspace`), each with its own prefix:
+  two deployments with the same prefix would mix their series.
 - xtsdb uses the atomic mode of RawKV, which compare-and-swap requires. No
   other client should write xtsdb's keys.
 - Production needs at least 3 PD and 3 TiKV nodes. `storage.index_buckets`
   does not apply: TiKV splits large key ranges over regions by itself.
-- TLS: `tikv.tls` with `ca_file` (and `cert_file`/`key_file` for mutual
-  TLS) is used for both PD and TiKV.
+- TLS: `tikv.tls` needs `ca_file`, `cert_file` and `key_file` (the PD client
+  uses TLS only with a client certificate) and is used for both PD and TiKV.
 
 **Security.** By default xtsdb's own listeners are neither encrypted nor
 authenticated: anyone who can reach the HTTP port can write and query, and
@@ -334,7 +343,7 @@ Releases are made by pushing a version tag; see
 Integration tests run against the servers named by
 `XTSDB_TEST_REDIS_ADDRS` (comma separated; set `XTSDB_TEST_REDIS_CLUSTER=1`
 for Redis Cluster), `XTSDB_TEST_CASSANDRA_HOSTS` and `XTSDB_TEST_TIKV_PD`
-(PD addresses; `XTSDB_TEST_TIKV_API_VERSION=v1ttl` for API v1 with TTLs),
+(PD addresses; `XTSDB_TEST_TIKV_API_VERSION=v2` for API v2),
 and are skipped when those are unset. Both persistent backends run the same
 conformance tests (`internal/storage/storagetest`); the TiKV backend also
 runs them against an in-memory RawKV without a cluster. The TiKV tests use
@@ -368,7 +377,11 @@ Cassandra 5.0.9, Prometheus 3.15.1 and Grafana 13.3.0.
   The tiers sit behind interfaces (`internal/storage`) with a conformance
   suite, so that other stores such as DynamoDB, Bigtable or object storage
   can be added.
-- The TiKV client roughly doubles the size of the binary (about 45 MB).
+- The TiKV client roughly doubles the size of the binary (about 45 MB; the
+  `notikv` build tag leaves it out), and is not in the macOS release
+  binaries.
+- `storage.backend` cannot be changed once data exists; there is no
+  migration between backends.
 
 ## Upgrading from 0.x
 

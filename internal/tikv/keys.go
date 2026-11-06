@@ -1,3 +1,5 @@
+//go:build !notikv && (!darwin || cgo)
+
 package tikv
 
 import (
@@ -6,6 +8,7 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/prometheus/prometheus/model/labels"
 
 	"github.com/yuuki/xtsdb/internal/chunk"
@@ -18,9 +21,15 @@ import (
 //	m <name>                                                   layout parameter (meta)
 //	c <series> <start> <fragment> <total> <digest> <part> <seg> chunk segment
 //	s <series>                                                 labels of a series
-//	p <day> <name> <value> <series>                            posting
-//	v <day> <name> <value>                                     label value
+//	p <hash(name, value)> <day> <name> <value> <series>        posting
+//	v <hash(name)> <day> <name> <value>                        label value
 //	n <day> <name>                                             label name
+//
+// The 16-bit hash in front of the day of postings and label values spreads
+// the entries of a new day over the key space, next to the entries of the
+// same label on earlier days, instead of starting one new range at the end
+// of it: at midnight UTC every active series writes postings for the new
+// day, and a single new range would be a single region.
 //
 // Integers are fixed-width big-endian, signed ones with the sign bit
 // flipped, so that keys sort like the numbers: the chunk segments of a
@@ -46,12 +55,13 @@ const formatVersion = 1
 // larger than that is split over several keys, so that every value stays
 // small: TiKV sends at most 10 MiB in one response by default
 // (server.max-grpc-send-msg-len), and reads take as many keys at a time as
-// fit in scanBudget. It is part of the storage format.
-const segmentSize = 64 << 10
+// fit in scanBudget if every value were as large as allowed. Most parts fit
+// in one segment. It is part of the storage format.
+const segmentSize = 8 << 10
 
 // chunkHeaderLen is the length of the header of a chunk segment value:
-// format, encoding, segment count, max_t and sample count.
-const chunkHeaderLen = 1 + 1 + 4 + 8 + 4
+// format, encoding, segment count, max_t, sample count and checksum.
+const chunkHeaderLen = 1 + 1 + 4 + 8 + 4 + 8
 
 // chunkKeyLen is the length of a chunk segment key after the table prefix.
 const chunkKeyLen = 8*6 + 4
@@ -148,12 +158,18 @@ func parseChunk(key []byte, seriesPrefixLen int) (segmentKey, error) {
 	return s, nil
 }
 
-// segmentHeader is the header of a chunk segment value.
+// segmentHeader is the header of a chunk segment value. Every segment of a
+// part carries the same header. The checksum covers the whole blob of the
+// part, so that segments of different writes of a part are never assembled
+// together: a write that failed half way, or a part written again by a build
+// that encodes it differently (into fewer segments, which leaves the old
+// trailing ones behind until they expire).
 type segmentHeader struct {
 	encoding chunk.Encoding
 	segments uint32 // segments of the part
 	maxT     int64
 	count    uint32 // samples in the part
+	sum      uint64 // xxhash64 of the blob of the part
 }
 
 func appendSegment(b []byte, h segmentHeader, data []byte) []byte {
@@ -161,6 +177,7 @@ func appendSegment(b []byte, h segmentHeader, data []byte) []byte {
 	b = binary.BigEndian.AppendUint32(b, h.segments)
 	b = binary.BigEndian.AppendUint64(b, uint64(h.maxT))
 	b = binary.BigEndian.AppendUint32(b, h.count)
+	b = binary.BigEndian.AppendUint64(b, h.sum)
 	return append(b, data...)
 }
 
@@ -173,6 +190,7 @@ func parseSegment(v []byte) (segmentHeader, []byte, error) {
 		segments: binary.BigEndian.Uint32(v[2:]),
 		maxT:     int64(binary.BigEndian.Uint64(v[6:])),
 		count:    binary.BigEndian.Uint32(v[14:]),
+		sum:      binary.BigEndian.Uint64(v[18:]),
 	}
 	if h.segments == 0 {
 		return segmentHeader{}, nil, errMalformed
@@ -182,23 +200,37 @@ func parseSegment(v []byte) (segmentHeader, []byte, error) {
 
 func (k keys) series(id model.SeriesID) []byte { return appendUint64(k.table(tagSeries), uint64(id)) }
 
-// encodeLabels encodes a label set deterministically, so that equal label
-// sets have equal encodings: the series row is claimed by compare-and-swap.
-func encodeLabels(lset labels.Labels) []byte {
-	b := make([]byte, 1, 1+lset.Len()*16)
-	b[0] = formatVersion
+// seriesValueHeaderLen is the length of the format byte and the expiry
+// time that precede the labels in a series entry.
+const seriesValueHeaderLen = 1 + 8
+
+// encodeSeries encodes the value of a series entry: the time in
+// milliseconds after which the entry no longer owns its ID (0: never), and
+// the labels. The entry also carries a TTL, but the time in the value is
+// what reads and claims go by, so that an entry whose TTL could not be set
+// still expires.
+func encodeSeries(lset labels.Labels, expires int64) []byte {
+	b := make([]byte, 0, seriesValueHeaderLen+lset.Len()*16)
+	b = append(b, formatVersion)
+	b = binary.BigEndian.AppendUint64(b, uint64(expires))
 	lset.Range(func(l labels.Label) {
 		b = appendString(appendString(b, l.Name), l.Value)
 	})
 	return b
 }
 
-func decodeLabels(v []byte) (labels.Labels, error) {
-	if len(v) == 0 || v[0] != formatVersion {
-		return labels.EmptyLabels(), errMalformed
+func decodeSeries(v []byte) (lset labels.Labels, expires int64, err error) {
+	if len(v) < seriesValueHeaderLen || v[0] != formatVersion {
+		return labels.EmptyLabels(), 0, errMalformed
 	}
+	expires = int64(binary.BigEndian.Uint64(v[1:]))
+	lset, err = decodeLabels(v[seriesValueHeaderLen:])
+	return lset, expires, err
+}
+
+func decodeLabels(v []byte) (labels.Labels, error) {
 	b := labels.NewScratchBuilder(8)
-	for rest := v[1:]; len(rest) > 0; {
+	for rest := v; len(rest) > 0; {
 		name, r, err := getString(rest)
 		if err != nil {
 			return labels.EmptyLabels(), err
@@ -214,9 +246,22 @@ func decodeLabels(v []byte) (labels.Labels, error) {
 	return b.Labels(), nil
 }
 
+// spread is the 16-bit hash of strings that precedes the day in postings
+// and label values. It is part of the storage format.
+func spread(b []byte, s ...string) []byte {
+	d := xxhash.New()
+	var scratch []byte
+	for _, x := range s {
+		scratch = appendString(scratch[:0], x)
+		_, _ = d.Write(scratch)
+	}
+	return binary.BigEndian.AppendUint16(b, uint16(d.Sum64()>>48))
+}
+
 // labelPair is the prefix of the postings of a label pair on a day.
 func (k keys) labelPair(day int32, name, value string) []byte {
-	return appendString(appendString(appendDay(k.table(tagPosting), day), name), value)
+	b := appendDay(spread(k.table(tagPosting), name, value), day)
+	return appendString(appendString(b, name), value)
 }
 
 func (k keys) posting(day int32, name, value string, id model.SeriesID) []byte {
@@ -225,7 +270,7 @@ func (k keys) posting(day int32, name, value string, id model.SeriesID) []byte {
 
 // labelValues is the prefix of the values of a label name on a day.
 func (k keys) labelValues(day int32, name string) []byte {
-	return appendString(appendDay(k.table(tagValue), day), name)
+	return appendString(appendDay(spread(k.table(tagValue), name), day), name)
 }
 
 func (k keys) labelValue(day int32, name, value string) []byte {

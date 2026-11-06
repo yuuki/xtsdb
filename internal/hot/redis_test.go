@@ -417,6 +417,22 @@ func TestRefusesChunkRangeChange(t *testing.T) {
 	}
 }
 
+func TestRefusesBackendChange(t *testing.T) {
+	layout := model.Layout{Shards: 4, ChunkRange: 1000}
+	s, client := newTestStore(t, layout, time.Minute)
+	ctx := context.Background()
+	opts := Options{Prefix: s.prefix, Layout: layout, Lease: time.Minute, Backend: "cassandra"}
+	for range 2 { // recorded on first use, accepted after
+		if _, err := New(ctx, client, opts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	opts.Backend = "tikv"
+	if _, err := New(ctx, client, opts); err == nil || !strings.Contains(err.Error(), "storage.backend") {
+		t.Fatalf("expected a backend mismatch error, got %v", err)
+	}
+}
+
 func TestChunkSizeLimit(t *testing.T) {
 	layout := model.Layout{Shards: 1, ChunkRange: time.Hour.Milliseconds()}
 	s, client := newTestStore(t, layout, time.Minute)

@@ -1,3 +1,5 @@
+//go:build !notikv && (!darwin || cgo)
+
 package tikv
 
 import (

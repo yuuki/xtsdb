@@ -1,10 +1,5 @@
-// Package tikv implements the persistent tier and the series index on the
-// RawKV API of TiKV.
-//
-// TiKV must run with storage.api-version = 2 (or, with api_version v1ttl,
-// storage.enable-ttl = true): entries expire through per-key TTLs, like the
-// Cassandra backend's rows. Every client of the data must use the atomic
-// mode of RawKV, which compare-and-swap needs; xtsdb always does.
+//go:build !notikv && (!darwin || cgo)
+
 package tikv
 
 import (
@@ -15,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pingcap/kvproto/pkg/keyspacepb"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	tikvconfig "github.com/tikv/client-go/v2/config"
 	"github.com/tikv/client-go/v2/rawkv"
@@ -67,10 +63,10 @@ func Open(ctx context.Context, cfg config.TiKVConfig, prefix string, logger *slo
 		rawkv.WithPDOptions(opt.WithCustomTimeoutOption(cfg.Timeout.D()), opt.WithInitMetricsOption(false)),
 	}
 	switch strings.ToLower(cfg.APIVersion) {
-	case "v2", "":
-		opts = append(opts, rawkv.WithAPIVersion(kvrpcpb.APIVersion_V2), rawkv.WithKeyspace(cfg.Keyspace))
-	case "v1ttl":
+	case "v1ttl", "":
 		opts = append(opts, rawkv.WithAPIVersion(kvrpcpb.APIVersion_V1TTL))
+	case "v2":
+		opts = append(opts, rawkv.WithAPIVersion(kvrpcpb.APIVersion_V2), rawkv.WithKeyspace(cfg.Keyspace))
 	default:
 		return nil, fmt.Errorf("unknown tikv.api_version %q", cfg.APIVersion)
 	}
@@ -122,6 +118,24 @@ func Open(ctx context.Context, cfg config.TiKVConfig, prefix string, logger *slo
 		}
 		return nil, fmt.Errorf("connect to tikv (pd %s): %w", strings.Join(cfg.PDEndpoints, ","), r.err)
 	}
+	if cfg.APIVersion == "v2" {
+		// client-go does not check the state of the keyspace.
+		name := cfg.Keyspace
+		if name == "" {
+			name = "DEFAULT"
+		}
+		kctx, cancel := context.WithTimeout(ctx, cfg.Timeout.D())
+		meta, err := r.c.GetPDClient().LoadKeyspace(kctx, name)
+		cancel()
+		if err == nil && meta.GetState() != keyspacepb.KeyspaceState_ENABLED {
+			err = fmt.Errorf("keyspace %q is %s", name, meta.GetState())
+		}
+		if err != nil {
+			_ = r.c.Close()
+			stop()
+			return nil, fmt.Errorf("tikv keyspace: %w", err)
+		}
+	}
 	r.c.SetAtomicForCAS(true)
 	db := newDB(r.c, prefix, cfg.Timeout.D())
 	db.stop = stop
@@ -139,7 +153,9 @@ func (db *DB) Close() error {
 	return err
 }
 
-// DeleteAll deletes every entry of the namespace.
+// DeleteAll deletes every entry of the namespace. TiKV's range deletion is
+// not in atomic mode: it is for tests and must not run while xtsdb writes
+// the namespace.
 func (db *DB) DeleteAll(ctx context.Context) error {
 	return db.raw.DeleteRange(ctx, db.keys.prefix, prefixEnd(db.keys.prefix))
 }
@@ -236,6 +252,17 @@ func ttlSeconds(retention time.Duration, keepUntil, now time.Time) (uint64, bool
 		return 0, false
 	}
 	return uint64(left / time.Second), true
+}
+
+// CheckTTL checks that TiKV accepts entries with a TTL, which it rejects
+// unless storage.enable-ttl is set, so that a misconfigured cluster is
+// reported at startup rather than by every write.
+func (db *DB) CheckTTL(ctx context.Context) error {
+	if err := db.put(ctx, db.keys.meta("ttl_check"), presence, 3600); err != nil {
+		return fmt.Errorf("TiKV refused an entry with a TTL; run it with storage.enable-ttl = true "+
+			"(and storage.api-version = 1 for tikv.api_version v1ttl, 2 for v2): %w", err)
+	}
+	return nil
 }
 
 // CheckLayout records the layout of the TiKV data on first use and refuses

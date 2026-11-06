@@ -157,17 +157,19 @@ type CassandraConfig struct {
 type TiKVConfig struct {
 	// PDEndpoints are the addresses of the PD servers of the cluster.
 	PDEndpoints []string `yaml:"pd_endpoints"`
-	// APIVersion is the RawKV API of the cluster: v2 (TiKV
-	// storage.api-version = 2) or v1ttl (api-version = 1 with
-	// storage.enable-ttl = true).
+	// APIVersion is the RawKV API of the cluster: v1ttl (TiKV
+	// storage.api-version = 1 with storage.enable-ttl = true) or v2
+	// (api-version = 2). With v2, TiKV removes expired entries only below
+	// the GC safe point, which TiDB or a RawKV GC worker must advance.
 	APIVersion string `yaml:"api_version"`
 	// Keyspace is the API v2 keyspace; empty means the default keyspace.
 	Keyspace string `yaml:"keyspace"`
 	// Timeout bounds each request, retries included.
 	Timeout        Duration `yaml:"timeout"`
 	ConnectTimeout Duration `yaml:"connect_timeout"`
-	// TLS uses the same files for PD and TiKV; ca_file is required and
-	// server_name and insecure_skip_verify are not supported.
+	// TLS uses the same files for PD and TiKV. ca_file, cert_file and
+	// key_file are required (the PD client uses TLS only with a client
+	// certificate); server_name and insecure_skip_verify are not supported.
 	TLS TLSConfig `yaml:"tls"`
 }
 
@@ -178,9 +180,10 @@ const (
 )
 
 // StorageConfig holds settings that define the on-storage layout. Changing
-// key_prefix, shards, chunk_range or index_buckets on an existing deployment
-// orphans the data written with the previous values, so xtsdb refuses to
-// start when shards, chunk_range or index_buckets change.
+// backend, key_prefix, shards, chunk_range or index_buckets on an existing
+// deployment orphans the data written with the previous values, so xtsdb
+// refuses to start when backend, shards, chunk_range or index_buckets
+// change.
 type StorageConfig struct {
 	// Backend is the store of the persistent tier and the index: cassandra
 	// or tikv.
@@ -266,7 +269,7 @@ func Default() *Config {
 		},
 		TiKV: TiKVConfig{
 			PDEndpoints:    []string{"127.0.0.1:2379"},
-			APIVersion:     "v2",
+			APIVersion:     "v1ttl",
 			Timeout:        Duration(10 * time.Second),
 			ConnectTimeout: Duration(10 * time.Second),
 		},
@@ -407,8 +410,9 @@ func (c TiKVConfig) validate() []error {
 	check(c.Timeout.D() > 0, "tikv.timeout must be positive")
 	check(c.ConnectTimeout.D() > 0, "tikv.connect_timeout must be positive")
 	if c.TLS.Enabled {
-		check(c.TLS.CAFile != "", "tikv.tls.ca_file is required when TLS is enabled")
-		check((c.TLS.CertFile == "") == (c.TLS.KeyFile == ""), "tikv.tls.cert_file and tikv.tls.key_file must be set together")
+		// The PD client uses TLS only with a client certificate.
+		check(c.TLS.CAFile != "" && c.TLS.CertFile != "" && c.TLS.KeyFile != "",
+			"tikv.tls.ca_file, tikv.tls.cert_file and tikv.tls.key_file are required when TLS is enabled")
 		check(c.TLS.ServerName == "" && !c.TLS.InsecureSkipVerify,
 			"tikv.tls.server_name and tikv.tls.insecure_skip_verify are not supported")
 	}

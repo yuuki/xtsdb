@@ -304,7 +304,9 @@ func (c *Cold) Read(_ context.Context, ids []model.SeriesID, mint, maxt int64) (
 			cur     *coldKey
 		)
 		for _, k := range keys {
-			if k.series != id || k.start > maxt || k.start+c.ChunkRange <= mint {
+			// The window [start, start+ChunkRange) must overlap [mint, maxt],
+			// without overflowing at the extremes.
+			if k.series != id || k.start > maxt || (k.start < mint && uint64(mint)-uint64(k.start) >= uint64(c.ChunkRange)) {
 				continue
 			}
 			if cur != nil && (cur.start != k.start || cur.fragment != k.fragment || cur.total != k.total || cur.digest != k.digest) {

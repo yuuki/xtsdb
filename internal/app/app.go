@@ -217,6 +217,7 @@ func OpenHot(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*hot
 		Layout:        Layout(cfg),
 		Lease:         cfg.Flusher.LeaseDuration.D(),
 		QuarantineTTL: cfg.Flusher.QuarantineTTL.D(),
+		Backend:       cfg.Storage.Backend,
 		Logger:        logger.With("component", "redis"),
 	})
 	if err != nil {

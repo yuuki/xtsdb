@@ -266,15 +266,16 @@ func testColdLargePart(t *testing.T, newStore ColdFactory) {
 	if len(data) < 256<<10 {
 		t.Fatalf("the test needs a large part, got %d bytes", len(data))
 	}
-	c := storage.ColdChunk{Series: id, Start: start, Fragment: 1, Total: len(samples), Digest: 42,
+	total := len(samples) + 1
+	c := storage.ColdChunk{Series: id, Start: start, Fragment: 1, Total: total, Digest: 42,
 		MaxT: samples[len(samples)-1].T, Count: len(samples), Encoding: enc, Data: data}
 	for range 2 { // and idempotently
 		if err := store.WriteChunk(context.Background(), c); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// A small second part after it.
-	writePart(t, store, storage.ColdChunk{Series: id, Start: start, Fragment: 1, Total: len(samples) + 1, Digest: 43},
+	// A small second part of the same version.
+	writePart(t, store, storage.ColdChunk{Series: id, Start: start, Fragment: 1, Total: total, Digest: 42, Part: 1},
 		[]model.Sample{{T: start + hour - 1, V: 1}})
 	got := read(t, store, []model.SeriesID{id}, start, start+hour)
 	expectSamples(t, "large part", got[id], append(slices.Clone(samples), model.Sample{T: start + hour - 1, V: 1}))
@@ -549,7 +550,13 @@ func testIndexCollisions(t *testing.T, newIndex IndexFactory) {
 			lset = b
 		}
 		g.Go(func() error {
-			errs[i] = x.WriteSeries(ctx, day, id2, lset)
+			// Contention may make a backend give up; the ingester retries.
+			for range 5 {
+				errs[i] = x.WriteSeries(ctx, day, id2, lset)
+				if errs[i] == nil || errors.Is(errs[i], storage.ErrSeriesCollision) {
+					break
+				}
+			}
 			return nil
 		})
 	}
@@ -570,18 +577,20 @@ func testIndexCollisions(t *testing.T, newIndex IndexFactory) {
 }
 
 // Index entries of a day are kept two days longer than its samples; entries
-// of days whose samples have already expired are not stored.
+// of days whose samples have already expired are not stored. With a
+// retention of one day, the entries of day d expire at the start of day d+4:
+// the days are chosen at least a day away from that, whatever the time.
 func testIndexRetention(t *testing.T, newIndex IndexFactory) {
 	x := newIndex(t, 24*time.Hour)
 	ctx := context.Background()
 	today := model.Day(time.Now().UnixMilli())
-	for _, day := range []int32{today, today - 3, today - 4} {
+	for _, day := range []int32{today, today - 2, today - 5} {
 		lset := labels.FromStrings("__name__", "up", "day", fmt.Sprint(today-day))
 		if err := writeIndex(ctx, x, day, lset); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for day, want := range map[int32]bool{today: true, today - 3: true, today - 4: false} {
+	for day, want := range map[int32]bool{today: true, today - 2: true, today - 5: false} {
 		names, err := x.LabelNames(ctx, day)
 		if err != nil || (len(names) == 2) != want {
 			t.Errorf("day -%d: names %v (%v), want present=%v", today-day, names, err, want)
@@ -594,7 +603,7 @@ func testIndexRetention(t *testing.T, newIndex IndexFactory) {
 			t.Errorf("day -%d: postings %v, want present=%v", today-day, ids, want)
 		}
 	}
-	old := labels.FromStrings("__name__", "up", "day", "4")
+	old := labels.FromStrings("__name__", "up", "day", "5")
 	if ls, err := x.SeriesLabels(ctx, []model.SeriesID{model.ID(old)}); err != nil || len(ls) != 0 {
 		t.Errorf("a series written only for an expired day was stored: %v %v", ls, err)
 	}

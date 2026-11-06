@@ -49,11 +49,14 @@ key prefix. Versions before 2.0.0 were not released.
   macOS attached to GitHub releases and multi-architecture images on
   `ghcr.io/yuuki/xtsdb` (#11).
 - TiKV as a second backend of the persistent tier and the series index,
-  through the RawKV API (API v2, or v1 with TTLs): `storage.backend: tikv`
-  and the `tikv` section. Ingestion, flushing, queries, `xtsdb import` and
-  collision detection work as with Cassandra. A conformance suite in
-  `internal/storage/storagetest` defines the semantics both backends
-  provide (#10).
+  through the RawKV API (API v1 with TTLs by default, or API v2):
+  `storage.backend: tikv` and the `tikv` section. Ingestion, flushing,
+  queries, `xtsdb import` and collision detection work as with Cassandra. A
+  conformance suite in `internal/storage/storagetest` defines the semantics
+  both backends provide. The build tag `notikv` leaves the backend out, and
+  macOS builds without cgo (the release binaries) do not include it (#10).
+- `storage.backend` is recorded in Redis, and xtsdb refuses to start when it
+  changes (#10).
 
 ### Changed
 

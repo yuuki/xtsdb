@@ -134,6 +134,7 @@ storage:
   backend: tikv
 tikv:
   pd_endpoints: [pd-0:2379, pd-1:2379]
+  api_version: v2
   keyspace: metrics
 cassandra:
   hosts: []   # not used with the tikv backend
@@ -156,10 +157,14 @@ cassandra:
 		{func(c *Config) { c.TiKV.PDEndpoints = nil }, "tikv.pd_endpoints"},
 		{func(c *Config) { c.TiKV.APIVersion = "v1" }, "tikv.api_version"},
 		{func(c *Config) { c.TiKV.APIVersion = "v1ttl" }, "tikv.keyspace"},
+		{func(c *Config) { c.TiKV.APIVersion = "" }, "tikv.api_version"},
 		{func(c *Config) { c.TiKV.Timeout = 0 }, "tikv.timeout"},
 		{func(c *Config) { c.TiKV.TLS = TLSConfig{Enabled: true} }, "tikv.tls.ca_file"},
-		{func(c *Config) { c.TiKV.TLS = TLSConfig{Enabled: true, CAFile: "ca", CertFile: "c"} }, "tikv.tls.cert_file"},
-		{func(c *Config) { c.TiKV.TLS = TLSConfig{Enabled: true, CAFile: "ca", InsecureSkipVerify: true} }, "not supported"},
+		{func(c *Config) { c.TiKV.TLS = TLSConfig{Enabled: true, CAFile: "ca"} }, "tikv.tls.cert_file"},
+		{func(c *Config) { c.TiKV.TLS = TLSConfig{Enabled: true, CAFile: "ca", CertFile: "c"} }, "tikv.tls.key_file"},
+		{func(c *Config) {
+			c.TiKV.TLS = TLSConfig{Enabled: true, CAFile: "ca", CertFile: "c", KeyFile: "k", InsecureSkipVerify: true}
+		}, "not supported"},
 		{func(c *Config) { c.Storage.KeyPrefix = strings.Repeat("x", 65) }, "storage.key_prefix"},
 	} {
 		bad := *cfg

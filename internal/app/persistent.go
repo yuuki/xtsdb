@@ -8,7 +8,6 @@ import (
 	"github.com/yuuki/xtsdb/internal/cassandra"
 	"github.com/yuuki/xtsdb/internal/config"
 	"github.com/yuuki/xtsdb/internal/storage"
-	"github.com/yuuki/xtsdb/internal/tikv"
 )
 
 // Persistent is the persistent tier and the series index, on the backend
@@ -57,20 +56,7 @@ func OpenPersistent(ctx context.Context, cfg *config.Config, logger *slog.Logger
 			close:   session.Close,
 		}, nil
 	case config.BackendTiKV:
-		db, err := tikv.Open(ctx, cfg.TiKV, cfg.Storage.KeyPrefix, logger)
-		if err != nil {
-			return nil, err
-		}
-		if err := db.CheckLayout(ctx, chunkRange); err != nil {
-			_ = db.Close()
-			return nil, err
-		}
-		return &Persistent{
-			Backend: config.BackendTiKV,
-			Cold:    tikv.NewChunkStore(db, retention, chunkRange.Milliseconds(), readConcurrency, logger),
-			Index:   tikv.NewIndex(db, retention, readConcurrency),
-			close:   func() { _ = db.Close() },
-		}, nil
+		return openTiKV(ctx, cfg, logger)
 	}
 	return nil, fmt.Errorf("unknown storage.backend %q", cfg.Storage.Backend)
 }
@@ -82,16 +68,7 @@ func Migrate(ctx context.Context, cfg *config.Config, logger *slog.Logger) error
 	case config.BackendCassandra:
 		return cassandra.Migrate(ctx, cfg.Cassandra, logger)
 	case config.BackendTiKV:
-		db, err := tikv.Open(ctx, cfg.TiKV, cfg.Storage.KeyPrefix, logger)
-		if err != nil {
-			return err
-		}
-		defer db.Close()
-		if err := db.Ping(ctx); err != nil {
-			return fmt.Errorf("tikv: %w", err)
-		}
-		logger.Info("the tikv backend has no schema to migrate; TiKV is reachable")
-		return nil
+		return migrateTiKV(ctx, cfg, logger)
 	}
 	return fmt.Errorf("unknown storage.backend %q", cfg.Storage.Backend)
 }

@@ -1,9 +1,12 @@
+//go:build !notikv && (!darwin || cgo)
+
 package tikv
 
 import (
 	"bytes"
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -15,6 +18,7 @@ import (
 	"time"
 
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/tikv/client-go/v2/rawkv"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
@@ -103,8 +107,8 @@ func TestKeysGolden(t *testing.T) {
 			"78743a63" + "8000000000000001" + "8000000000000001" + "7fffffffffffffff" + "8000000000000003" +
 				"0000000000000000" + "8000000000000000" + "00000002"},
 		{k.series(0xf28c8afcd224e55f), "78743a73f28c8afcd224e55f"},
-		{k.posting(-1, "job", "a\x00", 42), "78743a70" + "7fffffff" + "036a6f62" + "026100" + "000000000000002a"},
-		{k.labelValue(20_000, "job", "api"), "78743a76" + "80004e20" + "036a6f62" + "03617069"},
+		{k.posting(-1, "job", "a\x00", 42), "78743a70" + "4964" + "7fffffff" + "036a6f62" + "026100" + "000000000000002a"},
+		{k.labelValue(20_000, "job", "api"), "78743a76" + "9f11" + "80004e20" + "036a6f62" + "03617069"},
 		{k.labelName(20_000, "job"), "78743a6e" + "80004e20" + "036a6f62"},
 	} {
 		if got := fmt.Sprintf("%x", c.got); got != c.want {
@@ -112,8 +116,8 @@ func TestKeysGolden(t *testing.T) {
 		}
 	}
 	lset := labels.FromStrings("__name__", "up", "job", "a\x00b")
-	if got := fmt.Sprintf("%x", encodeLabels(lset)); got != "01085f5f6e616d655f5f027570036a6f6203610062" {
-		t.Errorf("labels encoding changed: %s", got)
+	if got := fmt.Sprintf("%x", encodeSeries(lset, 1700000000000)); got != "01"+"0000018bcfe56800"+"085f5f6e616d655f5f027570036a6f6203610062" {
+		t.Errorf("series encoding changed: %s", got)
 	}
 }
 
@@ -160,13 +164,14 @@ func TestLabelsEncoding(t *testing.T) {
 		labels.FromStrings("__name__", "up"),
 		labels.FromStrings("__name__", "m", "a\x00", "\x00b", "日本", strings.Repeat("x", model.MaxLabelLength)),
 	} {
-		got, err := decodeLabels(encodeLabels(lset))
-		if err != nil || !labels.Equal(got, lset) {
-			t.Fatalf("round trip of %v: %v %v", lset, got, err)
+		got, expires, err := decodeSeries(encodeSeries(lset, -5))
+		if err != nil || !labels.Equal(got, lset) || expires != -5 {
+			t.Fatalf("round trip of %v: %v %d %v", lset, got, expires, err)
 		}
 	}
-	for _, bad := range [][]byte{nil, {0}, {formatVersion, 5, 'a'}, {formatVersion, 1, 'a'}} {
-		if _, err := decodeLabels(bad); err == nil {
+	header := []byte{formatVersion, 0, 0, 0, 0, 0, 0, 0, 0}
+	for _, bad := range [][]byte{nil, {0}, header[:5], append(header, 5, 'a'), append(header, 1, 'a')} {
+		if _, _, err := decodeSeries(bad); err == nil {
 			t.Fatalf("decoded malformed labels %x", bad)
 		}
 	}
@@ -486,5 +491,207 @@ func TestLogRedirect(t *testing.T) {
 	quiet := &slogCore{logger: slog.New(slog.NewTextHandler(&buf, nil))}
 	if quiet.Enabled(zapcore.InfoLevel) || !quiet.Enabled(zapcore.WarnLevel) {
 		t.Error("info logs must be enabled only when slog debug logs are")
+	}
+}
+
+// A part written again in fewer segments, by a build that encodes it
+// differently, leaves the old trailing segments behind: they are ignored.
+// Segments of different writes are never assembled together.
+func TestPartRewrittenInFewerSegments(t *testing.T) {
+	db, kv := newMemDB(t)
+	store := NewChunkStore(db, 0, int64(time.Hour/time.Millisecond), 8, nil)
+	ctx := context.Background()
+	start := int64(20_000) * model.DayMillis
+	rng := rand.New(rand.NewPCG(9, 10))
+	write := func(samples []model.Sample) {
+		t.Helper()
+		enc, data, err := chunk.Encode(samples)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.WriteChunk(ctx, storage.ColdChunk{Series: 1, Start: start, Fragment: 1, Total: 7, Digest: 7,
+			MaxT: samples[len(samples)-1].T, Count: len(samples), Encoding: enc, Data: data}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func() []model.Sample {
+		t.Helper()
+		got, err := store.Read(ctx, []model.SeriesID{1}, start, start+60_000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got[1]
+	}
+	large := make([]model.Sample, 6000)
+	for i := range large {
+		large[i] = model.Sample{T: start + int64(i), V: rng.NormFloat64()}
+	}
+	write(large)
+	before := len(kv.Keys(db.keys.chunkSeries(1)))
+	small := []model.Sample{{T: start + 1, V: 1}, {T: start + 2, V: 2}}
+	write(small)
+	keys := kv.Keys(db.keys.chunkSeries(1))
+	if before < 3 || len(keys) != before {
+		t.Fatalf("the test needs leftover segments: %d keys before, %d after", before, len(keys))
+	}
+	if got := read(); len(got) != 2 || got[1].V != 2 {
+		t.Fatalf("the rewritten part must be read, got %d samples", len(got))
+	}
+
+	// Write the large part again, then replace its second segment with one
+	// that has the same header but other data, as a write by another build
+	// that failed half way could leave: the checksum rejects the part.
+	write(large)
+	v, err := kv.Get(ctx, keys[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	v[len(v)-1] ^= 0xff
+	if err := kv.PutWithTTL(ctx, keys[1], v, 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(); len(got) != 0 {
+		t.Fatalf("a part with mixed segments must be skipped, got %d samples", len(got))
+	}
+}
+
+// Reads look back a whole chunk range, also near the smallest timestamp.
+func TestLookBackAtTheEdges(t *testing.T) {
+	db, _ := newMemDB(t)
+	const r = 1000
+	store := NewChunkStore(db, 0, r, 8, nil)
+	ctx := context.Background()
+	for _, c := range []struct {
+		name         string
+		start, t     int64
+		mint, maxint int64
+	}{
+		{"min", math.MinInt64, math.MinInt64 + 5, math.MinInt64, math.MinInt64 + 10},
+		{"min+r-1", math.MinInt64 + 10, math.MinInt64 + 1005, math.MinInt64 + r - 1, math.MinInt64 + 2000},
+		{"min+r", math.MinInt64 + 10, math.MinInt64 + 1005, math.MinInt64 + r, math.MinInt64 + 2000},
+		{"max", math.MaxInt64 - 500, math.MaxInt64 - 1, math.MaxInt64 - 10, math.MaxInt64},
+	} {
+		id := model.SeriesID(rand.Uint64())
+		samples := []model.Sample{{T: c.t, V: 1}}
+		enc, data, err := chunk.Encode(samples)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.WriteChunk(ctx, storage.ColdChunk{Series: id, Start: c.start, Fragment: 1, Total: 1,
+			MaxT: c.t, Count: 1, Encoding: enc, Data: data}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := store.Read(ctx, []model.SeriesID{id}, c.mint, c.maxint)
+		if err != nil || len(got[id]) != 1 || got[id][0].T != c.t {
+			t.Errorf("%s: got %v (%v)", c.name, got[id], err)
+		}
+	}
+}
+
+// failingPuts fails the next PutWithTTL calls, after a compare-and-swap
+// succeeded, as a timeout or a crash between the two would.
+type failingPuts struct {
+	*memKV
+	fail int
+}
+
+func (f *failingPuts) PutWithTTL(ctx context.Context, key, value []byte, ttl uint64, opts ...rawkv.RawOption) error {
+	if f.fail > 0 {
+		f.fail--
+		return errors.New("injected failure")
+	}
+	return f.memKV.PutWithTTL(ctx, key, value, ttl, opts...)
+}
+
+// Ownership of a series ID goes by the expiry time recorded in the entry,
+// so an entry whose TTL could not be set still expires, and an expired
+// entry can be claimed by other labels.
+func TestSeriesEntryExpiry(t *testing.T) {
+	kv := &failingPuts{memKV: newMemKV(), fail: 1}
+	db := newDB(kv, "xt", time.Second)
+	now := time.Now()
+	x := NewIndex(db, 24*time.Hour, 8)
+	x.now = func() time.Time { return now }
+	ctx := context.Background()
+	id := model.SeriesID(0x77)
+	a := labels.FromStrings("__name__", "up", "job", "a")
+	b := labels.FromStrings("__name__", "up", "job", "b")
+	day := model.Day(now.UnixMilli())
+	if err := x.WriteSeries(ctx, day, id, a); err == nil {
+		t.Fatal("the injected failure must be reported")
+	}
+	if ttl, ok := kv.TTL(db.keys.series(id)); !ok || ttl != 0 {
+		t.Fatalf("the test needs an entry without TTL: %v %v", ttl, ok)
+	}
+	if err := x.WriteSeries(ctx, day, id, b); !errors.Is(err, storage.ErrSeriesCollision) {
+		t.Fatalf("a live entry must be kept: %v", err)
+	}
+
+	// Three days later the entry has expired, although it has no TTL.
+	now = now.Add(72*time.Hour + time.Minute)
+	day = model.Day(now.UnixMilli())
+	if ls, err := x.SeriesLabels(ctx, []model.SeriesID{id}); err != nil || len(ls) != 0 {
+		t.Fatalf("an expired entry must not be returned: %v %v", ls, err)
+	}
+	if err := x.WriteSeries(ctx, day, id, b); err != nil {
+		t.Fatalf("the ID of an expired series must be free: %v", err)
+	}
+	if ls, _ := x.SeriesLabels(ctx, []model.SeriesID{id}); !labels.Equal(ls[id], b) {
+		t.Fatalf("the new owner must be recorded: %v", ls)
+	}
+	if ttl, _ := kv.TTL(db.keys.series(id)); ttl < 71*time.Hour {
+		t.Fatalf("the new entry must carry a TTL: %v", ttl)
+	}
+	if err := x.WriteSeries(ctx, day, id, a); !errors.Is(err, storage.ErrSeriesCollision) {
+		t.Fatalf("the former owner must now collide: %v", err)
+	}
+}
+
+// An entry about to expire is refreshed with a compare-and-swap, so that it
+// cannot be claimed by other labels in between; one that is not is
+// refreshed with a plain write.
+func TestSeriesEntryRefresh(t *testing.T) {
+	db, kv := newMemDB(t)
+	now := time.Now()
+	x := NewIndex(db, 24*time.Hour, 8)
+	x.now = func() time.Time { return now }
+	ctx := context.Background()
+	id := model.SeriesID(0x78)
+	a := labels.FromStrings("__name__", "up", "job", "a")
+	expires := func() int64 {
+		t.Helper()
+		v, err := kv.Get(ctx, db.keys.series(id))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, e, err := decodeSeries(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+	for _, step := range []time.Duration{0, 24 * time.Hour, 72*time.Hour - 30*time.Minute} {
+		now = now.Add(step)
+		if err := x.WriteSeries(ctx, model.Day(now.UnixMilli()), id, a); err != nil {
+			t.Fatal(err)
+		}
+		if got, want := expires(), now.Add(72*time.Hour).UnixMilli(); got != want {
+			t.Fatalf("after %v: expiry %d, want %d", step, got, want)
+		}
+	}
+}
+
+// The postings and label values of a label on different days are adjacent
+// keys: the hash in front of the day does not depend on it.
+func TestIndexKeysSpread(t *testing.T) {
+	k := newKeys("xt")
+	table := len(k.table(tagPosting))
+	a1, a2 := k.labelPair(1, "job", "api"), k.labelPair(2, "job", "api")
+	b1 := k.labelPair(1, "job", "db")
+	if !bytes.Equal(a1[:table+2], a2[:table+2]) || bytes.Equal(a1[:table+2], b1[:table+2]) {
+		t.Fatalf("unexpected spread: %x %x %x", a1, a2, b1)
+	}
+	if !bytes.Equal(k.labelValues(1, "job")[:table+2], k.labelValues(2, "job")[:table+2]) {
+		t.Fatal("the values of a label must share their hash on every day")
 	}
 }

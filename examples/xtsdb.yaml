@@ -73,17 +73,21 @@ cassandra:
   # datacenters: {dc1: 3, dc2: 3}     # for NetworkTopologyStrategy
 
 # Persistent tier and series index on TiKV (RawKV), used with
-# storage.backend: tikv. TiKV must run with storage.api-version = 2; with
-# api_version v1ttl, with api-version = 1 and storage.enable-ttl = true.
-# Keys start with storage.key_prefix. There is no schema to create.
+# storage.backend: tikv. Entries expire through TTLs: with api_version
+# v1ttl, TiKV must run with storage.api-version = 1 and
+# storage.enable-ttl = true (see deploy/tikv.toml); with v2, with
+# api-version = 2, and expired entries are removed from disk only below the
+# GC safe point, which TiDB or a RawKV GC worker must advance (and
+# storage.enable-ttl = true too). Keys start with storage.key_prefix. There
+# is no schema to create.
 tikv:
   pd_endpoints: [${XTSDB_TIKV_PD_ENDPOINTS:-127.0.0.1:2379}]  # example: from the environment
-  api_version: v2   # or v1ttl
-  keyspace: ""      # API v2 keyspace; empty: the default keyspace
+  api_version: v1ttl   # or v2
+  keyspace: ""         # API v2 keyspace; empty: the default keyspace
   timeout: 10s      # per request, retries included
   connect_timeout: 10s
-  # TLS to PD and TiKV: ca_file is required, cert_file and key_file for
-  # mutual TLS.
+  # TLS to PD and TiKV: ca_file, cert_file and key_file are all required
+  # (the PD client uses TLS only with a client certificate).
   tls:
     enabled: false
 
@@ -92,7 +96,7 @@ tikv:
 # differ from the values recorded in Redis, or chunk_range and index_buckets
 # from the values recorded in the persistent tier.
 storage:
-  backend: cassandra   # persistent tier and index: cassandra or tikv
+  backend: ${XTSDB_STORAGE_BACKEND:-cassandra}   # example: from the environment; cassandra or tikv
   key_prefix: xt       # of Redis keys, and of TiKV keys with the tikv backend
   shards: 256
   # Samples are grouped per series into windows of chunk_range. A window

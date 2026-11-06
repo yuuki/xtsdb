@@ -3,7 +3,6 @@
 package backendtest
 
 import (
-	"context"
 	"fmt"
 	"math/rand/v2"
 	"os"
@@ -12,7 +11,6 @@ import (
 
 	"github.com/yuuki/xtsdb/internal/cassandra"
 	"github.com/yuuki/xtsdb/internal/config"
-	"github.com/yuuki/xtsdb/internal/tikv"
 )
 
 // Available returns the backends whose servers are given in the
@@ -24,7 +22,7 @@ func Available() []string {
 	if os.Getenv("XTSDB_TEST_CASSANDRA_HOSTS") != "" {
 		out = append(out, config.BackendCassandra)
 	}
-	if os.Getenv("XTSDB_TEST_TIKV_PD") != "" {
+	if os.Getenv("XTSDB_TEST_TIKV_PD") != "" && tikvSupported {
 		out = append(out, config.BackendTiKV)
 	}
 	return out
@@ -59,17 +57,7 @@ func Configure(t *testing.T, cfg *config.Config, backend string) {
 			cfg.TiKV.APIVersion = v
 		}
 		tcfg, prefix := cfg.TiKV, cfg.Storage.KeyPrefix
-		t.Cleanup(func() {
-			db, err := tikv.Open(context.Background(), tcfg, prefix, nil)
-			if err != nil {
-				t.Logf("cleanup: %v", err)
-				return
-			}
-			defer db.Close()
-			if err := db.DeleteAll(context.Background()); err != nil {
-				t.Logf("cleanup: %v", err)
-			}
-		})
+		t.Cleanup(func() { deleteTiKV(t, tcfg, prefix) })
 	default:
 		t.Fatalf("unknown backend %q", backend)
 	}

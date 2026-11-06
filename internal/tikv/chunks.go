@@ -1,3 +1,5 @@
+//go:build !notikv && (!darwin || cgo)
+
 package tikv
 
 import (
@@ -8,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/yuuki/xtsdb/internal/chunk"
@@ -61,7 +64,8 @@ func (c *ChunkStore) WriteChunk(ctx context.Context, ch storage.ColdChunk) error
 		return fmt.Errorf("write chunk %s@%d: invalid sample count %d", ch.Series, ch.Start, ch.Count)
 	}
 	n := max(1, (len(ch.Data)+segmentSize-1)/segmentSize)
-	h := segmentHeader{encoding: ch.Encoding, segments: uint32(n), maxT: ch.MaxT, count: uint32(ch.Count)}
+	h := segmentHeader{encoding: ch.Encoding, segments: uint32(n), maxT: ch.MaxT, count: uint32(ch.Count),
+		sum: xxhash.Sum64(ch.Data)}
 	keys := make([][]byte, n)
 	values := make([][]byte, n)
 	for i := range n {
@@ -80,9 +84,10 @@ func (c *ChunkStore) WriteChunk(ctx context.Context, ch storage.ColdChunk) error
 
 // Read returns the persisted samples of the given series within [mint, maxt].
 func (c *ChunkStore) Read(ctx context.Context, ids []model.SeriesID, mint, maxt int64) (map[model.SeriesID][]model.Sample, error) {
-	from := mint
-	if mint > math.MinInt64+c.chunkRange {
-		from = mint - c.chunkRange + 1
+	// Chunks that start up to chunkRange-1 before mint overlap it.
+	from := int64(math.MinInt64)
+	if mint >= math.MinInt64+(c.chunkRange-1) {
+		from = mint - (c.chunkRange - 1)
 	}
 	out := make(map[model.SeriesID][]model.Sample, len(ids))
 	var mu sync.Mutex
@@ -134,6 +139,13 @@ func (c *ChunkStore) readSeries(ctx context.Context, id model.SeriesID, from, mi
 // order: the segments of a part are consecutive, the parts of a version are
 // consecutive, and the versions of a window come in the order of
 // precedence, so later versions win when merged.
+//
+// A part is used only if its segments 0 to n-1 are all present, carry the
+// same header, and their data matches the checksum, where n is the segment
+// count of segment 0. Segments beyond n are left over from an earlier write
+// of the part in more segments and are ignored. A part that is incomplete,
+// for example while it is being written, is skipped: the hot tier still
+// holds its samples until the write succeeds.
 type versionReader struct {
 	mint, maxt int64
 	logger     *slog.Logger
@@ -143,9 +155,10 @@ type versionReader struct {
 
 	cur     segmentKey // the last segment read
 	started bool
-	header  segmentHeader // of the current part
+	header  segmentHeader // of segment 0 of the current part
+	next    uint32        // the next segment expected
 	data    []byte        // of the current part
-	broken  bool          // the current part has a missing or malformed segment
+	broken  bool          // the current part cannot be used
 }
 
 func (r *versionReader) add(s segmentKey, value []byte) {
@@ -156,25 +169,32 @@ func (r *versionReader) add(s segmentKey, value []byte) {
 			r.endVersion()
 		}
 	}
-	var expected uint32
 	if newPart {
-		r.header, r.data, r.broken = segmentHeader{}, nil, false
-	} else {
-		expected = r.cur.seg + 1
+		r.header, r.next, r.data, r.broken = segmentHeader{}, 0, nil, false
 	}
 	r.cur, r.started = s, true
+	if r.broken || (r.next > 0 && r.next == r.header.segments) {
+		return // a broken part, or a segment left over after a complete one
+	}
 	h, data, err := parseSegment(value)
 	switch {
-	case r.broken:
 	case err != nil:
 		r.broken = true
 		r.logger.Error("skipping chunk with a malformed segment", "start", s.start, "part", s.part, "segment", s.seg)
-	case s.seg != expected || (s.seg > 0 && h != r.header):
+	case s.seg != r.next:
+		// A segment is missing: the part is being written, or its write
+		// failed half way and is retried until it succeeds.
 		r.broken = true
-		r.logger.Error("skipping incomplete chunk", "start", s.start, "part", s.part, "segment", s.seg)
+		r.logger.Debug("skipping incomplete chunk", "start", s.start, "part", s.part, "segment", s.seg)
+	case s.seg > 0 && h != r.header:
+		r.broken = true
+		r.logger.Warn("skipping chunk with segments of different writes", "start", s.start, "part", s.part, "segment", s.seg)
 	default:
-		r.header = h
+		if s.seg == 0 {
+			r.header = h
+		}
 		r.data = append(r.data, data...)
+		r.next++
 	}
 }
 
@@ -183,9 +203,13 @@ func (r *versionReader) endPart() {
 	if r.broken {
 		return
 	}
-	if r.cur.seg+1 != r.header.segments {
-		r.logger.Error("skipping incomplete chunk", "start", r.cur.start, "part", r.cur.part,
-			"segments", r.cur.seg+1, "want", r.header.segments)
+	if r.next != r.header.segments {
+		r.logger.Debug("skipping incomplete chunk", "start", r.cur.start, "part", r.cur.part,
+			"segments", r.next, "want", r.header.segments)
+		return
+	}
+	if xxhash.Sum64(r.data) != r.header.sum {
+		r.logger.Warn("skipping chunk with segments of different writes", "start", r.cur.start, "part", r.cur.part)
 		return
 	}
 	samples, err := chunk.Decode(r.header.encoding, r.data)
