@@ -211,7 +211,9 @@ func writeBlock(t *testing.T, dir string, series map[string][]model.Sample, dele
 	var entries []entry
 	symbols := map[string]struct{}{}
 	mint, maxt := int64(math.MaxInt64), int64(math.MinInt64)
-	// The index needs the chunks of its series in the order of their labels.
+	// The index requires chunk references in the order series are added
+	// (sorted by labels), so chunks are written in that order too: all
+	// series share the labels except __name__.
 	for _, name := range slices.Sorted(maps.Keys(series)) {
 		samples := series[name]
 		lset := labels.FromStrings("__name__", name, "job", "prom")
