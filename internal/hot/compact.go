@@ -112,13 +112,7 @@ func (s *Store) compactBatch(ctx context.Context, shard int, members []string, r
 	}); err != nil {
 		return err
 	}
-	var (
-		calls []scriptCall
-		sizes [][]compactSizes
-		call  scriptCall
-		cur   []compactSizes
-		bytes int
-	)
+	calls := compactCalls{s: s, shard: shard}
 	// As many records as the raw part may hold.
 	limit := (s.maxChunkBytes - chunk.HeaderLen) / chunk.RecordLen
 	for i, cmd := range cmds {
@@ -129,57 +123,100 @@ func (s *Store) compactBatch(ctx context.Context, shard int, members []string, r
 		if !ok || len(raw) < chunk.HeaderLen+s.compactMinRaw {
 			continue // completed, or compacted by someone else, since it was listed
 		}
-		_, samples, records, err := chunk.DecodeHot(raw, compacted)
-		if err != nil {
-			res.Failed++
-			s.logger.Warn("cannot compact undecodable chunk; it is left as it is", "shard", shard, "member", members[i], "err", err)
-			continue
+		if next, size, ok := s.compactChunk(shard, members[i], raw, compacted, limit, res); ok {
+			calls.add(members[i], raw, compacted, next, size)
 		}
-		// Chunks with native histograms stay raw (see EncodeCompacted).
-		// Beyond the record limit, further records stay raw up to the size
-		// limit of the raw part: a chunk holds at most twice the records of
-		// a full raw part.
-		if records > limit || slices.ContainsFunc(samples, model.Sample.IsHistogram) {
-			res.Kept++
-			continue
-		}
-		next, err := chunk.EncodeCompacted(raw[:chunk.HeaderLen], records, samples)
-		if err != nil {
-			res.Failed++
-			s.logger.Warn("cannot compact chunk; it is left as it is", "shard", shard, "member", members[i], "err", err)
-			continue
-		}
-		before := len(raw) - chunk.HeaderLen + len(compacted)
-		if len(next) >= before {
-			res.Kept++ // incompressible: compaction would take more memory
-			continue
-		}
-		n := len(raw) + len(compacted) + len(next)
-		if len(cur) > 0 && bytes+n > compactCallBytes {
-			calls, sizes = append(calls, call), append(sizes, cur)
-			call, cur, bytes = scriptCall{}, nil, 0
-		}
-		if len(cur) == 0 {
-			call.keys = []string{s.dueKey(shard)}
-		}
-		call.keys = append(call.keys, s.chunkKey(shard, members[i]), s.compactedKey(shard, members[i]))
-		call.args = append(call.args, members[i], raw, compacted, next)
-		cur = append(cur, compactSizes{before: before, after: len(next)})
-		bytes += n
 	}
-	if len(cur) > 0 {
-		calls, sizes = append(calls, call), append(sizes, cur)
-	}
-	if len(calls) == 0 {
+	calls.flush()
+	if len(calls.calls) == 0 {
 		return nil
 	}
 	if s.beforeCompact != nil {
 		s.beforeCompact()
 	}
-	replies, err := s.runScripts(ctx, compactScript, calls)
+	replies, err := s.runScripts(ctx, compactScript, calls.calls)
 	if err != nil {
 		return fmt.Errorf("compact shard %d: %w", shard, err)
 	}
+	return countCompacted(shard, replies, calls.sizes, res)
+}
+
+// compactChunk encodes the samples of a chunk, read as its raw and compacted
+// parts, into a new compacted part, which replaces the old one and the
+// records of the raw part. It returns false, and counts the chunk in res, if
+// the chunk is to be left as it is.
+func (s *Store) compactChunk(shard int, member string, raw, compacted []byte, limit int, res *storage.CompactResult) ([]byte, compactSizes, bool) {
+	_, samples, records, err := chunk.DecodeHot(raw, compacted)
+	if err != nil {
+		res.Failed++
+		s.logger.Warn("cannot compact undecodable chunk; it is left as it is", "shard", shard, "member", member, "err", err)
+		return nil, compactSizes{}, false
+	}
+	// Chunks with native histograms stay raw (see EncodeCompacted).
+	// Beyond the record limit, further records stay raw up to the size
+	// limit of the raw part: a chunk holds at most twice the records of
+	// a full raw part.
+	if records > limit || slices.ContainsFunc(samples, model.Sample.IsHistogram) {
+		res.Kept++
+		return nil, compactSizes{}, false
+	}
+	next, err := chunk.EncodeCompacted(raw[:chunk.HeaderLen], records, samples)
+	if err != nil {
+		res.Failed++
+		s.logger.Warn("cannot compact chunk; it is left as it is", "shard", shard, "member", member, "err", err)
+		return nil, compactSizes{}, false
+	}
+	before := len(raw) - chunk.HeaderLen + len(compacted)
+	if len(next) >= before {
+		res.Kept++ // incompressible: compaction would take more memory
+		return nil, compactSizes{}, false
+	}
+	return next, compactSizes{before: before, after: len(next)}, true
+}
+
+// compactCalls groups the swaps of the chunks of a shard into calls of
+// compactScript, each with at most compactCallBytes of chunk data unless a
+// single chunk has more.
+type compactCalls struct {
+	s     *Store
+	shard int
+	calls []scriptCall
+	sizes [][]compactSizes // the sizes of the chunks of each call
+	call  scriptCall       // the call being filled
+	cur   []compactSizes   // the sizes of the chunks of call
+	bytes int              // the bytes of chunk data in call
+}
+
+// add adds the swap of the parts of a chunk, raw and compacted as read, for
+// next. It first ends the call being filled if the chunk would take that
+// call beyond compactCallBytes.
+func (c *compactCalls) add(member string, raw, compacted, next []byte, size compactSizes) {
+	n := len(raw) + len(compacted) + len(next)
+	if len(c.cur) > 0 && c.bytes+n > compactCallBytes {
+		c.flush()
+	}
+	if len(c.cur) == 0 {
+		c.call.keys = []string{c.s.dueKey(c.shard)}
+	}
+	c.call.keys = append(c.call.keys, c.s.chunkKey(c.shard, member), c.s.compactedKey(c.shard, member))
+	c.call.args = append(c.call.args, member, raw, compacted, next)
+	c.cur = append(c.cur, size)
+	c.bytes += n
+}
+
+// flush ends the call being filled, if it has any chunk.
+func (c *compactCalls) flush() {
+	if len(c.cur) == 0 {
+		return
+	}
+	c.calls, c.sizes = append(c.calls, c.call), append(c.sizes, c.cur)
+	c.call, c.cur, c.bytes = scriptCall{}, nil, 0
+}
+
+// countCompacted counts the outcome of the calls of compactScript in res.
+// The reply of call i lists the chunks that were compacted, by their index
+// in sizes[i]; the others changed since they were read.
+func countCompacted(shard int, replies []*redis.Cmd, sizes [][]compactSizes, res *storage.CompactResult) error {
 	for i, reply := range replies {
 		idxs, err := reply.Int64Slice()
 		if err != nil {

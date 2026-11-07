@@ -48,49 +48,81 @@ func runImport(ctx context.Context, cfg *config.Config, logger *slog.Logger, opt
 	defer state.Close()
 
 	start := time.Now()
-	type source struct{ id, path string }
-	var sources []source
+	sources, err := importSources(opts.format, paths, logger)
+	if err != nil {
+		return err
+	}
+	if err := importAll(ctx, im, state, sources, opts, logger); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "%s in %v\n", im.Stats.String(), time.Since(start).Round(time.Second))
+	return nil
+}
+
+// importSource is a block or a file to import. Its id records it in the
+// state file; it is empty for standard input, which cannot be resumed.
+type importSource struct{ id, path string }
+
+// importSources lists the sources to import from paths: the blocks of each
+// data or block directory with the tsdb format, and each file with the
+// openmetrics format.
+func importSources(format string, paths []string, logger *slog.Logger) ([]importSource, error) {
+	var sources []importSource
 	for _, p := range paths {
 		switch {
-		case opts.format == "openmetrics" && p == "-":
-			sources = append(sources, source{path: p}) // stdin cannot be resumed
-		case opts.format == "openmetrics":
+		case format == "openmetrics" && p == "-":
+			sources = append(sources, importSource{path: p}) // stdin cannot be resumed
+		case format == "openmetrics":
 			id, err := backfill.FileID(p)
 			if err != nil {
-				return err
+				return nil, err
 			}
-			sources = append(sources, source{id: id, path: p})
+			sources = append(sources, importSource{id: id, path: p})
 		default:
-			blocks, err := backfill.Blocks(p)
+			blocks, err := blockSources(p, logger)
 			if err != nil {
-				return err
+				return nil, err
 			}
-			if backfill.HasHead(p) {
-				logger.Warn("the head of this Prometheus data directory (wal/) is not a block and is not imported: "+
-					"the most recent hours of data are missing; import a snapshot instead "+
-					"(POST /api/v1/admin/tsdb/snapshot writes the head as a block)", "dir", p)
-			}
-			for _, b := range blocks {
-				id, err := backfill.BlockID(b)
-				if err != nil {
-					return err
-				}
-				sources = append(sources, source{id: "block " + id, path: b})
-			}
+			sources = append(sources, blocks...)
 		}
 	}
+	return sources, nil
+}
+
+// blockSources lists the blocks of a Prometheus data directory or block
+// directory.
+func blockSources(dir string, logger *slog.Logger) ([]importSource, error) {
+	blocks, err := backfill.Blocks(dir)
+	if err != nil {
+		return nil, err
+	}
+	if backfill.HasHead(dir) {
+		logger.Warn("the head of this Prometheus data directory (wal/) is not a block and is not imported: "+
+			"the most recent hours of data are missing; import a snapshot instead "+
+			"(POST /api/v1/admin/tsdb/snapshot writes the head as a block)", "dir", dir)
+	}
+	sources := make([]importSource, 0, len(blocks))
+	for _, b := range blocks {
+		id, err := backfill.BlockID(b)
+		if err != nil {
+			return nil, err
+		}
+		sources = append(sources, importSource{id: "block " + id, path: b})
+	}
+	return sources, nil
+}
+
+// importAll imports the sources in order, skipping those that state records
+// as imported completely, and records in state each source with an id once
+// it is imported completely.
+func importAll(ctx context.Context, im *backfill.Importer, state *backfill.State, sources []importSource, opts importOptions, logger *slog.Logger) error {
 	for i, src := range sources {
 		if src.id != "" && state.Done(src.id) {
 			logger.Info("skipping source imported before", "source", src.path)
 			continue
 		}
 		logger.Info("importing", "source", src.path, "progress", fmt.Sprintf("%d/%d", i+1, len(sources)))
-		if opts.format == "tsdb" {
-			err = im.ImportBlock(ctx, src.path, opts.concurrency)
-		} else {
-			err = importOpenMetrics(ctx, im, src.path, opts)
-		}
-		if err != nil {
+		if err := importOne(ctx, im, src.path, opts); err != nil {
 			return fmt.Errorf("import %s: %w (importing again is safe)", src.path, err)
 		}
 		if src.id != "" {
@@ -100,8 +132,16 @@ func runImport(ctx context.Context, cfg *config.Config, logger *slog.Logger, opt
 		}
 		logger.Info("imported", "source", src.path, "stats", im.Stats.String())
 	}
-	fmt.Fprintf(stdout, "%s in %v\n", im.Stats.String(), time.Since(start).Round(time.Second))
 	return nil
+}
+
+// importOne imports the block, or with the openmetrics format the file, at
+// path.
+func importOne(ctx context.Context, im *backfill.Importer, path string, opts importOptions) error {
+	if opts.format == "tsdb" {
+		return im.ImportBlock(ctx, path, opts.concurrency)
+	}
+	return importOpenMetrics(ctx, im, path, opts)
 }
 
 // importOpenMetrics imports a file, mapped into memory rather than read, so
