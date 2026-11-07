@@ -181,131 +181,17 @@ func (w *Writer) Write(ctx context.Context, batch []Series) (Result, error) {
 	var res Result
 	maxT := start.Add(w.maxFuture).UnixMilli()
 	minT := start.Add(-w.maxAge).UnixMilli()
-	type entry struct {
-		id    model.SeriesID
-		check uint64
-		lset  labels.Labels
-		days  []int32
-	}
-	entries := make([]entry, 0, len(batch))
-	toStore := make([]storage.SeriesSamples, 0, len(batch))
-
-	for _, s := range batch {
-		if len(s.Samples) == 0 {
-			continue
-		}
-		lset, err := model.Canonicalize(s.Labels)
-		if err != nil {
-			res.Invalid += len(s.Samples)
-			if res.FirstInvalid == nil {
-				res.FirstInvalid = fmt.Errorf("series %s: %w", s.Labels, err)
-			}
-			continue
-		}
-		samples := s.Samples[:0:0]
-		minS, maxS := int64(0), int64(0)
-		for _, smp := range s.Samples {
-			if smp.H != nil {
-				if err := model.ValidateHistogram(smp.H); err != nil {
-					res.Invalid++
-					if res.FirstInvalid == nil {
-						res.FirstInvalid = fmt.Errorf("histogram of %s at %d: %w", lset, smp.T, err)
-					}
-					continue
-				}
-			}
-			if smp.T > maxT {
-				res.TooNew++
-				continue
-			}
-			if smp.T < minT {
-				res.TooOld++
-				continue
-			}
-			if len(samples) == 0 || smp.T < minS {
-				minS = smp.T
-			}
-			if len(samples) == 0 || smp.T > maxS {
-				maxS = smp.T
-			}
-			samples = append(samples, smp)
-		}
-		if len(samples) == 0 {
-			continue
-		}
-		id := w.idOf(lset)
-		entries = append(entries, entry{id: id, check: model.Check(lset), lset: lset, days: model.Days(minS, maxS)})
-		toStore = append(toStore, storage.SeriesSamples{ID: id, Samples: samples})
-	}
+	entries, toStore := w.prepare(batch, minT, maxT, &res)
 
 	// Index first: a sample must never be stored for a series that cannot
 	// be found. Series are recorded before their label values, so that a
 	// series whose ID collides with another one leaves no trace.
-	var (
-		mu       sync.Mutex
-		collided = make(map[indexKey]struct{})
-	)
-	seriesKey := func(e entry, day int32) indexKey {
-		return indexKey{kind: kindSeries, day: day, id: e.id, check: e.check}
-	}
-	err := w.writeIndex(ctx, func(once func(indexKey, func(context.Context) error)) {
-		for _, e := range entries {
-			for _, day := range e.days {
-				key := seriesKey(e, day)
-				if w.collisions.Contains(key) {
-					mu.Lock()
-					collided[key] = struct{}{}
-					mu.Unlock()
-					continue
-				}
-				once(key, func(ctx context.Context) error {
-					err := w.index.WriteSeries(ctx, day, e.id, e.lset)
-					var coll *storage.SeriesCollisionError
-					if !errors.As(err, &coll) {
-						return err
-					}
-					w.logger.Error("series ID collision: samples of this series are rejected",
-						"id", e.id, "day", day, "series", e.lset.String(), "existing", coll.Existing.String())
-					w.seriesCollisions.Inc()
-					w.collisions.Add(key, struct{}{})
-					mu.Lock()
-					collided[key] = struct{}{}
-					mu.Unlock()
-					return errSkip
-				})
-			}
-		}
-	})
+	collided, err := w.writeSeriesIndex(ctx, entries)
 	if err == nil && len(collided) > 0 {
-		kept := 0
-		for i, e := range entries {
-			if slices.ContainsFunc(e.days, func(day int32) bool {
-				_, ok := collided[seriesKey(e, day)]
-				return ok
-			}) {
-				res.Collision += len(toStore[i].Samples)
-				continue
-			}
-			entries[kept], toStore[kept] = e, toStore[i]
-			kept++
-		}
-		entries, toStore = entries[:kept], toStore[:kept]
+		entries, toStore = dropCollided(entries, toStore, collided, &res)
 	}
 	if err == nil {
-		err = w.writeIndex(ctx, func(once func(indexKey, func(context.Context) error)) {
-			for _, e := range entries {
-				for _, day := range e.days {
-					e.lset.Range(func(l labels.Label) {
-						once(indexKey{kind: kindValue, day: day, name: l.Name, value: l.Value}, func(ctx context.Context) error {
-							return w.index.WriteLabelValue(ctx, day, l.Name, l.Value)
-						})
-						once(indexKey{kind: kindName, day: day, name: l.Name}, func(ctx context.Context) error {
-							return w.index.WriteLabelName(ctx, day, l.Name)
-						})
-					})
-				}
-			}
-		})
+		err = w.writeLabelIndex(ctx, entries)
 	}
 	if err != nil {
 		w.samples.WithLabelValues("error").Add(float64(countSamples(toStore)))
@@ -331,6 +217,161 @@ func (w *Writer) Write(ctx context.Context, batch []Series) (Result, error) {
 	w.samples.WithLabelValues("collision").Add(float64(res.Collision))
 	w.samples.WithLabelValues("chunk_full").Add(float64(res.ChunkFull))
 	return res, nil
+}
+
+// seriesEntry is a series of a batch to index: its ID, the check of its
+// labels and the days of its samples.
+type seriesEntry struct {
+	id    model.SeriesID
+	check uint64
+	lset  labels.Labels
+	days  []int32
+}
+
+// seriesKey returns the key of the series entry of e on day.
+func (e *seriesEntry) seriesKey(day int32) indexKey {
+	return indexKey{kind: kindSeries, day: day, id: e.id, check: e.check}
+}
+
+// prepare canonicalizes the labels of the series of batch and keeps their
+// valid samples within [minT, maxT]. It counts the other samples in res and
+// returns the series that have samples left, to index and to store, in the
+// same order.
+func (w *Writer) prepare(batch []Series, minT, maxT int64, res *Result) ([]seriesEntry, []storage.SeriesSamples) {
+	entries := make([]seriesEntry, 0, len(batch))
+	toStore := make([]storage.SeriesSamples, 0, len(batch))
+	for _, s := range batch {
+		if len(s.Samples) == 0 {
+			continue
+		}
+		lset, err := model.Canonicalize(s.Labels)
+		if err != nil {
+			res.Invalid += len(s.Samples)
+			if res.FirstInvalid == nil {
+				res.FirstInvalid = fmt.Errorf("series %s: %w", s.Labels, err)
+			}
+			continue
+		}
+		samples, minS, maxS := acceptSamples(lset, s.Samples, minT, maxT, res)
+		if len(samples) == 0 {
+			continue
+		}
+		id := w.idOf(lset)
+		entries = append(entries, seriesEntry{id: id, check: model.Check(lset), lset: lset, days: model.Days(minS, maxS)})
+		toStore = append(toStore, storage.SeriesSamples{ID: id, Samples: samples})
+	}
+	return entries, toStore
+}
+
+// acceptSamples returns, in a new slice, the samples of the series lset that
+// are valid and within [minT, maxT], and their lowest and highest
+// timestamps. It counts the other samples in res.
+func acceptSamples(lset labels.Labels, in []model.Sample, minT, maxT int64, res *Result) (samples []model.Sample, minS, maxS int64) {
+	samples = in[:0:0]
+	for _, smp := range in {
+		if smp.H != nil {
+			if err := model.ValidateHistogram(smp.H); err != nil {
+				res.Invalid++
+				if res.FirstInvalid == nil {
+					res.FirstInvalid = fmt.Errorf("histogram of %s at %d: %w", lset, smp.T, err)
+				}
+				continue
+			}
+		}
+		if smp.T > maxT {
+			res.TooNew++
+			continue
+		}
+		if smp.T < minT {
+			res.TooOld++
+			continue
+		}
+		if len(samples) == 0 || smp.T < minS {
+			minS = smp.T
+		}
+		if len(samples) == 0 || smp.T > maxS {
+			maxS = smp.T
+		}
+		samples = append(samples, smp)
+	}
+	return samples, minS, maxS
+}
+
+// writeSeriesIndex writes the series entries of entries, for every day of
+// their samples. It returns the keys of the entries whose series ID is used
+// by a different label set, whether the collision was known or is found
+// now: the samples of these series must not be stored.
+func (w *Writer) writeSeriesIndex(ctx context.Context, entries []seriesEntry) (map[indexKey]struct{}, error) {
+	var (
+		mu       sync.Mutex
+		collided = make(map[indexKey]struct{})
+	)
+	err := w.writeIndex(ctx, func(once func(indexKey, func(context.Context) error)) {
+		for _, e := range entries {
+			for _, day := range e.days {
+				key := e.seriesKey(day)
+				if w.collisions.Contains(key) {
+					mu.Lock()
+					collided[key] = struct{}{}
+					mu.Unlock()
+					continue
+				}
+				once(key, func(ctx context.Context) error {
+					err := w.index.WriteSeries(ctx, day, e.id, e.lset)
+					var coll *storage.SeriesCollisionError
+					if !errors.As(err, &coll) {
+						return err
+					}
+					w.logger.Error("series ID collision: samples of this series are rejected",
+						"id", e.id, "day", day, "series", e.lset.String(), "existing", coll.Existing.String())
+					w.seriesCollisions.Inc()
+					w.collisions.Add(key, struct{}{})
+					mu.Lock()
+					collided[key] = struct{}{}
+					mu.Unlock()
+					return errSkip
+				})
+			}
+		}
+	})
+	return collided, err
+}
+
+// dropCollided removes from entries and toStore, in place, the series that
+// collided on any day of their samples, and counts their samples in res.
+func dropCollided(entries []seriesEntry, toStore []storage.SeriesSamples, collided map[indexKey]struct{}, res *Result) ([]seriesEntry, []storage.SeriesSamples) {
+	kept := 0
+	for i, e := range entries {
+		if slices.ContainsFunc(e.days, func(day int32) bool {
+			_, ok := collided[e.seriesKey(day)]
+			return ok
+		}) {
+			res.Collision += len(toStore[i].Samples)
+			continue
+		}
+		entries[kept], toStore[kept] = e, toStore[i]
+		kept++
+	}
+	return entries[:kept], toStore[:kept]
+}
+
+// writeLabelIndex writes the label value and label name entries of the
+// labels of entries, for every day of their samples.
+func (w *Writer) writeLabelIndex(ctx context.Context, entries []seriesEntry) error {
+	return w.writeIndex(ctx, func(once func(indexKey, func(context.Context) error)) {
+		for _, e := range entries {
+			for _, day := range e.days {
+				e.lset.Range(func(l labels.Label) {
+					once(indexKey{kind: kindValue, day: day, name: l.Name, value: l.Value}, func(ctx context.Context) error {
+						return w.index.WriteLabelValue(ctx, day, l.Name, l.Value)
+					})
+					once(indexKey{kind: kindName, day: day, name: l.Name}, func(ctx context.Context) error {
+						return w.index.WriteLabelName(ctx, day, l.Name)
+					})
+				})
+			}
+		}
+	})
 }
 
 // errSkip tells writeIndex that an entry was not written but that this is
