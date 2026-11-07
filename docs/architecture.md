@@ -304,6 +304,10 @@ Invariants:
   its lease has expired, completes what it persisted with its own timeout,
   and a flusher moves on when a batch made no progress.
 
+[`spec/XtsdbHandoff.tla`](../spec/README.md) models append, compaction,
+claim, complete and the read order in TLA+, including failovers to a lagging
+replica; `make test-tla` checks these invariants with TLC.
+
 No Redis keyspace notifications are used. 0.x relied on them; they are
 node-local, delivered at most once and require special server
 configuration, and a mismatch between notification payloads and key names

@@ -12,6 +12,12 @@ ACTIONLINT_VERSION    ?= v1.7.12
 ZIZMOR_VERSION        ?= 1.32.0
 FUZZTIME              ?= 30s
 BENCH_COUNT           ?= 6
+# TLA+ tools that model-check spec/ (a release, not the rolling nightly).
+TLA_VERSION           ?= 1.7.4
+TLA_SHA256            ?= 936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
+TLA_JAR               ?= $(CURDIR)/.cache/tla/tla2tools-$(TLA_VERSION).jar
+JAVA                  ?= java
+PYTHON                ?= python3
 
 # `go run tool@version` would build a tool with the oldest Go its go.mod
 # allows, and golangci-lint and govulncheck cannot load code that needs a
@@ -73,6 +79,10 @@ test-tikv: deps-tikv ## TiKV backend tests against Redis and TiKV from compose.y
 	docker compose up -d --wait redis
 	env -u XTSDB_TEST_CASSANDRA_HOSTS XTSDB_TEST_TIKV_PD=$(TIKV_PD) \
 		$(GO) test -race -count=1 ./internal/tikv/ ./internal/app/ ./cmd/xtsdb/
+
+.PHONY: test-tla
+test-tla: ## Model-check the hand-off in spec/ with TLC (Java 11+; downloads the pinned tla2tools.jar)
+	$(PYTHON) scripts/tlc.py --java $(JAVA) --jar $(TLA_JAR) --version $(TLA_VERSION) --sha256 $(TLA_SHA256) spec/XtsdbHandoff.tla
 
 .PHONY: bench
 bench: ## Benchmarks without backends into bench.txt (compare runs with benchstat)
