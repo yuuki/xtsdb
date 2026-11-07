@@ -361,9 +361,9 @@ make docker             # container image
 make snapshot           # release archives in dist/, without publishing
 ```
 
-[AGENTS.md](AGENTS.md) describes the test suites, conventions and
-compatibility rules in detail, and [CONTRIBUTING.md](CONTRIBUTING.md) how to
-propose a change. Report vulnerabilities as described in
+[AGENTS.md](AGENTS.md) lists the rules, conventions and compatibility
+contracts that the code does not show, and [CONTRIBUTING.md](CONTRIBUTING.md)
+how to propose a change. Report vulnerabilities as described in
 [SECURITY.md](SECURITY.md).
 
 Releases are made by pushing a version tag; see

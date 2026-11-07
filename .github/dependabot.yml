@@ -16,6 +16,9 @@ updates:
     groups:
       github-actions:
         patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+      include: "scope"
   - package-ecosystem: gomod
     directories: ["/"]
     schedule:
@@ -25,6 +28,9 @@ updates:
     groups:
       go-modules:
         patterns: ["*"]
+    commit-message:
+      prefix: "build"
+      include: "scope"
   # The base images of the released container image (Dockerfile). The Go
   # image must match the go directive of go.mod: update both together.
   - package-ecosystem: docker
@@ -36,3 +42,6 @@ updates:
     groups:
       docker:
         patterns: ["*"]
+    commit-message:
+      prefix: "build"
+      include: "scope"

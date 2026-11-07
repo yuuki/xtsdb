@@ -20,9 +20,8 @@ Security issues go through [SECURITY.md](SECURITY.md), not public issues.
    `## [Unreleased]`, and update README.md and `examples/xtsdb.yaml` when
    behaviour or options change.
 
-Commit subjects are short imperative sentences that say what changes
-("Split the hot tier's Append into its three steps"), with the reason in the
-body.
+Commits, branches and pull request titles follow the Git conventions in
+AGENTS.md.
 
-[AGENTS.md](AGENTS.md) lists every command, test suite and convention in
-detail.
+[AGENTS.md](AGENTS.md) lists the rules, compatibility contracts and
+conventions that the code does not show.
