@@ -1,0 +1,38 @@
+# Version updates arrive monthly, grouped into one PR per ecosystem, and only
+# after a release has been public for a week (compromised releases are usually
+# pulled within days). Security updates are not delayed by this schedule.
+#
+# The images of compose.yaml are left out: the same versions are pinned in the
+# service containers of .github/workflows/ci.yml and listed under "Tested
+# with" in README.md, which Dependabot would not update with them.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ["*"]
+  - package-ecosystem: gomod
+    directories: ["/"]
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      go-modules:
+        patterns: ["*"]
+  # The base images of the released container image (Dockerfile). The Go
+  # image must match the go directive of go.mod: update both together.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      docker:
+        patterns: ["*"]

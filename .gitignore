@@ -4,3 +4,5 @@
 *.test
 *.out
 coverage.*
+# make bench
+/bench.txt

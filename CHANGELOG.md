@@ -111,5 +111,12 @@ key prefix. Versions before 2.0.0 were not released.
   (#3).
 - Two label sets with the same 64-bit series ID shared postings and samples
   (#5).
+- Remote Write 1.0 requests did not count metadata entries, nor the labels of
+  exemplars, against `ingester.max_samples_per_request` before decoding: a
+  request of 8 MiB decompressed made the ingester allocate about 2 GB. They
+  are now counted like the other elements (413 beyond the limit).
+- A `step` or `timeout` query parameter of about 9223372036.85 seconds
+  wrapped around to the most negative duration instead of being rejected as
+  an overflow.
 
 [Unreleased]: https://github.com/yuuki/xtsdb/commits/master

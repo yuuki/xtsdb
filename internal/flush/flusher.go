@@ -154,7 +154,7 @@ func (f *Flusher) Run(ctx context.Context) error {
 dispatch:
 	for {
 		// Visit shards in random order so that several flushers spread out.
-		for _, shard := range rand.Perm(f.hot.Shards()) {
+		for _, shard := range rand.Perm(f.hot.Shards()) { //nolint:gosec // G404: load spreading, not security
 			select {
 			case shards <- shard:
 			case <-ctx.Done():
@@ -213,7 +213,7 @@ func (f *Flusher) compactLoop(ctx context.Context) {
 	defer ticker.Stop()
 offer:
 	for {
-		for _, shard := range rand.Perm(f.hot.Shards()) {
+		for _, shard := range rand.Perm(f.hot.Shards()) { //nolint:gosec // G404: load spreading, not security
 			select {
 			case shards <- shard:
 			case <-ctx.Done():

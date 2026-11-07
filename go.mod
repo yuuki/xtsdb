@@ -16,6 +16,7 @@ require (
 	github.com/redis/go-redis/v9 v9.23.0
 	github.com/tikv/client-go/v2 v2.0.8-0.20261029152027-3f9d5b43e9e5
 	github.com/tikv/pd/client v0.0.0-20260609141937-b01426f6b08b
+	go.uber.org/goleak v1.3.0
 	go.uber.org/zap v1.28.0
 	go.yaml.in/yaml/v4 v4.0.0
 	golang.org/x/sync v0.24.0

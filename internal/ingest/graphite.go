@@ -136,7 +136,8 @@ func NewGraphiteServer(addr string, maxConns int, w *Writer, reg prometheus.Regi
 
 // Start opens the listeners and serves in the background.
 func (g *GraphiteServer) Start() error {
-	ln, err := net.Listen("tcp", g.addr)
+	var lc net.ListenConfig
+	ln, err := lc.Listen(context.Background(), "tcp", g.addr)
 	if err != nil {
 		return fmt.Errorf("graphite tcp: %w", err)
 	}
@@ -147,7 +148,7 @@ func (g *GraphiteServer) Start() error {
 		go g.acceptLoop()
 		return nil
 	}
-	pc, err := net.ListenPacket("udp", g.addr)
+	pc, err := lc.ListenPacket(context.Background(), "udp", g.addr)
 	if err != nil {
 		ln.Close()
 		return fmt.Errorf("graphite udp: %w", err)
