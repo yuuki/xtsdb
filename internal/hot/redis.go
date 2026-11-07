@@ -401,6 +401,18 @@ type scriptCall struct {
 // Append stores samples in their chunk windows.
 func (s *Store) Append(ctx context.Context, batch []storage.SeriesSamples) (storage.AppendResult, error) {
 	shards := make(map[int]map[string]*pendingChunk)
+	s.addPending(shards, batch)
+	calls := s.appendCalls(shards)
+	results, err := s.runScripts(ctx, appendScript, calls)
+	if err != nil {
+		return storage.AppendResult{}, err
+	}
+	return appendResult(calls, results)
+}
+
+// addPending encodes the samples of batch as raw records, appended to their
+// chunks in shards, which holds the chunks of each shard by member.
+func (s *Store) addPending(shards map[int]map[string]*pendingChunk, batch []storage.SeriesSamples) {
 	for _, ss := range batch {
 		shard := s.layout.Shard(ss.ID)
 		chunks := shards[shard]
@@ -423,7 +435,12 @@ func (s *Store) Append(ctx context.Context, batch []storage.SeriesSamples) (stor
 			}
 		}
 	}
+}
 
+// appendCalls groups the pending chunks of each shard, in the order of
+// their members, into calls of appendScript of at most maxChunksPerCall
+// chunks.
+func (s *Store) appendCalls(shards map[int]map[string]*pendingChunk) []scriptCall {
 	var calls []scriptCall
 	for shard, chunks := range shards {
 		members := make([]string, 0, len(chunks))
@@ -451,11 +468,13 @@ func (s *Store) Append(ctx context.Context, batch []storage.SeriesSamples) (stor
 			members = members[n:]
 		}
 	}
+	return calls
+}
 
-	results, err := s.runScripts(ctx, appendScript, calls)
-	if err != nil {
-		return storage.AppendResult{}, err
-	}
+// appendResult counts the samples of calls from the replies of appendScript,
+// which list the chunks whose window was closed and those that were full.
+// The samples of the other chunks were stored.
+func appendResult(calls []scriptCall, results []*redis.Cmd) (storage.AppendResult, error) {
 	var res storage.AppendResult
 	for i, call := range calls {
 		reply, err := results[i].Slice()
@@ -466,19 +485,8 @@ func (s *Store) Append(ctx context.Context, batch []storage.SeriesSamples) (stor
 		for i := range accepted {
 			accepted[i] = true
 		}
-		count := func(v any) int {
-			idxs, _ := v.([]any)
-			n := 0
-			for _, x := range idxs {
-				if idx, ok := x.(int64); ok && idx >= 0 && int(idx) < len(call.samples) && accepted[idx] {
-					n += call.samples[idx]
-					accepted[idx] = false
-				}
-			}
-			return n
-		}
-		res.TooOld += count(reply[0])
-		res.ChunkFull += count(reply[1])
+		res.TooOld += rejectedSamples(reply[0], call.samples, accepted)
+		res.ChunkFull += rejectedSamples(reply[1], call.samples, accepted)
 		for i, ok := range accepted {
 			if ok {
 				res.Accepted += call.samples[i]
@@ -487,6 +495,22 @@ func (s *Store) Append(ctx context.Context, batch []storage.SeriesSamples) (stor
 		}
 	}
 	return res, nil
+}
+
+// rejectedSamples returns the number of samples of the chunks that v, a list
+// in a reply of appendScript, gives by index, and marks those chunks as not
+// accepted. samples holds the number of samples of each chunk of the call. A
+// chunk that is already marked is not counted again.
+func rejectedSamples(v any, samples []int, accepted []bool) int {
+	idxs, _ := v.([]any)
+	n := 0
+	for _, x := range idxs {
+		if idx, ok := x.(int64); ok && idx >= 0 && int(idx) < len(samples) && accepted[idx] {
+			n += samples[idx]
+			accepted[idx] = false
+		}
+	}
+	return n
 }
 
 // runScripts executes script calls in pipelines and transparently reloads
