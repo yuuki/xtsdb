@@ -359,6 +359,16 @@ make snapshot           # release archives in dist/, without publishing
 Releases are made by pushing a version tag; see
 [docs/releasing.md](docs/releasing.md).
 
+The Code Complexity workflow (`.github/workflows/complexity.yml`) measures
+the Cognitive and Cyclomatic Complexity of the Go code without its tests
+with [cccc](https://github.com/moznion/cccc), configured by `cccc.toml`, and
+tracks them with [octocov](https://github.com/k1LoW/octocov)
+(`.octocov.complexity.yml`): a comment on each pull request compares them
+with `master`, the job summary lists the 20 most complex functions, and each
+push to `master` stores a report in the `octocov` branch. The numbers are a
+trend to watch: no threshold fails the job. To see them locally:
+`cccc --table --top-cognitive 20 cmd internal`.
+
 Integration tests run against the servers named by
 `XTSDB_TEST_REDIS_ADDRS` (comma separated; set `XTSDB_TEST_REDIS_CLUSTER=1`
 for Redis Cluster), `XTSDB_TEST_CASSANDRA_HOSTS` and `XTSDB_TEST_TIKV_PD`
