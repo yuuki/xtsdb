@@ -22,7 +22,7 @@ reader while:
 | `Ingest` | `appendScript` in [`internal/hot/scripts.go`](../internal/hot/scripts.go) |
 | `Claim` | `claimScript` |
 | `Load`, `Persist`, `GiveUp` | the batches of [`internal/flush/flusher.go`](../internal/flush/flusher.go): `MGET`, the cold write, a failed or late batch |
-| `Complete`, `Fence` | `completeScript` |
+| `Complete`, `Fence` | `completeScript`; `CompleteFence = "length"` is the fence it had before it compared content |
 | `CompactRead`, `CompactSwap` | compaction in [`internal/hot/compact.go`](../internal/hot/compact.go) and `compactScript` |
 | `ReadStart`, `ReadFirst`, `ReadSecond` | `Queryable.Samples` in [`internal/query/queryable.go`](../internal/query/queryable.go) |
 | `Replicate`, `Failover` | asynchronous Redis replication, failover or snapshot restore |
@@ -53,27 +53,27 @@ the model does not pass vacuously.
 | Configuration | Expected | What it shows |
 |---|---|---|
 | `XtsdbHandoff.cfg` | pass | The hand-off as implemented, with clock steps and without failover. |
-| `XtsdbHandoff_FailoverLengthFence.cfg` | `NoUnpersistedDelete` violated | After a failover to a lagging replica on a node whose clock is behind, `completeScript` deletes a chunk whose fragment and lengths match what was persisted, together with records that were never persisted. |
-| `XtsdbHandoff_FailoverLengthFenceOneIncarnation.cfg` | `NoUnpersistedDelete` violated | The same within one incarnation, with no fragment issued twice: the gap documented under "Fenced completion" in [docs/architecture.md](../docs/architecture.md). |
-| `XtsdbHandoff_FailoverContentFence.cfg` | pass | Completion fenced by content, as compaction already is, keeps every sample through the same failovers. |
+| `XtsdbHandoff_Failover.cfg` | pass | The hand-off as implemented, with failovers to a lagging replica on a node whose clock is behind: completion fenced by content keeps every sample. |
+| `XtsdbHandoff_FailoverLengthFence.cfg` | `NoUnpersistedDelete` violated | The length fence that `completeScript` had before: after such a failover it deletes a chunk whose fragment and lengths match what was persisted, together with records that were never persisted. |
+| `XtsdbHandoff_FailoverLengthFenceOneIncarnation.cfg` | `NoUnpersistedDelete` violated | The same within one incarnation, with no fragment issued twice: the gap that docs/architecture.md documented under "Fenced completion". |
 | `XtsdbHandoff_ColdFirst.cfg` | `ReadsComplete` violated | Reading the persistent tier first misses a chunk persisted after the cold read and deleted before the hot read. |
 | `XtsdbHandoff_ConsistencyOne.cfg` | `ReadsComplete` violated | Reads and writes that do not overlap in Cassandra miss a chunk deleted from Redis after its write. |
 
 ## Findings
 
-- The length fence of `completeScript` loses samples after a failover to a
-  lagging replica on a node whose clock is behind, in two ways. Within one
+- The length fence that `completeScript` had lost samples after a failover to
+  a lagging replica on a node whose clock is behind, in two ways. Within one
   incarnation, other records of the same length are appended, as
-  docs/architecture.md already says. And because a failover rewinds the shard
-  clock key with the rest of the shard, the new node can create a later
-  incarnation with the fragment of the one being persisted. The model's clock
-  is coarse, which makes the second way far more likely than with microsecond
-  fragments, but it shows that the fence relies on fragments never repeating,
-  which the hybrid clock does not guarantee across a failover.
-- Comparing the content instead, as `compactScript` already does, closes both
-  ways in the model: `XtsdbHandoff_FailoverContentFence.cfg` passes every
-  property through the same failovers. In the code, `completeScript` would
-  compare the bytes (or a digest) of both parts instead of their lengths.
+  docs/architecture.md said. And because a failover rewinds the shard clock
+  key with the rest of the shard, the new node can create a later incarnation
+  with the fragment of the one being persisted. The model's clock is coarse,
+  which makes the second way far more likely than with microsecond
+  fragments, but it shows that a length fence relies on fragments never
+  repeating, which the hybrid clock does not guarantee across a failover.
+- `completeScript` and `quarantineScript` therefore compare the content of
+  both parts too (`redis.sha1hex`, after the lengths), as `compactScript`
+  already compared content. `XtsdbHandoff_Failover.cfg` passes every property
+  through the same failovers.
 - The read order of `Queryable.Samples` and an overlapping Cassandra
   consistency level are both necessary for `ReadsComplete`, as the comments in
   `internal/query/queryable.go` and `internal/config/config.go` state.

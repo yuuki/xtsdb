@@ -36,7 +36,7 @@ CONSTANTS
     MaxStepBack,    \* how far one clock step or failover moves the clock back
     MaxClockSteps,  \* NTP steps of the clock back, without failover
     MaxFailovers,   \* failovers to a lagging replica, or snapshot restores
-    CompleteFence,  \* "length" as completeScript compares, or "content"
+    CompleteFence,  \* "content" as completeScript compares, or "length" as it did
     HotFirst,       \* TRUE as in Queryable.Samples: hot tier read first
     ColdQuorum,     \* TRUE: reads and writes overlap (QUORUM, LOCAL_QUORUM)
     Compaction,     \* TRUE: compaction of open chunks runs
@@ -208,8 +208,9 @@ Persist(f) ==
                    compactVars, ghostVars, readerVars>>
 
 \* The fence of completeScript: the chunk is deleted only if it still is
-\* the incarnation that was persisted and its lengths did not change. A
-\* chunk that was missing is released only if it is still missing.
+\* the incarnation that was persisted and its parts did not change, by
+\* content ("content", redis.sha1hex) or by length only ("length", before).
+\* A chunk that was missing is released only if it is still missing.
 Fence(l) ==
     IF ~l.present
     THEN ~redis.present

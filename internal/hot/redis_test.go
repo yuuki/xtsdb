@@ -255,6 +255,74 @@ func TestCompleteIgnoresNewerIncarnation(t *testing.T) {
 	}
 }
 
+// Complete compares the content of a chunk, not only its fragment and
+// lengths: after a failover to a lagging replica, other records of the same
+// length can follow the records the replica had, and they were never
+// persisted (spec/XtsdbHandoff_FailoverLengthFenceOneIncarnation.cfg).
+func TestCompleteIsFencedOnContent(t *testing.T) {
+	layout := model.Layout{Shards: 1, ChunkRange: 300, Grace: 0}
+	s, client := newTestStore(t, layout, time.Minute)
+	ctx := context.Background()
+	now := nowMs()
+	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: 5, Samples: []model.Sample{{T: now, V: 1}, {T: now + 1, V: 2}}}}); err != nil {
+		t.Fatal(err)
+	}
+	refs := waitClaim(t, s, 0)
+	chunks, _, err := load(ctx, s, refs)
+	if err != nil || len(chunks) != 1 {
+		t.Fatalf("load: %v %v", chunks, err)
+	}
+	key := s.chunkKey(0, member(refs[0].Series, refs[0].Start))
+	persisted := client.Get(ctx, key).Val()
+	// Same header and length, another last record.
+	diverged := []byte(persisted)
+	diverged[len(diverged)-1] ^= 0xff
+	client.Set(ctx, key, diverged, 0)
+	if err := s.Complete(ctx, chunks); err != nil {
+		t.Fatal(err)
+	}
+	if client.Get(ctx, key).Val() != string(diverged) {
+		t.Fatal("a chunk with other records of the same length was deleted")
+	}
+	if client.ZCard(ctx, s.inflightKey(0)).Val() != 1 {
+		t.Fatal("the diverged chunk must stay in flight to be flushed again")
+	}
+	// The chunk as persisted is deleted.
+	client.Set(ctx, key, persisted, 0)
+	if err := s.Complete(ctx, chunks); err != nil {
+		t.Fatal(err)
+	}
+	if client.Exists(ctx, key).Val() != 0 || client.ZCard(ctx, s.inflightKey(0)).Val() != 0 {
+		t.Fatal("the persisted chunk was not completed")
+	}
+}
+
+// A call of completeScript is bounded by its chunk count and by the content
+// it reads, except that a chunk larger than the bound gets a call of its own.
+func TestCompleteCallsAreBounded(t *testing.T) {
+	s := &Store{prefix: "p"}
+	item := func(series, size int) finishItem {
+		return finishItem{ref: storage.ChunkRef{Series: model.SeriesID(series)}, header: "0000000000000001", size: size}
+	}
+	var items []finishItem
+	for i := range maxChunksPerCall + 1 {
+		items = append(items, item(i, 16))
+	}
+	if calls := s.completeCalls(items); len(calls) != 2 {
+		t.Fatalf("%d small chunks: %d calls, want 2", len(items), len(calls))
+	}
+	half := completeCallBytes / 2
+	items = []finishItem{item(1, half), item(2, half), item(3, 16), item(4, 2*completeCallBytes), item(5, 16)}
+	calls := s.completeCalls(items)
+	var perCall []int
+	for _, c := range calls {
+		perCall = append(perCall, len(c.args)/6)
+	}
+	if fmt.Sprint(perCall) != "[2 1 1 1]" {
+		t.Fatalf("chunks per call %v, want [2 1 1 1]", perCall)
+	}
+}
+
 func TestQuarantinesCorruptChunks(t *testing.T) {
 	layout := model.Layout{Shards: 1, ChunkRange: 300, Grace: 0}
 	s, client := newTestStore(t, layout, time.Minute)
@@ -364,6 +432,11 @@ func TestQuarantineIsFenced(t *testing.T) {
 	client.Set(ctx, key, "0000000000001000xyz", 0)
 	if s.quarantine(ctx, ref, corrupt, nil, errors.New("test")) {
 		t.Fatal("a chunk that grew must not be quarantined")
+	}
+	// Same header and length, other content: a diverged replica.
+	client.Set(ctx, key, "0000000000001000y", 0)
+	if s.quarantine(ctx, ref, corrupt, nil, errors.New("test")) {
+		t.Fatal("a chunk with other content of the same length must not be quarantined")
 	}
 	// A chunk that disappeared is released.
 	client.Del(ctx, key)

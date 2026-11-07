@@ -111,6 +111,12 @@ key prefix. Versions before 2.0.0 were not released.
   (#3).
 - Two label sets with the same 64-bit series ID shared postings and samples
   (#5).
+- After a failover to a lagging replica on a node whose clock was behind,
+  completing a flushed chunk could delete samples that were never persisted:
+  the fence compared the chunk's fragment and lengths, which other records of
+  the same length, or a later incarnation reusing the fragment, could match.
+  Completion and quarantine now also compare the content of both parts. The
+  TLA+ model in `spec/` checks the hand-off with failovers.
 - Remote Write 1.0 requests did not count metadata entries, nor the labels of
   exemplars, against `ingester.max_samples_per_request` before decoding: a
   request of 8 MiB decompressed made the ingester allocate about 2 GB. They

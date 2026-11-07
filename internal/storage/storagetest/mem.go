@@ -6,6 +6,7 @@ import (
 	"cmp"
 	"context"
 	"slices"
+	"strconv"
 	"sync"
 	"time"
 
@@ -24,7 +25,12 @@ type hotChunk struct {
 	// compactedRecords the number of raw records they came from.
 	compacted        []model.Sample
 	compactedRecords int
+	// changes counts the appends and compactions of the chunk; it stands for
+	// the content checksum that the Redis store compares.
+	changes int
 }
+
+func (c *hotChunk) checksum() string { return strconv.Itoa(c.changes) }
 
 // samples returns the samples of a chunk sorted, the latest write winning.
 func (c *hotChunk) samples() []model.Sample {
@@ -104,6 +110,7 @@ func (h *Hot) Append(_ context.Context, batch []storage.SeriesSamples) (storage.
 				h.chunks[ref] = c
 			}
 			c.raw = append(c.raw, s)
+			c.changes++
 			res.Accepted++
 			if s.IsHistogram() {
 				res.AcceptedHistograms++
@@ -145,6 +152,7 @@ func (h *Hot) Compact(_ context.Context, shard int, interval time.Duration) (sto
 		c.compacted = c.samples()
 		c.compactedRecords += len(c.raw)
 		c.raw = nil
+		c.changes++
 		res.BytesAfter += int64(compactedSize(c))
 		res.Compacted++
 	}
@@ -193,7 +201,7 @@ func (h *Hot) Load(_ context.Context, refs []storage.ChunkRef) (storage.LoadResu
 		}
 		res.Chunks = append(res.Chunks, storage.HotChunk{
 			Ref: ref, Fragment: c.fragment, Size: size(c), CompactedSize: compactedSize(c),
-			Records: c.compactedRecords + len(c.raw), Samples: c.samples(),
+			Checksum: c.checksum(), Records: c.compactedRecords + len(c.raw), Samples: c.samples(),
 		})
 	}
 	return res, nil
@@ -205,7 +213,7 @@ func (h *Hot) Complete(_ context.Context, chunks []storage.HotChunk) error {
 	defer h.mu.Unlock()
 	for _, hc := range chunks {
 		if c := h.chunks[hc.Ref]; c != nil && c.fragment == hc.Fragment && size(c) == hc.Size &&
-			compactedSize(c) == hc.CompactedSize {
+			compactedSize(c) == hc.CompactedSize && c.checksum() == hc.Checksum {
 			delete(h.chunks, hc.Ref)
 			delete(h.inflight, hc.Ref)
 		}

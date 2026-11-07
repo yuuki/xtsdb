@@ -113,9 +113,13 @@ return out
 //
 // For a persisted chunk (header non-empty) the chunk is deleted only if it
 // is still exactly what was persisted: same header (incarnation), same
-// length (no sample appended since it was loaded) and same length of the
-// compacted part. Otherwise it is left in flight and re-processed after its
-// lease expires.
+// lengths of both parts, and same content of both parts. Otherwise it is
+// left in flight and re-processed after its lease expires. The lengths are
+// compared first; the content (redis.sha1hex of each part, the only digest a
+// script can compute) only when they match. Lengths alone do not do: after a
+// failover to a lagging replica, other records of the same length can have
+// been appended, and the shard clock key goes back with the replica, so a
+// later incarnation can even reuse the fragment.
 //
 // For a chunk that no longer exists (header empty) the in-flight entries
 // are removed, so that they do not leak, and so is a leftover compacted
@@ -125,21 +129,22 @@ return out
 //
 // KEYS[1] = in-flight set, KEYS[2] = in-flight due set,
 // KEYS[3..] = (chunk key, compacted key, window index) for every chunk
-// ARGV = (member, window start, header, length, compacted length) for every
-// chunk
+// ARGV = (member, window start, header, length, compacted length, checksum)
+// for every chunk; the checksum is contentChecksum of both parts
 // Returns the number of chunks finished.
 var completeScript = redis.NewScript(allowOOM + `
 local done = 0
 for c = 0, (#KEYS - 2) / 3 - 1 do
   local key, zkey, windows = KEYS[3 + 3 * c], KEYS[4 + 3 * c], KEYS[5 + 3 * c]
-  local j = 1 + 5 * c
+  local j = 1 + 6 * c
   local member, start, want = ARGV[j], ARGV[j + 1], ARGV[j + 2]
-  local size, zsize = tonumber(ARGV[j + 3]), tonumber(ARGV[j + 4])
+  local size, zsize, sum = tonumber(ARGV[j + 3]), tonumber(ARGV[j + 4]), ARGV[j + 5]
   local hdr = redis.call('GETRANGE', key, 0, 15)
   local finished = false
   if want == '' then
     finished = (hdr == '')
-  elseif hdr == want and redis.call('STRLEN', key) == size and redis.call('STRLEN', zkey) == zsize then
+  elseif hdr == want and redis.call('STRLEN', key) == size and redis.call('STRLEN', zkey) == zsize
+      and redis.sha1hex(redis.call('GET', key)) .. redis.sha1hex(redis.call('GET', zkey) or '') == sum then
     redis.call('DEL', key)
     finished = true
   end
@@ -158,10 +163,10 @@ return done
 // does not block the flusher forever, while keeping it for inspection.
 //
 // It is fenced like completeScript: the chunk is moved only if its first 16
-// bytes, its length and the length of its compacted part are still those
-// that were read. A chunk that changed (a newer incarnation of the window
-// after a failover or a clock step) is left in flight and re-processed after
-// its lease. A chunk that no longer exists is released.
+// bytes, the lengths of both parts and their content are still those that
+// were read. A chunk that changed (a newer incarnation of the window after a
+// failover or a clock step) is left in flight and re-processed after its
+// lease. A chunk that no longer exists is released.
 //
 // The quarantine key is named after the content of the chunk, so a later
 // quarantine of the same window never overwrites a different chunk. The
@@ -175,7 +180,8 @@ return done
 // KEYS[8] = quarantine key of the compacted part
 // ARGV[1] = member, ARGV[2] = first 16 bytes as read, ARGV[3] = length as
 // read, ARGV[4] = TTL of the quarantine key in milliseconds (0: none),
-// ARGV[5] = window start, ARGV[6] = length of the compacted part as read
+// ARGV[5] = window start, ARGV[6] = length of the compacted part as read,
+// ARGV[7] = contentChecksum of both parts as read
 // Returns 1 if the chunk was quarantined, 0 if it changed and -1 if it no
 // longer exists.
 var quarantineScript = redis.NewScript(allowOOM + prelude + `
@@ -189,7 +195,8 @@ if redis.call('EXISTS', KEYS[3]) == 0 then
   return -1
 end
 if redis.call('GETRANGE', KEYS[3], 0, 15) ~= want or redis.call('STRLEN', KEYS[3]) ~= size
-    or redis.call('STRLEN', KEYS[7]) ~= zsize then
+    or redis.call('STRLEN', KEYS[7]) ~= zsize
+    or redis.sha1hex(redis.call('GET', KEYS[3])) .. redis.sha1hex(redis.call('GET', KEYS[7]) or '') ~= ARGV[7] then
   return 0
 end
 redis.call('RENAME', KEYS[3], KEYS[4])

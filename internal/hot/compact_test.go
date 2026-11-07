@@ -383,12 +383,25 @@ func TestCompleteIsFencedOnCompactedPart(t *testing.T) {
 		t.Fatalf("load: %v %v", chunks, err)
 	}
 	m := member(id, refs[0].Start)
-	client.Append(ctx, s.compactedKey(0, m), "x")
+	zkey := s.compactedKey(0, m)
+	compacted := client.Get(ctx, zkey).Val()
+	client.Append(ctx, zkey, "x")
 	if err := s.Complete(ctx, chunks); err != nil {
 		t.Fatal(err)
 	}
 	if client.Exists(ctx, s.chunkKey(0, m)).Val() != 1 {
 		t.Fatal("a chunk whose compacted part changed was deleted")
+	}
+	// A compacted part of the same length with other content, as a
+	// compaction on a diverged replica can write.
+	other := []byte(compacted)
+	other[len(other)-1] ^= 0xff
+	client.Set(ctx, zkey, other, 0)
+	if err := s.Complete(ctx, chunks); err != nil {
+		t.Fatal(err)
+	}
+	if client.Exists(ctx, s.chunkKey(0, m)).Val() != 1 {
+		t.Fatal("a chunk whose compacted part has other content was deleted")
 	}
 }
 
