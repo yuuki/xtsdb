@@ -348,13 +348,23 @@ Requires Go 1.27.
 
 ```bash
 make build              # bin/xtsdb
-make test               # unit tests
+make test               # unit tests (with the race detector)
 make test-integration   # starts Redis and Cassandra with Docker Compose, then runs all tests
 make test-tikv          # starts Redis and a single-node TiKV (Linux), then runs the TiKV tests
-make lint               # go vet + golangci-lint
+make test-fuzz          # every fuzz target for FUZZTIME (30s)
+make bench              # benchmarks into bench.txt, to compare with benchstat
+make lint               # go vet + golangci-lint + go mod tidy -diff
+make lint-actions       # actionlint + zizmor on the GitHub Actions workflows
+make vuln               # govulncheck
+make check              # what pull request CI checks without backends: run before a PR
 make docker             # container image
 make snapshot           # release archives in dist/, without publishing
 ```
+
+[AGENTS.md](AGENTS.md) lists the rules, conventions and compatibility
+contracts that the code does not show, and [CONTRIBUTING.md](CONTRIBUTING.md)
+how to propose a change. Report vulnerabilities as described in
+[SECURITY.md](SECURITY.md).
 
 Releases are made by pushing a version tag; see
 [docs/releasing.md](docs/releasing.md).

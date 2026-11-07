@@ -5,11 +5,23 @@ linters:
   enable:
     - bodyclose
     - errorlint
+    - gosec
     - misspell
+    - noctx
     - nolintlint
     - revive
     - unconvert
+    - usestdlibvars
   settings:
+    gosec:
+      excludes:
+        # Unchecked errors are errcheck's job, which allows unchecked Close
+        # (std-error-handling preset); gosec would report them again.
+        - G104
+        # The storage formats reinterpret integers bit for bit (series IDs
+        # as Cassandra bigints, sign-flipped TiKV keys, varint lengths);
+        # golden, round-trip and fuzz tests pin those conversions.
+        - G115
     revive:
       rules:
         - name: exported
@@ -17,10 +29,14 @@ linters:
         - name: var-naming
   exclusions:
     presets:
+      - common-false-positives
       - std-error-handling
     rules:
       - path: _test\.go
-        linters: [bodyclose, errorlint, revive]
+        linters: [bodyclose, errorlint, gosec, noctx, revive]
+      # Helpers that only tests import.
+      - path: internal/(backendtest|faultnet|storage/storagetest|tlstest)/
+        linters: [gosec]
 
 formatters:
   enable:

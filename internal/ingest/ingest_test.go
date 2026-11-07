@@ -495,6 +495,18 @@ func TestRemoteWriteLimits(t *testing.T) {
 	if rec := post(t, h, "", append(one, inner...)); rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("sample bomb: status %d: %s", rec.Code, rec.Body)
 	}
+	// Many empty metadata entries (field 3 of a 1.0 request): each decodes
+	// into a struct of about 90 bytes.
+	if rec := post(t, h, "", bytes.Repeat([]byte{0x1a, 0x00}, 20_000)); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("metadata bomb: status %d: %s", rec.Code, rec.Body)
+	}
+	// One exemplar with many empty labels.
+	labelsBomb := bytes.Repeat([]byte{0x0a, 0x00}, 20_000)
+	ex := append(append([]byte{0x1a}, binary.AppendUvarint(nil, uint64(len(labelsBomb)))...), labelsBomb...)
+	exSeries := append(append([]byte{0x0a}, binary.AppendUvarint(nil, uint64(len(ex)))...), ex...)
+	if rec := post(t, h, "", exSeries); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("exemplar labels bomb: status %d: %s", rec.Code, rec.Body)
+	}
 	// The S2 "repeat offset" extension gives near-unbounded compression
 	// ratios; the strict Snappy decoder rejects it before anything is
 	// allocated.

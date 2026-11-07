@@ -132,7 +132,7 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 
 // Listen opens the listener so that Addr is known before Serve.
 func (s *Server) Listen() error {
-	ln, err := net.Listen("tcp", s.srv.Addr)
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", s.srv.Addr)
 	if err != nil {
 		return fmt.Errorf("http listen: %w", err)
 	}

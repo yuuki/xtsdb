@@ -338,6 +338,11 @@ func TestParseTimeAndDuration(t *testing.T) {
 	if _, err := parseDuration("x"); err == nil || !strings.Contains(err.Error(), "cannot parse") {
 		t.Errorf("parseDuration should fail: %v", err)
 	}
+	// The largest Duration in seconds rounds to 2^63 as a float64, which
+	// used to wrap around to the most negative Duration.
+	if d, err := parseDuration("9223372036.854775807"); err == nil {
+		t.Errorf("parseDuration of an overflowing value = %v, want an error", d)
+	}
 }
 
 // handoffCold simulates a flusher that persists and deletes a chunk at the

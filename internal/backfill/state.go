@@ -24,7 +24,7 @@ func OpenState(path string) (*State, error) {
 	if path == "" {
 		return s, nil
 	}
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644) //nolint:gosec // G302: lists imported blocks and files, nothing secret
 	if err != nil {
 		return nil, fmt.Errorf("open state file: %w", err)
 	}

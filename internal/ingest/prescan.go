@@ -13,7 +13,7 @@ import (
 // elements are counted on the wire before anything is decoded.
 type Limits struct {
 	MaxSeries  int // time series per request
-	MaxSamples int // samples per request; also bounds labels, symbols, histogram buckets and exemplars
+	MaxSamples int // samples per request; also bounds labels, symbols, metadata, histogram buckets and exemplars
 }
 
 // errLimit is returned when a request exceeds Limits.
@@ -22,7 +22,9 @@ var errLimit = errors.New("request exceeds limits")
 // Field numbers of the remote write protobuf messages.
 const (
 	v1TimeseriesField = 1 // prometheus.WriteRequest.timeseries
+	v1MetadataField   = 3 // prometheus.WriteRequest.metadata
 	v1LabelsField     = 1 // prometheus.TimeSeries.labels
+	v1ExemplarsField  = 3 // prometheus.TimeSeries.exemplars
 	v2SymbolsField    = 4 // io.prometheus.write.v2.Request.symbols
 	v2TimeseriesField = 5 // io.prometheus.write.v2.Request.timeseries
 	v2LabelRefsField  = 1 // io.prometheus.write.v2.TimeSeries.labels_refs
@@ -84,7 +86,7 @@ func prescan(b []byte, v2 bool, lim Limits) error {
 			}
 			samples += s
 			other += o
-		case v2 && num == v2SymbolsField:
+		case v2 && num == v2SymbolsField, !v2 && num == v1MetadataField:
 			other++
 		}
 		if err := check(); err != nil {
@@ -123,12 +125,40 @@ func countSeriesFields(b []byte, v2 bool) (samples, other int, err error) {
 				return 0, 0, err
 			}
 			other += n
+		case !v2 && num == v1ExemplarsField && typ == protowire.BytesType:
+			// The labels of a 1.0 exemplar are messages, like those of the
+			// series.
+			v, _ := protowire.ConsumeBytes(b[:m])
+			n, err := countFields(v)
+			if err != nil {
+				return 0, 0, err
+			}
+			other += 1 + n
 		default:
 			other++ // exemplars, metadata, ...
 		}
 		b = b[m:]
 	}
 	return samples, other, nil
+}
+
+// countFields returns the number of fields of an encoded message.
+func countFields(b []byte) (int, error) {
+	n := 0
+	for len(b) > 0 {
+		num, typ, l := protowire.ConsumeTag(b)
+		if l < 0 {
+			return 0, protowire.ParseError(l)
+		}
+		b = b[l:]
+		m := protowire.ConsumeFieldValue(num, typ, b)
+		if m < 0 {
+			return 0, protowire.ParseError(m)
+		}
+		n++
+		b = b[m:]
+	}
+	return n, nil
 }
 
 // countHistogramElements returns an upper bound of the repeated elements
