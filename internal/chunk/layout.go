@@ -77,17 +77,9 @@ func checkHistogramChunk(b []byte) error {
 func readHistogramLayout(r *bitReader) (*histogram.FloatHistogram, error) {
 	var h histogram.FloatHistogram
 	maxBuckets := r.remaining() / 64
-	switch zt, err := r.readBits(8); {
-	case err != nil:
+	var err error
+	if h.ZeroThreshold, err = readZeroThreshold(r); err != nil {
 		return nil, err
-	case zt == 255:
-		v, err := r.readBits(64)
-		if err != nil {
-			return nil, err
-		}
-		h.ZeroThreshold = math.Float64frombits(v)
-	case zt != 0:
-		h.ZeroThreshold = math.Ldexp(0.5, int(zt)-243)
 	}
 	schema, err := r.varbitInt()
 	if err != nil {
@@ -97,59 +89,108 @@ func readHistogramLayout(r *bitReader) (*histogram.FloatHistogram, error) {
 	if !histogram.IsValidSchema(h.Schema) {
 		return nil, histogram.InvalidSchemaError(h.Schema)
 	}
-	spans, buckets := 0, 0
-	for _, side := range []*[]histogram.Span{&h.PositiveSpans, &h.NegativeSpans} {
-		n, err := r.varbitUint()
-		if err != nil {
-			return nil, err
-		}
-		if n > uint64(model.MaxHistogramBuckets-spans) {
-			return nil, fmt.Errorf("more than %d spans", model.MaxHistogramBuckets)
-		}
-		spans += int(n)
-		for range n {
-			length, err := r.varbitUint()
-			if err != nil {
-				return nil, err
-			}
-			offset, err := r.varbitInt()
-			if err != nil {
-				return nil, err
-			}
-			if length > maxBuckets-uint64(buckets) {
-				return nil, errors.New("more buckets than the chunk can hold")
-			}
-			buckets += int(length)
-			*side = append(*side, histogram.Span{Offset: int32(offset), Length: uint32(length)})
-		}
+	spans := spanReader{r: r, maxBuckets: maxBuckets}
+	if h.PositiveSpans, err = spans.read(); err != nil {
+		return nil, err
+	}
+	if h.NegativeSpans, err = spans.read(); err != nil {
+		return nil, err
 	}
 	if histogram.IsCustomBucketsSchema(h.Schema) {
-		n, err := r.varbitUint()
-		if err != nil {
+		if h.CustomValues, err = readCustomBounds(r); err != nil {
 			return nil, err
-		}
-		if n > model.MaxHistogramBuckets {
-			return nil, fmt.Errorf("more than %d custom bounds", model.MaxHistogramBuckets)
-		}
-		for range n {
-			// A bound is stored as 1 + 1000 * bound if that is a whole
-			// number that fits, else as 0 and the float64.
-			v, err := r.varbitUint()
-			if err != nil {
-				return nil, err
-			}
-			bound := float64(v-1) / 1000
-			if v == 0 {
-				bits, err := r.readBits(64)
-				if err != nil {
-					return nil, err
-				}
-				bound = math.Float64frombits(bits)
-			}
-			h.CustomValues = append(h.CustomValues, bound)
 		}
 	}
 	return &h, nil
+}
+
+// readZeroThreshold reads the zero threshold of a layout: a byte that is 0
+// for a threshold of 0, 255 if the threshold follows as a float64, and else
+// encodes a threshold that is a power of two.
+func readZeroThreshold(r *bitReader) (float64, error) {
+	switch zt, err := r.readBits(8); {
+	case err != nil:
+		return 0, err
+	case zt == 255:
+		v, err := r.readBits(64)
+		if err != nil {
+			return 0, err
+		}
+		return math.Float64frombits(v), nil
+	case zt != 0:
+		return math.Ldexp(0.5, int(zt)-243), nil
+	}
+	return 0, nil
+}
+
+// spanReader reads the positive and then the negative spans of a layout.
+// Its bounds hold for both sides together: at most model.MaxHistogramBuckets
+// spans, with at most maxBuckets buckets.
+type spanReader struct {
+	r          *bitReader
+	maxBuckets uint64
+	spans      int // spans read so far
+	buckets    int // buckets of the spans read so far
+}
+
+// read reads the spans of one side.
+func (sr *spanReader) read() ([]histogram.Span, error) {
+	n, err := sr.r.varbitUint()
+	if err != nil {
+		return nil, err
+	}
+	if n > uint64(model.MaxHistogramBuckets-sr.spans) {
+		return nil, fmt.Errorf("more than %d spans", model.MaxHistogramBuckets)
+	}
+	sr.spans += int(n)
+	var side []histogram.Span
+	for range n {
+		length, err := sr.r.varbitUint()
+		if err != nil {
+			return nil, err
+		}
+		offset, err := sr.r.varbitInt()
+		if err != nil {
+			return nil, err
+		}
+		if length > sr.maxBuckets-uint64(sr.buckets) {
+			return nil, errors.New("more buckets than the chunk can hold")
+		}
+		sr.buckets += int(length)
+		side = append(side, histogram.Span{Offset: int32(offset), Length: uint32(length)})
+	}
+	return side, nil
+}
+
+// readCustomBounds reads the custom bounds of a layout with the custom
+// buckets schema, at most model.MaxHistogramBuckets of them.
+func readCustomBounds(r *bitReader) ([]float64, error) {
+	n, err := r.varbitUint()
+	if err != nil {
+		return nil, err
+	}
+	if n > model.MaxHistogramBuckets {
+		return nil, fmt.Errorf("more than %d custom bounds", model.MaxHistogramBuckets)
+	}
+	var bounds []float64
+	for range n {
+		// A bound is stored as 1 + 1000 * bound if that is a whole
+		// number that fits, else as 0 and the float64.
+		v, err := r.varbitUint()
+		if err != nil {
+			return nil, err
+		}
+		bound := float64(v-1) / 1000
+		if v == 0 {
+			bits, err := r.readBits(64)
+			if err != nil {
+				return nil, err
+			}
+			bound = math.Float64frombits(bits)
+		}
+		bounds = append(bounds, bound)
+	}
+	return bounds, nil
 }
 
 func countBuckets(spans []histogram.Span) int {
