@@ -262,7 +262,7 @@ sequenceDiagram
     R-->>F: members
     F->>R: MGET chunks and compacted parts
     F->>C: INSERT parts (series, day, start, fragment, total, digest, part) USING TTL
-    F->>R: complete: DEL both parts if header and lengths are unchanged
+    F->>R: complete: DEL both parts if header, lengths and content are unchanged
 ```
 
 Invariants:
@@ -281,21 +281,27 @@ Invariants:
   Redis was restored from an older snapshot) stores a second version
   instead of overwriting a more complete one. Reads merge all versions.
 - **Fenced completion.** `complete` deletes a chunk and its compacted part
-  only if its header, its length and the length of its compacted part are
-  still those that were persisted. A flusher whose lease
-  expired cannot delete a newer incarnation, and samples appended after the
-  chunk was loaded (possible only after a failover to a lagging replica)
-  are not deleted: the chunk is re-processed after its lease. The fence
-  compares lengths: if, after such a failover, the chunk diverged so that
-  both its lengths are those that were loaded (the same number of other
-  records, and a compaction that left the compacted part as long), those
-  records are deleted unpersisted.
+  only if its header and the length and content of both parts are still
+  those that were persisted. A flusher whose lease expired cannot delete a
+  newer incarnation, and samples appended after the chunk was loaded
+  (possible only after a failover to a lagging replica) are not deleted: the
+  chunk is re-processed after its lease. Lengths are compared first, and the
+  content (`redis.sha1hex` of each part, the only digest a script computes)
+  only when they match. Lengths alone would not do: after such a failover the
+  chunk can hold the same number of other records, or a compacted part
+  exactly as long, and since the shard clock key goes back with the replica,
+  a later incarnation can even reuse the fragment that was persisted
+  ([spec/](../spec/README.md) finds both). Reading the content into the
+  script costs the Redis main thread a few milliseconds per MiB (about 3 ms
+  on the Redis 7.0 we measured), so one call reads at most 8 MiB, as one
+  compaction call writes; a chunk of the default hour at a 15 s interval
+  holds a few KiB.
 - **No leaks.** In-flight entries whose chunk no longer exists are released,
   and a compacted part left behind is deleted.
 - **Fenced quarantine.** A chunk that cannot be decoded is moved to a
   quarantine key so that it does not block flushing, but only if its first
-  16 bytes, its length and the length of its compacted part are still those
-  that were read, exactly like `complete`. A healthy newer incarnation of the window is never moved
+  16 bytes and the length and content of both parts are still those that
+  were read, exactly like `complete`. A healthy newer incarnation of the window is never moved
   away. See [Quarantined chunks](#quarantined-chunks).
 - **Flushing works when Redis is full.** claim, complete, quarantine and
   compaction are flagged `allow-oom`; with `noeviction`, flushing and
@@ -303,6 +309,10 @@ Invariants:
 - **Progress under slow storage.** A batch stops starting new writes once
   its lease has expired, completes what it persisted with its own timeout,
   and a flusher moves on when a batch made no progress.
+
+[`spec/XtsdbHandoff.tla`](../spec/README.md) models append, compaction,
+claim, complete and the read order in TLA+, including failovers to a lagging
+replica; `make test-tla` checks these invariants with TLC.
 
 No Redis keyspace notifications are used. 0.x relied on them; they are
 node-local, delivered at most once and require special server
@@ -345,8 +355,8 @@ nor be lost silently:
   Different chunks of the same window therefore never overwrite each other
   in quarantine. Its compacted part, if any, is renamed to the same key with
   `qz` for `q`, and expires with it.
-- The rename is fenced on the first 16 bytes, the length and the length of
-  the compacted part that were read.
+- The rename is fenced on the first 16 bytes and on the length and content
+  of both parts that were read.
   If the chunk changed since (a newer incarnation after a failover or a
   clock step), it stays in flight and is read again after its lease.
 - The quarantine key is recorded in `<prefix>:{N}:qidx` and expires after
@@ -703,7 +713,7 @@ to remove a part from TiKV.
 | 0.x | v2 |
 |-----|-----|
 | Keyspace notifications + Redis Streams to detect expiry; payloads without the `ts:` prefix meant series that stopped receiving writes were never flushed | Due/in-flight sorted sets polled by flushers; no notifications |
-| `GET` then `UNLINK` race lost concurrent appends | Due windows are immutable; completion fenced by header and length |
+| `GET` then `UNLINK` race lost concurrent appends | Due windows are immutable; completion fenced by header, lengths and content |
 | Failed batches stuck in the stream's pending list forever | Leases with automatic re-claim |
 | Graphite millisecond timestamps written as seconds (year 58815) | One timestamp unit (ms) end to end, tested |
 | `EVALSHA` without fallback: writes failed after Redis restart | `EVALSHA` with automatic `EVAL` fallback |

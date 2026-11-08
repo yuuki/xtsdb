@@ -22,6 +22,7 @@
 ## Before opening a pull request
 - `make check`; also `make test-integration` for `internal/hot`, `internal/flush`, `internal/cassandra`, `internal/app` or `cmd/xtsdb`.
 - `internal/tikv` or backend wiring: `make test-tikv` (Linux); a parser, decoder or encoder: `make test-fuzz`; a hot path: `make bench` before and after.
+- Redis scripts, the flusher or the read order: update `spec/XtsdbHandoff.tla` and `make test-tla` (Java 11+).
 
 ## Git conventions
 - Branches: `<type>/<issue>-<summary>` (`<type>/<summary>` without an issue); tools' `agent/*`, `claude/*`, `copilot/*`, `dependabot/*` keep their names.

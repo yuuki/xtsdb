@@ -19,7 +19,9 @@ package hot
 
 import (
 	"context"
+	"crypto/sha1" //nolint:gosec // G505: redis.sha1hex is the only digest a script computes; it fences content, not security.
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -606,6 +608,7 @@ func (s *Store) Load(ctx context.Context, refs []storage.ChunkRef) (storage.Load
 			Fragment:      frag,
 			Size:          len(raw),
 			CompactedSize: len(compacted),
+			Checksum:      contentChecksum(raw, compacted),
 			Records:       records,
 			Samples:       samples,
 		})
@@ -655,6 +658,7 @@ func (s *Store) quarantine(ctx context.Context, ref storage.ChunkRef, raw, compa
 			s.quarantineIndexKey(ref.Shard), s.windowsKey(ref.Shard, ref.Series), s.compactedKey(ref.Shard, m),
 			quarantinedCompactedKey(qkey)},
 		m, head, len(raw), s.quarantineTTL.Milliseconds(), ref.Start, len(compacted),
+		contentChecksum(raw, compacted),
 	).Int()
 	switch {
 	case err != nil:
@@ -672,12 +676,21 @@ func (s *Store) quarantine(ctx context.Context, ref storage.ChunkRef, raw, compa
 	return true
 }
 
+// contentChecksum is what completeScript and quarantineScript compare with
+// redis.sha1hex of the raw and the compacted part: SHA-1 is the only digest
+// a Redis script can compute. It detects changed content, not tampering.
+func contentChecksum(raw, compacted []byte) string {
+	r, z := sha1.Sum(raw), sha1.Sum(compacted) //nolint:gosec // G401: compared with redis.sha1hex, not a security check.
+	return hex.EncodeToString(r[:]) + hex.EncodeToString(z[:])
+}
+
 // Complete deletes chunks that have been persisted, unless they changed
 // since they were loaded.
 func (s *Store) Complete(ctx context.Context, chunks []storage.HotChunk) error {
 	items := make([]finishItem, len(chunks))
 	for i, c := range chunks {
-		items[i] = finishItem{ref: c.Ref, header: fmt.Sprintf("%016d", c.Fragment), size: c.Size, compactedSize: c.CompactedSize}
+		items[i] = finishItem{ref: c.Ref, header: fmt.Sprintf("%016d", c.Fragment), size: c.Size,
+			compactedSize: c.CompactedSize, checksum: c.Checksum}
 	}
 	return s.finish(ctx, items)
 }
@@ -696,29 +709,50 @@ type finishItem struct {
 	header        string // empty: release a missing chunk
 	size          int
 	compactedSize int
+	checksum      string
 }
 
+// completeCallBytes bounds the content that one completeScript call reads
+// to compare checksums, as compactCallBytes bounds compaction: reading a
+// part into the script takes the Redis main thread milliseconds per MiB.
+const completeCallBytes = 8 << 20
+
 func (s *Store) finish(ctx context.Context, items []finishItem) error {
+	_, err := s.runScripts(ctx, completeScript, s.completeCalls(items))
+	return err
+}
+
+// completeCalls groups items by shard into calls of completeScript of at
+// most maxChunksPerCall chunks and, unless a single chunk is larger, at most
+// completeCallBytes of content.
+func (s *Store) completeCalls(items []finishItem) []scriptCall {
 	byShard := make(map[int][]finishItem)
 	for _, it := range items {
 		byShard[it.ref.Shard] = append(byShard[it.ref.Shard], it)
 	}
 	var calls []scriptCall
 	for shard, its := range byShard {
-		for len(its) > 0 {
-			n := min(len(its), maxChunksPerCall)
-			call := scriptCall{keys: []string{s.inflightKey(shard), s.inflightDueKey(shard)}}
-			for _, it := range its[:n] {
-				m := member(it.ref.Series, it.ref.Start)
-				call.keys = append(call.keys, s.chunkKey(shard, m), s.compactedKey(shard, m), s.windowsKey(shard, it.ref.Series))
-				call.args = append(call.args, m, it.ref.Start, it.header, it.size, it.compactedSize)
+		var call scriptCall
+		chunks, bytes := 0, 0
+		for _, it := range its {
+			if chunks > 0 && (chunks == maxChunksPerCall || bytes+it.size+it.compactedSize > completeCallBytes) {
+				calls = append(calls, call)
+				chunks, bytes = 0, 0
 			}
+			if chunks == 0 {
+				call = scriptCall{keys: []string{s.inflightKey(shard), s.inflightDueKey(shard)}}
+			}
+			m := member(it.ref.Series, it.ref.Start)
+			call.keys = append(call.keys, s.chunkKey(shard, m), s.compactedKey(shard, m), s.windowsKey(shard, it.ref.Series))
+			call.args = append(call.args, m, it.ref.Start, it.header, it.size, it.compactedSize, it.checksum)
+			chunks++
+			bytes += it.size + it.compactedSize
+		}
+		if chunks > 0 {
 			calls = append(calls, call)
-			its = its[n:]
 		}
 	}
-	_, err := s.runScripts(ctx, completeScript, calls)
-	return err
+	return calls
 }
 
 // Read returns the samples of the given series within [mint, maxt] that are

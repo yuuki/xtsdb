@@ -6,3 +6,5 @@
 coverage.*
 # make bench
 /bench.txt
+# make test-tla
+/.cache/

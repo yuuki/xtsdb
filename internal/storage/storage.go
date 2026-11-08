@@ -49,6 +49,11 @@ type HotChunk struct {
 	// CompactedSize is the size of the compacted part when loaded (zero if
 	// the chunk has none).
 	CompactedSize int
+	// Checksum identifies the content of both parts when loaded, in a form
+	// of the store's choosing. Complete deletes the chunk only if its content
+	// is still this one: after a failover to a lagging replica, a chunk can
+	// keep its fragment and both sizes while holding other records.
+	Checksum string
 	// Records is the number of samples appended to this incarnation,
 	// including those that were overwritten by a later sample with the same
 	// timestamp. An incarnation only grows, so a larger count means a later

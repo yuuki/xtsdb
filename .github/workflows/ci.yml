@@ -192,6 +192,17 @@ jobs:
           path: "**/testdata/fuzz/**"
           if-no-files-found: ignore
 
+  # TLC over the hand-off model in spec/, including the variants that must
+  # fail, so that the model cannot pass vacuously.
+  tla:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: make test-tla JAVA="$JAVA_HOME_21_X64/bin/java"
+
   # actionlint and zizmor; the token lets zizmor run its online audits.
   workflows:
     runs-on: ubuntu-latest
