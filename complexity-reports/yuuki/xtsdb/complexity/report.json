@@ -1,9 +1,9 @@
 {
   "repository": "yuuki/xtsdb/complexity",
-  "ref": "refs/heads/master",
-  "commit": "8ab4ff159f1b526edb46ee56ca8aa25790d397f1",
-  "base_ref": "refs/heads/master",
-  "timestamp": "2026-11-07T05:23:24.220430953Z",
+  "ref": "refs/heads/main",
+  "commit": "7f120ece13b74dcd1b737bcd21988fe489bce5ee",
+  "base_ref": "refs/heads/main",
+  "timestamp": "2026-11-08T05:29:38.657595486Z",
   "custom_metrics": [
     {
       "key": "code_complexity",
@@ -12,12 +12,12 @@
         {
           "key": "function_count",
           "name": "Function count",
-          "value": 618
+          "value": 637
         },
         {
           "key": "cognitive_sum",
           "name": "Cognitive: total",
-          "value": 1978
+          "value": 2029
         },
         {
           "key": "cognitive_max",
@@ -37,7 +37,7 @@
         {
           "key": "cyclomatic_sum",
           "name": "Cyclomatic: total",
-          "value": 2164
+          "value": 2221
         },
         {
           "key": "cyclomatic_max",
