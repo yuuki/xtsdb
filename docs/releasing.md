@@ -1,6 +1,6 @@
 # Releasing xtsdb
 
-Releases are cut from `master` by pushing a version tag. The
+Releases are cut from `main` by pushing a version tag. The
 [release workflow](../.github/workflows/release.yml) then:
 
 1. runs the unit tests and extracts the release notes for the version from
@@ -40,7 +40,7 @@ checkout of the tag with `make build`.
 
 ## Steps
 
-1. Make sure `master` is green in CI (unit and integration tests, lint,
+1. Make sure `main` is green in CI (unit and integration tests, lint,
    image build).
 2. In `CHANGELOG.md`, rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`,
    add a new empty `## [Unreleased]` section above it, and update the links
@@ -53,7 +53,7 @@ checkout of the tag with `make build`.
 
    (for the first release: `[2.0.0]: https://github.com/yuuki/xtsdb/releases/tag/v2.0.0`).
    Check the notes with `scripts/release-notes.sh X.Y.Z`.
-3. Commit the changelog on `master`, then tag that commit and push the tag:
+3. Commit the changelog on `main`, then tag that commit and push the tag:
 
    ```bash
    git tag -a vX.Y.Z -m "xtsdb X.Y.Z"
