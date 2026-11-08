@@ -58,19 +58,6 @@ func run(t int64, n int, v float64) []model.Sample {
 	return out
 }
 
-// atWindowStart waits until a window of the series has just opened, so that
-// it stays open for most of the chunk range, and returns the time.
-func atWindowStart(layout model.Layout, id model.SeriesID) int64 {
-	for {
-		now := nowMs()
-		start := layout.WindowStart(id, now)
-		if now-start < layout.ChunkRange/5 {
-			return now
-		}
-		time.Sleep(time.Duration(start+layout.ChunkRange-now) * time.Millisecond)
-	}
-}
-
 func sameSamples(t *testing.T, got, want []model.Sample) {
 	t.Helper()
 	if len(got) != len(want) {
@@ -460,9 +447,7 @@ func TestReleaseRemovesLeftoverCompactedPart(t *testing.T) {
 	layout := model.Layout{Shards: 1, ChunkRange: 300, Grace: 0}
 	s, client := newTestStore(t, layout, time.Minute)
 	ctx := context.Background()
-	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: 5, Samples: []model.Sample{{T: nowMs(), V: 1}}}}); err != nil {
-		t.Fatal(err)
-	}
+	appendAccepted(t, s, []storage.SeriesSamples{{ID: 5, Samples: []model.Sample{{T: atWindowStart(layout, 5), V: 1}}}})
 	refs := waitClaim(t, s, 0)
 	m := member(refs[0].Series, refs[0].Start)
 	client.Set(ctx, s.compactedKey(0, m), "leftover", 0)
