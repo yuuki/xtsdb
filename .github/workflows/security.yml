@@ -2,7 +2,7 @@ name: Security
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
   workflow_dispatch:
   # Weekly: new advisories and queries apply to unchanged code too.

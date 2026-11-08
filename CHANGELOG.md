@@ -125,4 +125,4 @@ key prefix. Versions before 2.0.0 were not released.
   wrapped around to the most negative duration instead of being rejected as
   an overflow.
 
-[Unreleased]: https://github.com/yuuki/xtsdb/commits/master
+[Unreleased]: https://github.com/yuuki/xtsdb/commits/main

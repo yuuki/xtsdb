@@ -20,7 +20,7 @@ Examples of what is in scope:
 
 ## Supported versions
 
-Security fixes are made on the `master` branch and released in the next
+Security fixes are made on the `main` branch and released in the next
 version. Only the latest release is supported.
 
 ## Reporting a vulnerability
