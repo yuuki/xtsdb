@@ -69,6 +69,39 @@ func deleteKeys(t testing.TB, client redis.UniversalClient, prefix string) {
 
 func nowMs() int64 { return time.Now().UnixMilli() }
 
+// atWindowStart waits until a window of the series has just opened, so that
+// it stays open for most of the chunk range, and returns the time. Tests with
+// windows of a few hundred milliseconds append at it: a sample taken with
+// nowMs() in the last milliseconds of its window can reach Redis once the
+// node's clock has closed the window, and is then rejected as too old.
+func atWindowStart(layout model.Layout, id model.SeriesID) int64 {
+	for {
+		now := nowMs()
+		start := layout.WindowStart(id, now)
+		if now-start < layout.ChunkRange/5 {
+			return now
+		}
+		time.Sleep(time.Duration(start+layout.ChunkRange-now) * time.Millisecond)
+	}
+}
+
+// appendAccepted appends batch and fails the test unless every sample was
+// accepted.
+func appendAccepted(t *testing.T, s *Store, batch []storage.SeriesSamples) {
+	t.Helper()
+	res, err := s.Append(context.Background(), batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := 0
+	for _, ss := range batch {
+		want += len(ss.Samples)
+	}
+	if res.Accepted != want {
+		t.Fatalf("append: %+v, want %d accepted", res, want)
+	}
+}
+
 // load returns the loaded and missing chunks.
 func load(ctx context.Context, s *Store, refs []storage.ChunkRef) ([]storage.HotChunk, []storage.ChunkRef, error) {
 	res, err := s.Load(ctx, refs)
@@ -163,10 +196,8 @@ func TestFlushLifecycle(t *testing.T) {
 	id := model.SeriesID(99)
 	shard := layout.Shard(id)
 
-	now := nowMs()
-	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: id, Samples: []model.Sample{{T: now, V: 1}, {T: now + 1, V: 2}}}}); err != nil {
-		t.Fatal(err)
-	}
+	now := atWindowStart(layout, id)
+	appendAccepted(t, s, []storage.SeriesSamples{{ID: id, Samples: []model.Sample{{T: now, V: 1}, {T: now + 1, V: 2}}}})
 	if refs, _ := s.Claim(ctx, shard, 10); len(refs) != 0 {
 		t.Fatalf("open chunk must not be claimable, got %v", refs)
 	}
@@ -218,9 +249,7 @@ func TestExpiredLeaseIsReclaimed(t *testing.T) {
 	layout := model.Layout{Shards: 1, ChunkRange: 300, Grace: 0}
 	s, _ := newTestStore(t, layout, 500*time.Millisecond)
 	ctx := context.Background()
-	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: 5, Samples: []model.Sample{{T: nowMs(), V: 1}}}}); err != nil {
-		t.Fatal(err)
-	}
+	appendAccepted(t, s, []storage.SeriesSamples{{ID: 5, Samples: []model.Sample{{T: atWindowStart(layout, 5), V: 1}}}})
 	first := waitClaim(t, s, 0)
 	if refs, _ := s.Claim(ctx, 0, 10); len(refs) != 0 {
 		t.Fatalf("leased chunk handed out twice: %v", refs)
@@ -236,9 +265,7 @@ func TestCompleteIgnoresNewerIncarnation(t *testing.T) {
 	layout := model.Layout{Shards: 1, ChunkRange: 300, Grace: 0}
 	s, client := newTestStore(t, layout, time.Minute)
 	ctx := context.Background()
-	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: 5, Samples: []model.Sample{{T: nowMs(), V: 1}}}}); err != nil {
-		t.Fatal(err)
-	}
+	appendAccepted(t, s, []storage.SeriesSamples{{ID: 5, Samples: []model.Sample{{T: atWindowStart(layout, 5), V: 1}}}})
 	refs := waitClaim(t, s, 0)
 	chunks, _, err := load(ctx, s, refs)
 	if err != nil || len(chunks) != 1 {
@@ -263,10 +290,8 @@ func TestCompleteIsFencedOnContent(t *testing.T) {
 	layout := model.Layout{Shards: 1, ChunkRange: 300, Grace: 0}
 	s, client := newTestStore(t, layout, time.Minute)
 	ctx := context.Background()
-	now := nowMs()
-	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: 5, Samples: []model.Sample{{T: now, V: 1}, {T: now + 1, V: 2}}}}); err != nil {
-		t.Fatal(err)
-	}
+	now := atWindowStart(layout, 5)
+	appendAccepted(t, s, []storage.SeriesSamples{{ID: 5, Samples: []model.Sample{{T: now, V: 1}, {T: now + 1, V: 2}}}})
 	refs := waitClaim(t, s, 0)
 	chunks, _, err := load(ctx, s, refs)
 	if err != nil || len(chunks) != 1 {
@@ -328,9 +353,7 @@ func TestQuarantinesCorruptChunks(t *testing.T) {
 	s, client := newTestStore(t, layout, time.Minute)
 	s.quarantineTTL = time.Hour
 	ctx := context.Background()
-	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: 5, Samples: []model.Sample{{T: nowMs(), V: 1}}}}); err != nil {
-		t.Fatal(err)
-	}
+	appendAccepted(t, s, []storage.SeriesSamples{{ID: 5, Samples: []model.Sample{{T: atWindowStart(layout, 5), V: 1}}}})
 	refs := waitClaim(t, s, 0)
 	m := member(refs[0].Series, refs[0].Start)
 	client.Append(ctx, s.chunkKey(0, m), "x") // break record alignment
@@ -548,9 +571,7 @@ func TestCompleteKeepsChunkThatGrew(t *testing.T) {
 	layout := model.Layout{Shards: 1, ChunkRange: 300, Grace: 0}
 	s, client := newTestStore(t, layout, 500*time.Millisecond)
 	ctx := context.Background()
-	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: 5, Samples: []model.Sample{{T: nowMs(), V: 1}}}}); err != nil {
-		t.Fatal(err)
-	}
+	appendAccepted(t, s, []storage.SeriesSamples{{ID: 5, Samples: []model.Sample{{T: atWindowStart(layout, 5), V: 1}}}})
 	refs := waitClaim(t, s, 0)
 	chunks, _, err := load(ctx, s, refs)
 	if err != nil || len(chunks) != 1 {
@@ -584,9 +605,7 @@ func TestReleaseMissingChunks(t *testing.T) {
 	layout := model.Layout{Shards: 1, ChunkRange: 300, Grace: 0}
 	s, client := newTestStore(t, layout, time.Minute)
 	ctx := context.Background()
-	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: 5, Samples: []model.Sample{{T: nowMs(), V: 1}}}}); err != nil {
-		t.Fatal(err)
-	}
+	appendAccepted(t, s, []storage.SeriesSamples{{ID: 5, Samples: []model.Sample{{T: atWindowStart(layout, 5), V: 1}}}})
 	refs := waitClaim(t, s, 0)
 	client.Del(ctx, s.chunkKey(0, member(refs[0].Series, refs[0].Start)))
 	chunks, missing, err := load(ctx, s, refs)
@@ -606,10 +625,8 @@ func TestBacklogCountsInflightChunks(t *testing.T) {
 	s, _ := newTestStore(t, layout, time.Minute)
 	ctx := context.Background()
 	id := model.SeriesID(9)
-	t0 := nowMs()
-	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: id, Samples: []model.Sample{{T: t0, V: 1}}}}); err != nil {
-		t.Fatal(err)
-	}
+	t0 := atWindowStart(layout, id)
+	appendAccepted(t, s, []storage.SeriesSamples{{ID: id, Samples: []model.Sample{{T: t0, V: 1}}}})
 	waitClaim(t, s, layout.Shard(id))
 	b, err := s.Backlog(ctx)
 	if err != nil {
@@ -704,20 +721,17 @@ func TestFragmentsSurviveClockStep(t *testing.T) {
 	layout := model.Layout{Shards: 1, ChunkRange: 300, Grace: 0}
 	s, client := newTestStore(t, layout, time.Minute)
 	ctx := context.Background()
-	fragment := func(id model.SeriesID) int64 {
+	fragment := func(id model.SeriesID, ts int64) int64 {
 		t.Helper()
-		now := nowMs()
-		if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: id, Samples: []model.Sample{{T: now, V: 1}}}}); err != nil {
-			t.Fatal(err)
-		}
-		hdr := client.GetRange(ctx, s.chunkKey(0, member(id, layout.WindowStart(id, now))), 0, 15).Val()
+		appendAccepted(t, s, []storage.SeriesSamples{{ID: id, Samples: []model.Sample{{T: ts, V: 1}}}})
+		hdr := client.GetRange(ctx, s.chunkKey(0, member(id, layout.WindowStart(id, ts))), 0, 15).Val()
 		f, err := strconv.ParseInt(hdr, 10, 64)
 		if err != nil {
 			t.Fatalf("header %q: %v", hdr, err)
 		}
 		return f
 	}
-	first := fragment(1)
+	first := fragment(1, atWindowStart(layout, 1))
 	if us := time.Now().UnixMicro(); first < us-int64(time.Minute/time.Microsecond) || first > us {
 		t.Fatalf("fragment %d does not follow the server clock (%d)", first, us)
 	}
@@ -725,14 +739,15 @@ func TestFragmentsSurviveClockStep(t *testing.T) {
 	// stepped back by a day.
 	ahead := time.Now().Add(24 * time.Hour).UnixMicro()
 	client.Set(ctx, s.clockKey(0), strconv.FormatInt(ahead, 10), 0)
-	if f := fragment(2); f != ahead+1 {
+	if f := fragment(2, atWindowStart(layout, 2)); f != ahead+1 {
 		t.Fatalf("fragment %d, want %d", f, ahead+1)
 	}
-	if f := fragment(3); f != ahead+2 {
+	t3 := atWindowStart(layout, 3)
+	if f := fragment(3, t3); f != ahead+2 {
 		t.Fatalf("fragment %d, want %d", f, ahead+2)
 	}
 	// Appending to an existing chunk does not advance the clock.
-	_ = fragment(3)
+	_ = fragment(3, t3+1)
 	if got := client.Get(ctx, s.clockKey(0)).Val(); got != fmt.Sprintf("%016d", ahead+2) {
 		t.Fatalf("shard clock %s, want %d", got, ahead+2)
 	}

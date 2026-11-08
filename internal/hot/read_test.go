@@ -90,10 +90,8 @@ func TestWindowIndexIsMaintained(t *testing.T) {
 	windows := func() []string {
 		return client.ZRange(ctx, s.windowsKey(0, id), 0, -1).Val()
 	}
-	now := nowMs()
-	if _, err := s.Append(ctx, []storage.SeriesSamples{{ID: id, Samples: []model.Sample{{T: now, V: 1}, {T: now + 1, V: 2}}}}); err != nil {
-		t.Fatal(err)
-	}
+	now := atWindowStart(layout, id)
+	appendAccepted(t, s, []storage.SeriesSamples{{ID: id, Samples: []model.Sample{{T: now, V: 1}, {T: now + 1, V: 2}}}})
 	start := layout.WindowStart(id, now)
 	if got := windows(); len(got) != 1 || got[0] != strconv.FormatInt(start, 10) {
 		t.Fatalf("window index %v, want [%d]", got, start)
