@@ -354,7 +354,8 @@ make test-tikv          # starts Redis and a single-node TiKV (Linux), then runs
 make test-fuzz          # every fuzz target for FUZZTIME (30s)
 make bench              # benchmarks into bench.txt, to compare with benchstat
 make lint               # go vet + golangci-lint + go mod tidy -diff
-make lint-actions       # actionlint + zizmor on the GitHub Actions workflows
+make lint-actions       # actionlint + zizmor on the GitHub Actions workflows, and their lockfile
+make lock-actions       # update .github/workflows/actions.lock after changing a uses: line
 make vuln               # govulncheck
 make check              # what pull request CI checks without backends: run before a PR
 make docker             # container image
