@@ -6,18 +6,19 @@ LDFLAGS  := -s -w \
 	-X github.com/yuuki/xtsdb/internal/version.Revision=$(REVISION)
 
 # Tool versions. CI pins the same versions (.github/workflows); bump together.
-GOLANGCI_LINT_VERSION ?= v2.15.0
-GOVULNCHECK_VERSION   ?= v1.9.0
-ACTIONLINT_VERSION    ?= v1.7.12
-ZIZMOR_VERSION        ?= 1.32.0
-FUZZTIME              ?= 30s
-BENCH_COUNT           ?= 6
+GOLANGCI_LINT_VERSION   ?= v2.15.0
+GOVULNCHECK_VERSION     ?= v1.9.0
+ACTIONLINT_VERSION      ?= v1.7.12
+ZIZMOR_VERSION          ?= 1.32.0
+GH_ACTIONS_LOCK_VERSION ?= v0.4.1
+FUZZTIME                ?= 30s
+BENCH_COUNT             ?= 6
 # TLA+ tools that model-check spec/ (a release, not the rolling nightly).
-TLA_VERSION           ?= 1.7.4
-TLA_SHA256            ?= 936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
-TLA_JAR               ?= $(CURDIR)/.cache/tla/tla2tools-$(TLA_VERSION).jar
-JAVA                  ?= java
-PYTHON                ?= python3
+TLA_VERSION             ?= 1.7.4
+TLA_SHA256              ?= 936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
+TLA_JAR                 ?= $(CURDIR)/.cache/tla/tla2tools-$(TLA_VERSION).jar
+JAVA                    ?= java
+PYTHON                  ?= python3
 
 # `go run tool@version` would build a tool with the oldest Go its go.mod
 # allows, and golangci-lint and govulncheck cannot load code that needs a
@@ -26,6 +27,8 @@ GO_TOOLCHAIN = $(shell $(GO) env GOVERSION)
 GOLANGCI_LINT ?= GOTOOLCHAIN=$(GO_TOOLCHAIN) $(GO) run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 # uvx or pipx (preinstalled on GitHub-hosted runners) runs the pinned zizmor.
 ZIZMOR ?= $(if $(shell command -v uvx 2>/dev/null),uvx zizmor@$(ZIZMOR_VERSION),pipx run zizmor==$(ZIZMOR_VERSION))
+# gh-actions-lock (the `gh actions-lock` extension) runs through `go run` too.
+GH_ACTIONS_LOCK ?= GOTOOLCHAIN=$(GO_TOOLCHAIN) $(GO) run github.com/github/gh-actions-lock/cmd/gh-actions-lock@$(GH_ACTIONS_LOCK_VERSION)
 
 # Backends started by `make deps` (see compose.yaml).
 export XTSDB_TEST_REDIS_ADDRS     ?= 127.0.0.1:6379
@@ -109,10 +112,19 @@ lint: ## go vet, golangci-lint (linters and formatters) and go.mod tidiness
 fmt: ## Format the code (gofmt, goimports)
 	$(GOLANGCI_LINT) fmt
 
+# gh-actions-lock checks that .github/workflows/actions.lock pins every
+# action the workflows use; with GH_TOKEN it also verifies each pin upstream.
 .PHONY: lint-actions
-lint-actions: ## Lint (actionlint) and audit (zizmor) the GitHub Actions workflows
+lint-actions: ## Lint (actionlint) and audit (zizmor) the GitHub Actions workflows, and check their lockfile
 	GOTOOLCHAIN=$(GO_TOOLCHAIN) $(GO) run github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION)
 	$(ZIZMOR) $(if $(GH_TOKEN),,--offline) .
+	$(GH_ACTIONS_LOCK) $(if $(GH_TOKEN),--verify,--verify-local)
+
+# Pin the actions in .github/workflows/actions.lock after a `uses:` changed,
+# then review the diff. Needs a GitHub token (GH_TOKEN or `gh auth login`).
+.PHONY: lock-actions
+lock-actions: ## Update .github/workflows/actions.lock after changing a uses: line
+	$(GH_ACTIONS_LOCK)
 
 .PHONY: vuln
 vuln: ## Known vulnerabilities reachable from the code
