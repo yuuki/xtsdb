@@ -106,6 +106,11 @@ key prefix. Versions before 2.0.0 were not released.
   accepted; PromQL never finished adding one with a NaN threshold to another
   histogram. They are now rejected (`outcome="invalid"`), and treated as
   corruption when read from either tier.
+- Native histograms with a span that reaches past bucket index 2^31-1 were
+  accepted; Prometheus stored them with corrupted buckets. Like Prometheus
+  3.16, whose validation xtsdb applies, xtsdb now rejects them
+  (`outcome="invalid"`) and treats them as corruption when read from either
+  tier.
 - Quarantining an undecodable chunk could move a healthy newer incarnation of
   its window away, and overwrote earlier quarantined chunks of the window
   (#3).

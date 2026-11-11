@@ -720,4 +720,4 @@ to remove a part from TiKV.
 | Series ID depended on tag order; `hostname` tag as hash tag | Canonical sorted labels; hash-based shards |
 | No index, no query support (querier crashed on start) | Day-partitioned index, PromQL, Prometheus HTTP API |
 | Raw 16-byte samples in Cassandra, unbounded partitions, consistency `ANY` | XOR compression, day partitions, TTL, TWCS, configurable consistency |
-| Go 1.14, go-redis v7, gocql 2020, VictoriaMetrics 1.35 | Go 1.27, go-redis v9, Apache Cassandra GoCQL driver v2, Prometheus 3.15 |
+| Go 1.14, go-redis v7, gocql 2020, VictoriaMetrics 1.35 | Go 1.27, go-redis v9, Apache Cassandra GoCQL driver v2, Prometheus 3.16 |
