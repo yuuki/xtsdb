@@ -106,6 +106,11 @@ key prefix. Versions before 2.0.0 were not released.
   accepted; PromQL never finished adding one with a NaN threshold to another
   histogram. They are now rejected (`outcome="invalid"`), and treated as
   corruption when read from either tier.
+- Native histograms with a span that reaches past bucket index 2^31-1 were
+  accepted; Prometheus stored them with corrupted buckets. Like Prometheus
+  3.16, whose validation xtsdb applies, xtsdb now rejects them
+  (`outcome="invalid"`) and treats them as corruption when read from either
+  tier.
 - Quarantining an undecodable chunk could move a healthy newer incarnation of
   its window away, and overwrote earlier quarantined chunks of the window
   (#3).
@@ -124,5 +129,14 @@ key prefix. Versions before 2.0.0 were not released.
 - A `step` or `timeout` query parameter of about 9223372036.85 seconds
   wrapped around to the most negative duration instead of being rejected as
   an overflow.
+
+### Security
+
+- Built with Go 1.27.4, the security release of 2026-11-10. It fixes a
+  panic of the HTTP/1 server: `http.MaxBytesReader`, which bounds Remote
+  Write request bodies, set `Connection: close` without synchronization with
+  the handler writing its headers (CVE-2026-97054). It also fixes code
+  execution at build time through cgo flags and directives (CVE-2026-97033
+  to CVE-2026-97043).
 
 [Unreleased]: https://github.com/yuuki/xtsdb/commits/main

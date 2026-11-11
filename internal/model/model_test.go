@@ -159,6 +159,23 @@ func TestValidateHistogramZeroThreshold(t *testing.T) {
 	}
 }
 
+// Bucket indexes are int32: since Prometheus 3.16, whose validation
+// ValidateHistogram applies, a span that reaches past math.MaxInt32 makes
+// the histogram invalid (Prometheus stored such histograms with corrupted
+// buckets).
+func TestValidateHistogramSpanIndex(t *testing.T) {
+	last := &histogram.FloatHistogram{Schema: 0, Count: 2,
+		PositiveSpans: []histogram.Span{{Offset: math.MaxInt32 - 1, Length: 2}}, PositiveBuckets: []float64{1, 1}}
+	if err := ValidateHistogram(last); err != nil {
+		t.Errorf("last bucket at index math.MaxInt32: %v", err)
+	}
+	past := &histogram.FloatHistogram{Schema: 0, Count: 2,
+		PositiveSpans: []histogram.Span{{Offset: math.MaxInt32, Length: 2}}, PositiveBuckets: []float64{1, 1}}
+	if ValidateHistogram(past) == nil || ValidateHistogramLayout(past) == nil {
+		t.Error("bucket index past math.MaxInt32 accepted")
+	}
+}
+
 // The layout of a persistent-tier chunk may have more buckets than one
 // histogram, but not more spans or custom bounds.
 func TestValidateHistogramLayout(t *testing.T) {

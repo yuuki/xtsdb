@@ -803,8 +803,8 @@ func TestReadHistogramLayout(t *testing.T) {
 			PositiveSpans: []histogram.Span{{Offset: 4, Length: 1}, {Offset: 32, Length: 1}, {Offset: 256, Length: 1},
 				{Offset: 2048, Length: 1}, {Offset: 131072, Length: 1}, {Offset: 16777216, Length: 1}},
 			PositiveBuckets: slices.Repeat([]float64{1}, 6)},
-		{Schema: 3, ZeroThreshold: 1e-300, Count: 300,
-			PositiveSpans: []histogram.Span{{Offset: math.MaxInt32, Length: 300}}, PositiveBuckets: slices.Repeat([]float64{1}, 300)},
+		{Schema: 3, ZeroThreshold: 1e-300, Count: 300, // the last bucket at the largest index, math.MaxInt32
+			PositiveSpans: []histogram.Span{{Offset: math.MaxInt32 - 299, Length: 300}}, PositiveBuckets: slices.Repeat([]float64{1}, 300)},
 		{Schema: histogram.CustomBucketsSchema, Count: 2, // bounds as varbits and as floats
 			PositiveSpans:   []histogram.Span{{Offset: 1, Length: 1}, {Offset: 2, Length: 1}},
 			PositiveBuckets: []float64{1, 1}, CustomValues: []float64{-5, 0, 0.1, 33554.43, 33554.431, 1e9}},
