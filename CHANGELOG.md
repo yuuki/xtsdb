@@ -9,6 +9,8 @@ made.
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-11-11
+
 xtsdb 2.0.0 is a ground-up rewrite of the 0.x proof of concept. Its storage
 format is not compatible with 0.x; run it against a new keyspace and Redis
 key prefix. Versions before 2.0.0 were not released.
@@ -139,4 +141,5 @@ key prefix. Versions before 2.0.0 were not released.
   execution at build time through cgo flags and directives (CVE-2026-97033
   to CVE-2026-97043).
 
-[Unreleased]: https://github.com/yuuki/xtsdb/commits/main
+[Unreleased]: https://github.com/yuuki/xtsdb/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/yuuki/xtsdb/releases/tag/v2.0.0
