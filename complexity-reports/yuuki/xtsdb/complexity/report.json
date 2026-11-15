@@ -1,9 +1,9 @@
 {
   "repository": "yuuki/xtsdb/complexity",
   "ref": "refs/heads/main",
-  "commit": "1adfae18f11b82d0bd749c972d542945d3b48776",
+  "commit": "0398336c816250764e9e970fc774ddc88c295709",
   "base_ref": "refs/heads/main",
-  "timestamp": "2026-11-11T12:29:29.784879254Z",
+  "timestamp": "2026-11-15T01:54:26.432771465Z",
   "custom_metrics": [
     {
       "key": "code_complexity",
