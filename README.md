@@ -1,5 +1,6 @@
 # xtsdb
 
+[![AI Generated](https://img.shields.io/badge/AI%20Generated-Claude-orange?logo=anthropic)](https://claude.ai/claude-code)
 [![CI](https://github.com/yuuki/xtsdb/actions/workflows/ci.yml/badge.svg)](https://github.com/yuuki/xtsdb/actions/workflows/ci.yml)
 [![Security](https://github.com/yuuki/xtsdb/actions/workflows/security.yml/badge.svg)](https://github.com/yuuki/xtsdb/actions/workflows/security.yml)
 [![Release](https://img.shields.io/github/v/release/yuuki/xtsdb)](https://github.com/yuuki/xtsdb/releases)
