@@ -1,5 +1,12 @@
 # xtsdb
 
+[![AI Generated](https://img.shields.io/badge/AI%20Generated-Claude-orange?logo=anthropic)](https://claude.ai/claude-code)
+[![CI](https://github.com/yuuki/xtsdb/actions/workflows/ci.yml/badge.svg)](https://github.com/yuuki/xtsdb/actions/workflows/ci.yml)
+[![Security](https://github.com/yuuki/xtsdb/actions/workflows/security.yml/badge.svg)](https://github.com/yuuki/xtsdb/actions/workflows/security.yml)
+[![Release](https://img.shields.io/github/v/release/yuuki/xtsdb)](https://github.com/yuuki/xtsdb/releases)
+[![License](https://img.shields.io/github/license/yuuki/xtsdb)](LICENSE)
+[![Go version](https://img.shields.io/github/go-mod/go-version/yuuki/xtsdb)](go.mod)
+
 xtsdb is a horizontally scalable time series database that tiers data
 across two kinds of key-value stores: recent samples live in **Redis** (or
 Valkey) and older samples are compressed and moved to **Apache Cassandra**
